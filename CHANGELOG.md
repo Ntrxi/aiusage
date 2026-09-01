@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.13] - 2026-09-01
+
+### Fixed
+- **Reliable `serve` shutdown** ([#50](https://github.com/juliantanx/aiusage/pull/50); reported by [@lmingde](https://github.com/lmingde) in [#49](https://github.com/juliantanx/aiusage/issues/49)) — make shutdown idempotent, register signal handlers once, close idle HTTP connections immediately, and force-close active connections after a short timeout so `Ctrl+C` always exits without accumulating `close` listeners.
+
+---
+
 ## [1.5.12] - 2026-08-18
 
 ### Fixed
@@ -432,6 +439,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/juliantanx/aiusage/compare/v1.5.10...v1.5.11
 [1.5.10]: https://github.com/juliantanx/aiusage/compare/v1.5.9...v1.5.10

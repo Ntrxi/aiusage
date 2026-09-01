@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [1.5.13] - 2026-09-01
+
+### 修复
+- **可靠关闭 `serve`**（[#50](https://github.com/juliantanx/aiusage/pull/50)；由 [@lmingde](https://github.com/lmingde) 在 [#49](https://github.com/juliantanx/aiusage/issues/49) 中报告）— 使关闭流程保持幂等、仅注册一次信号处理器、立即关闭空闲 HTTP 连接，并在短暂超时后强制断开活跃连接，确保 `Ctrl+C` 总能退出且不会累积 `close` 监听器。
+
+---
+
 ## [1.5.12] - 2026-08-18
 
 ### 修复
@@ -432,6 +439,7 @@
 
 ---
 
+[1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/juliantanx/aiusage/compare/v1.5.10...v1.5.11
 [1.5.10]: https://github.com/juliantanx/aiusage/compare/v1.5.9...v1.5.10
