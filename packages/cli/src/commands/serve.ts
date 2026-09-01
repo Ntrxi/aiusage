@@ -15,6 +15,7 @@ import { getSyncTarget } from '../sync/target.js'
 import { RuntimeSettingsController } from '../runtime/settings-controller.js'
 import { AsyncTaskQueue } from '../db/write-queue.js'
 import { fetchExchangeRate, CACHE_TTL_MS } from '@aiusage/core'
+import { createGracefulShutdownHandler } from './serve-shutdown.js'
 import type Database from 'better-sqlite3'
 
 export interface ServeOptions {
@@ -202,20 +203,11 @@ export function serve(options: ServeOptions): void {
     try { unlinkSync(PORT_FILE) } catch {}
   }
 
-  process.on('SIGINT', () => {
-    console.log('\nShutting down...')
-    cleanup()
-    runtimeSettings.stop()
-    server.close(() => {
-      process.exit(0)
-    })
+  const shutdown = createGracefulShutdownHandler({
+    server,
+    cleanup,
+    stopRuntime: () => runtimeSettings.stop(),
   })
-
-  process.on('SIGTERM', () => {
-    cleanup()
-    runtimeSettings.stop()
-    server.close(() => {
-      process.exit(0)
-    })
-  })
+  process.once('SIGINT', shutdown)
+  process.once('SIGTERM', shutdown)
 }
