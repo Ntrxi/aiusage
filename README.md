@@ -191,6 +191,9 @@ Thanks to these wonderful people ([emoji key](https://allcontributors.org/en/ref
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/jlxyfll"><img src="https://avatars.githubusercontent.com/u/16436887?v=4?s=100" width="100px;" alt="jlxyfll"/><br /><sub><b>jlxyfll</b></sub></a><br /><a href="https://github.com/juliantanx/aiusage/commits?author=jlxyfll" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/Ed-Bg"><img src="https://avatars.githubusercontent.com/u/68063080?v=4?s=100" width="100px;" alt="Harlan Hu"/><br /><sub><b>Harlan Hu</b></sub></a><br /><a href="https://github.com/juliantanx/aiusage/commits?author=Ed-Bg" title="Code">💻</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/lmingde"><img src="https://avatars.githubusercontent.com/u/38581341?v=4?s=100" width="100px;" alt="Mingde"/><br /><sub><b>Mingde</b></sub></a><br /><a href="https://github.com/juliantanx/aiusage/issues?q=author%3Almingde" title="Bug reports">🐛</a></td>
+    </tr>
   </tbody>
 </table>
 

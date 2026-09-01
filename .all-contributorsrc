@@ -76,6 +76,15 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "lmingde",
+      "name": "Mingde",
+      "avatar_url": "https://avatars.githubusercontent.com/u/38581341?v=4",
+      "profile": "https://github.com/lmingde",
+      "contributions": [
+        "bug"
+      ]
     }
   ],
   "contributorsPerLine": 7,

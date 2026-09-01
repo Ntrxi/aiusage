@@ -28,9 +28,11 @@ pnpm lint
 
 ```text
 packages/
-  core/     - Shared types, database schema, pricing data
-  cli/      - CLI tool for parsing logs, querying data, sync
-  web/      - SvelteKit web dashboard (SPA)
+  core/     - Shared types, database schema, pricing data, utilities
+  cli/      - Published CLI, parsers, local API server, sync, PM2 helpers
+  web/      - Local SvelteKit dashboard bundled into the CLI
+  widget/   - Electron tray/menu-bar widget
+  site/     - Official website, docs, accounts, uploads, leaderboard
 ```
 
 ## Submitting Changes
