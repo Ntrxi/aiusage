@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Cross-device sync re-uploaded pulled records** — records pulled from another device kept their real `source_file`, so the `source_file NOT LIKE 'synced/%'` heuristic treated them as local and re-uploaded them under the pulling device's namespace with colliding ids (`line_offset = 0`), double-counting usage on every machine. Provenance is now an explicit `records.origin` column (`local` | `synced`); only local rows stamped with the current device id are uploaded, and only under that device's namespace. Pull ignores lines that do not belong to the namespace they sit in, and echoes of the device's own records. Migration v13 back-fills `origin` deterministically for existing databases. A new `aiusage sync --repair [--apply] [--all-namespaces]` command reports and, on request, removes contamination from the local database and the remote namespaces. See `docs/sync-repair.md`.
+
+---
+
 ## [1.5.13] - 2026-09-01
 
 ### Fixed

@@ -4,7 +4,7 @@ import { basename, join, dirname } from 'node:path'
 import { hostname } from 'node:os'
 import { Aggregator, resolveExchangeRate, generateToolCallId, inferProvider, calculateCost, resolvePrice, generateRecordId, normalizeCodeFuseModel, parseTimestamp, type StatsRecord, type Tool } from '@aiusage/core'
 import type { ToolCallRecord } from '@aiusage/core'
-import { insertRecord } from '../db/records.js'
+import { insertRecord, LOCAL_RECORDS_WHERE } from '../db/records.js'
 import { insertToolCall } from '../db/tool-calls.js'
 import { getState } from '../init.js'
 import { loadConfig, AIUSAGE_DIR } from '../config.js'
@@ -1219,14 +1219,14 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
   // If the current device UUID is known, backfill any records with 'unknown' device_instance_id.
   if (deviceInstanceId !== 'unknown') {
     db.prepare(
-      `UPDATE records SET device_instance_id = ?, device = ? WHERE device_instance_id = 'unknown'`
+      `UPDATE records SET device_instance_id = ?, device = ? WHERE device_instance_id = 'unknown' AND ${LOCAL_RECORDS_WHERE}`
     ).run(deviceInstanceId, device)
   }
 
   // Backfill platform for existing records that have an empty platform field.
   if (devicePlatform) {
     db.prepare(
-      `UPDATE records SET platform = ? WHERE platform = '' AND source_file NOT LIKE 'synced/%'`
+      `UPDATE records SET platform = ? WHERE platform = '' AND ${LOCAL_RECORDS_WHERE}`
     ).run(devicePlatform)
   }
 
@@ -1263,7 +1263,7 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
  */
 export function backfillCwd(db: Database.Database): void {
   const staleFiles = db.prepare(
-    `SELECT DISTINCT source_file FROM records WHERE cwd = '' AND source_file NOT LIKE 'synced/%'`
+    `SELECT DISTINCT source_file FROM records WHERE cwd = '' AND ${LOCAL_RECORDS_WHERE}`
   ).all() as { source_file: string }[]
   const updateStmt = db.prepare(
     `UPDATE records SET cwd = ?, updated_at = ? WHERE source_file = ? AND cwd = ''`
@@ -1292,7 +1292,7 @@ export function backfillHermesSourceFiles(db: Database.Database): void {
     FROM records r
     WHERE r.tool = 'hermes'
       AND r.source_file NOT LIKE '%:session:%'
-      AND r.source_file NOT LIKE 'synced/%'
+      AND r.${LOCAL_RECORDS_WHERE}
   `).all() as { source_file: string; session_id: string }[]
 
   if (rows.length === 0) return
@@ -1333,7 +1333,7 @@ function backfillSkillNames(db: Database.Database): void {
     FROM tool_calls tc
     JOIN records r ON r.id = tc.record_id
     WHERE (tc.name = 'Skill' OR tc.name = 'skill__unknown')
-      AND r.source_file NOT LIKE 'synced/%'
+      AND r.${LOCAL_RECORDS_WHERE}
   `).all() as { id: string; record_id: string; ts: number; call_index: number; source_file: string; line_offset: number }[]
 
   if (rows.length === 0) return
@@ -1382,7 +1382,7 @@ function backfillCodexModels(db: Database.Database): void {
     SELECT id, source_file, line_offset
     FROM records
     WHERE tool = 'codex' AND model = 'unknown'
-      AND source_file NOT LIKE 'synced/%'
+      AND ${LOCAL_RECORDS_WHERE}
   `).all() as { id: string; source_file: string; line_offset: number }[]
 
   if (rows.length === 0) return
@@ -1444,7 +1444,7 @@ function backfillMissingToolCalls(db: Database.Database, exchangeRate?: number):
     FROM records r
     LEFT JOIN tool_calls tc ON tc.record_id = r.id
     WHERE r.tool IN ('codex', 'openclaw', 'qoder')
-      AND r.source_file NOT LIKE 'synced/%'
+      AND r.${LOCAL_RECORDS_WHERE}
       AND tc.id IS NULL
   `).all() as { id: string; source_file: string; tool: Tool; line_offset: number; session_id: string }[]
 

@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { serve } from './commands/serve.js'
 import { runInit } from './commands/init.js'
-import { runSync } from './commands/sync.js'
+import { runSync, runSyncRepair, formatRepairReport } from './commands/sync.js'
 import { generateSummary } from './commands/summary.js'
 import { generateStatus } from './commands/status.js'
 import { exportData } from './commands/export.js'
@@ -359,8 +359,26 @@ program
 program
   .command('sync')
   .description('Sync data with cloud storage')
-  .action(async () => {
+  .option('--repair', 'Report records that an older version copied into the wrong device namespace (dry run unless --apply)')
+  .option('--apply', 'With --repair: perform the cleanup (rewrites this device\'s remote namespace and prunes local echoes)')
+  .option('--all-namespaces', 'With --repair: also clean namespaces owned by other devices')
+  .action(async (opts: { repair?: boolean; apply?: boolean; allNamespaces?: boolean }) => {
     const db = createDatabase(DB_PATH)
+    if (opts.repair) {
+      try {
+        const result = await runSyncRepair(db, { apply: opts.apply, allNamespaces: opts.allNamespaces })
+        if (result.status !== 'ok' || !result.report) {
+          console.error(`✗ ${result.error ?? 'Repair failed'}`)
+          process.exit(1)
+        }
+        console.log(formatRepairReport(result.report))
+      } catch (e) {
+        console.error(`✗ Repair failed: ${e instanceof Error ? e.message : e}`)
+        process.exit(1)
+      }
+      db.close()
+      return
+    }
     const reporter = new SyncProgressReporter()
     reporter.start()
     try {
@@ -369,7 +387,11 @@ program
       })
       reporter.done()
       if (result.status === 'ok') {
-        console.log(`✓ Sync complete — pulled: ${result.pulledCount}, merged: ${result.mergedCount}, uploaded: ${result.uploadedCount}`)
+        const ignored = 'ignoredCount' in result && result.ignoredCount ? `, ignored: ${result.ignoredCount} foreign` : ''
+        console.log(`✓ Sync complete — pulled: ${result.pulledCount}, merged: ${result.mergedCount}, uploaded: ${result.uploadedCount}${ignored}`)
+        if (ignored) {
+          console.log('  Some remote lines belong to a different device than the namespace they are in. Run "aiusage sync --repair" for details.')
+        }
       } else if (result.status === 'blocked_pending_consent') {
         console.error(`✗ ${result.error}`)
         process.exit(1)

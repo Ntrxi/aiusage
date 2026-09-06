@@ -1,8 +1,9 @@
 import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
-import { getUnsyncedRecords, markRecordsSynced } from '../db/records.js'
+import { getUnsyncedRecords, isUploadableLocalRecord, markRecordsSynced, repairRecordProvenance } from '../db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
+import { classifyPulledRecord, namespaceOwnerFromPath } from './ownership.js'
 import type { SyncProgress } from './runtime.js'
 
 export interface SyncBackend {
@@ -31,6 +32,15 @@ export interface SyncResult {
   pulledCount: number
   uploadedCount: number
   mergedCount: number
+  /**
+   * Remote lines ignored during pull because they did not belong to the
+   * namespace they were read from (or were echoes of this device's own
+   * records). Non-zero means a peer still has a contaminated namespace —
+   * see `aiusage sync --repair`.
+   */
+  ignoredCount?: number
+  /** Local rows whose provenance flag was corrected before uploading. */
+  repairedCount?: number
   error?: string
 }
 
@@ -40,20 +50,29 @@ export function getSyncPath(ts: string | number, deviceInstanceId: string): stri
   return `${deviceInstanceId}/${date}.ndjson`
 }
 
+/** Parse a single ndjson line, normalising string timestamps. Returns null on bad input. */
+export function parseSyncRecordLine(line: string): SyncRecord | null {
+  try {
+    const record: SyncRecord = JSON.parse(line)
+    if (!record || typeof record !== 'object' || typeof record.id !== 'string') return null
+    if (typeof record.ts === 'string') {
+      (record as any).ts = new Date(record.ts).getTime()
+    }
+    if (typeof record.updatedAt === 'string') {
+      (record as any).updatedAt = new Date(record.updatedAt).getTime()
+    }
+    return record
+  } catch {
+    return null
+  }
+}
+
 /** Parse ndjson content into a Map<id, SyncRecord> */
-function parseNdjson(content: string): Map<string, SyncRecord> {
+export function parseNdjson(content: string): Map<string, SyncRecord> {
   const records = new Map<string, SyncRecord>()
   for (const line of content.split('\n').filter(Boolean)) {
-    try {
-      const record: SyncRecord = JSON.parse(line)
-      if (typeof record.ts === 'string') {
-        (record as any).ts = new Date(record.ts).getTime()
-      }
-      if (typeof record.updatedAt === 'string') {
-        (record as any).updatedAt = new Date(record.updatedAt).getTime()
-      }
-      records.set(record.id, record)
-    } catch {}
+    const record = parseSyncRecordLine(line)
+    if (record) records.set(record.id, record)
   }
   return records
 }
@@ -91,14 +110,17 @@ export class SyncOrchestrator {
     }
 
     try {
+      // Provenance guard first: nothing stamped with another device's id may
+      // ever be treated as local, whatever its source_file says.
+      const repairedCount = repairRecordProvenance(this.db, this.options.deviceInstanceId)
       await this.backend.prepare?.()
-      const pulledCount = await this.pull()
+      const { pulledCount, ignoredCount } = await this.pull()
       this.options.onProgress?.({ phase: 'merging', pulledCount })
-      const mergedCount = mergeSyncedRecordsIntoRecords(this.db)
+      const mergedCount = mergeSyncedRecordsIntoRecords(this.db, this.options.deviceInstanceId)
       const uploadedCount = await this.upload()
       await this.backend.flush?.()
       this.options.onProgress?.({ phase: 'finalizing', pulledCount, uploadedCount })
-      return { status: 'ok', pulledCount, uploadedCount, mergedCount }
+      return { status: 'ok', pulledCount, uploadedCount, mergedCount, ignoredCount, repairedCount }
     } catch (error) {
       return {
         status: 'failed',
@@ -110,7 +132,7 @@ export class SyncOrchestrator {
     }
   }
 
-  private async pull(): Promise<number> {
+  private async pull(): Promise<{ pulledCount: number; ignoredCount: number }> {
     const allPaths = await this.backend.listFiles()
     const localDevicePrefix = `${this.options.deviceInstanceId}/`
     const paths = allPaths.filter(p => !p.startsWith(localDevicePrefix))
@@ -121,9 +143,10 @@ export class SyncOrchestrator {
       totalFiles: paths.length,
       pulledCount: 0,
     })
-    if (paths.length === 0) return 0
+    if (paths.length === 0) return { pulledCount: 0, ignoredCount: 0 }
 
     let totalPulled = 0
+    let totalIgnored = 0
 
     for (const [index, path] of paths.entries()) {
       this.options.onProgress?.({
@@ -136,15 +159,18 @@ export class SyncOrchestrator {
       const content = await this.backend.readFile(path)
       if (!content) continue
 
+      const namespaceOwner = namespaceOwnerFromPath(path)
       for (const line of content.split('\n').filter(Boolean)) {
+        const record = parseSyncRecordLine(line)
+        if (!record) continue
+        // Only records that belong to the namespace they were read from are
+        // trusted. Anything else is a pre-fix echo whose authoritative copy
+        // lives elsewhere (or is our own local row).
+        if (classifyPulledRecord(record, namespaceOwner, this.options.deviceInstanceId)) {
+          totalIgnored++
+          continue
+        }
         try {
-          const record: SyncRecord = JSON.parse(line)
-          if (typeof record.ts === 'string') {
-            (record as any).ts = new Date(record.ts).getTime()
-          }
-          if (typeof record.updatedAt === 'string') {
-            (record as any).updatedAt = new Date(record.updatedAt).getTime()
-          }
           const changed = insertSyncedRecord(this.db, record)
           if (changed) totalPulled++
         } catch {}
@@ -159,7 +185,7 @@ export class SyncOrchestrator {
       })
     }
 
-    return totalPulled
+    return { pulledCount: totalPulled, ignoredCount: totalIgnored }
   }
 
   private async uploadFile(
@@ -178,13 +204,18 @@ export class SyncOrchestrator {
   }
 
   private async upload(): Promise<number> {
-    const unsynced = getUnsyncedRecords(this.db, this.options.target)
+    const deviceInstanceId = this.options.deviceInstanceId
+    // The query already restricts to origin = 'local' rows owned by this
+    // device; the explicit filter is the last line of defence so that no
+    // record stamped with another device's id can reach our namespace.
+    const unsynced = getUnsyncedRecords(this.db, this.options.target, deviceInstanceId)
+      .filter(record => isUploadableLocalRecord(record, deviceInstanceId))
     if (unsynced.length === 0) return 0
 
-    // Group records by day per device.
+    // Group records by day. Every path is under *this* device's namespace.
     const byPath = new Map<string, typeof unsynced>()
     for (const record of unsynced) {
-      const path = getSyncPath(record.ts, this.options.deviceInstanceId)
+      const path = getSyncPath(record.ts, deviceInstanceId)
       if (!byPath.has(path)) byPath.set(path, [])
       byPath.get(path)!.push(record)
     }
