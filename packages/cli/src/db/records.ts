@@ -1,5 +1,34 @@
 import type Database from 'better-sqlite3'
-import type { StatsRecord } from '@aiusage/core'
+import type { RecordOrigin, StatsRecord } from '@aiusage/core'
+
+/**
+ * Sentinel device id used by parsers that ran before `state.json` existed.
+ * Such rows were still produced on this device, so they count as local; parse
+ * re-labels them to the real device id on its next run.
+ */
+export const UNKNOWN_DEVICE_INSTANCE_ID = 'unknown'
+
+/**
+ * SQL fragment (no leading AND) selecting rows that were parsed on this device.
+ * Use this — never `source_file NOT LIKE 'synced/%'` — to exclude records that
+ * were pulled from other devices and merged into `records`.
+ */
+export const LOCAL_RECORDS_WHERE = "origin = 'local'"
+
+/**
+ * True when `record` may be uploaded under `deviceInstanceId`'s sync namespace:
+ * it must have been parsed here (origin = local) and carry this device's id
+ * (or the pre-init 'unknown' sentinel, which only local parsing can produce).
+ * Pulled records — whatever their `source_file` — never satisfy this.
+ */
+export function isUploadableLocalRecord(
+  record: Pick<StatsRecord, 'origin' | 'deviceInstanceId'>,
+  deviceInstanceId: string,
+): boolean {
+  if ((record.origin ?? 'local') !== 'local') return false
+  return record.deviceInstanceId === deviceInstanceId
+    || record.deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID
+}
 
 export function insertRecord(db: Database.Database, record: StatsRecord): void {
   db.prepare(`
@@ -7,12 +36,12 @@ export function insertRecord(db: Database.Database, record: StatsRecord): void {
       id, ts, ingested_at, synced_at, updated_at, line_offset,
       tool, model, provider, input_tokens, output_tokens,
       cache_read_tokens, cache_write_tokens, thinking_tokens,
-      cost, cost_source, session_id, source_file, cwd, device, device_instance_id, platform
+      cost, cost_source, session_id, source_file, cwd, device, device_instance_id, platform, origin
     ) VALUES (
       @id, @ts, @ingestedAt, @syncedAt, @updatedAt, @lineOffset,
       @tool, @model, @provider, @inputTokens, @outputTokens,
       @cacheReadTokens, @cacheWriteTokens, @thinkingTokens,
-      @cost, @costSource, @sessionId, @sourceFile, @cwd, @device, @deviceInstanceId, @platform
+      @cost, @costSource, @sessionId, @sourceFile, @cwd, @device, @deviceInstanceId, @platform, @origin
     )
   `).run({
     id: record.id,
@@ -37,6 +66,7 @@ export function insertRecord(db: Database.Database, record: StatsRecord): void {
     device: record.device,
     deviceInstanceId: record.deviceInstanceId,
     platform: record.platform ?? '',
+    origin: record.origin ?? 'local',
   })
 }
 
@@ -56,18 +86,37 @@ export function deleteRecordsBySourceFile(db: Database.Database, sourceFile: str
   return result.changes
 }
 
-export function getUnsyncedRecords(db: Database.Database, target?: string): StatsRecord[] {
+/**
+ * Local records that still need uploading.
+ *
+ * Only rows with `origin = 'local'` are candidates: rows merged from
+ * `synced_records` are never returned, regardless of their `source_file`.
+ * When `deviceInstanceId` is given, candidates are additionally restricted to
+ * rows carrying that device id (or the pre-init 'unknown' sentinel), so a row
+ * stamped with another device's id can never be uploaded under this device's
+ * namespace even if its provenance flag were wrong.
+ */
+export function getUnsyncedRecords(db: Database.Database, target?: string, deviceInstanceId?: string): StatsRecord[] {
+  const ownerWhere = deviceInstanceId !== undefined
+    ? `AND r.device_instance_id IN (@deviceInstanceId, '${UNKNOWN_DEVICE_INSTANCE_ID}')`
+    : ''
+  const ownerParams = deviceInstanceId !== undefined ? { deviceInstanceId } : {}
+
   const rows = target
     ? db.prepare(`
         SELECT r.* FROM records r
         LEFT JOIN sync_record_state s
-          ON s.record_id = r.id AND s.target = ?
-        WHERE r.source_file NOT LIKE 'synced/%'
+          ON s.record_id = r.id AND s.target = @target
+        WHERE r.${LOCAL_RECORDS_WHERE}
+          ${ownerWhere}
           AND (s.synced_at IS NULL OR r.updated_at > s.synced_at)
-      `).all(target) as Record<string, unknown>[]
-    : db.prepare(
-      'SELECT * FROM records WHERE synced_at IS NULL OR updated_at > synced_at'
-    ).all() as Record<string, unknown>[]
+      `).all({ target, ...ownerParams }) as Record<string, unknown>[]
+    : db.prepare(`
+        SELECT r.* FROM records r
+        WHERE r.${LOCAL_RECORDS_WHERE}
+          ${ownerWhere}
+          AND (r.synced_at IS NULL OR r.updated_at > r.synced_at)
+      `).all(ownerParams) as Record<string, unknown>[]
   return rows.map(mapRowToRecord)
 }
 
@@ -98,6 +147,35 @@ export function markRecordsSynced(db: Database.Database, ids: string[], syncedAt
   tx(ids)
 }
 
+/**
+ * Runtime provenance guard, run at the start of every sync once the current
+ * device id is known (migrations cannot know it).
+ *
+ * Any `origin = 'local'` row stamped with a *different, concrete* device id
+ * cannot have been produced by a parser on this device — parsers always stamp
+ * the current id (or 'unknown' before init). Such rows are pulled copies whose
+ * merge fingerprint was lost (e.g. the origin device renamed its alias and
+ * re-uploaded, changing the session key), so they are re-flagged as `synced`.
+ * Nothing is deleted; the rows remain visible via `synced_records`.
+ * Returns the number of rows re-flagged.
+ */
+export function repairRecordProvenance(db: Database.Database, deviceInstanceId: string): number {
+  const result = db.prepare(`
+    UPDATE records
+    SET origin = 'synced'
+    WHERE origin = 'local'
+      AND device_instance_id != ?
+      AND device_instance_id != '${UNKNOWN_DEVICE_INSTANCE_ID}'
+  `).run(deviceInstanceId)
+  if (result.changes > 0) {
+    db.prepare(`
+      DELETE FROM sync_record_state
+      WHERE record_id IN (SELECT id FROM records WHERE origin = 'synced')
+    `).run()
+  }
+  return result.changes
+}
+
 function mapRowToRecord(row: Record<string, unknown>): StatsRecord {
   return {
     id: row.id as string,
@@ -122,5 +200,6 @@ function mapRowToRecord(row: Record<string, unknown>): StatsRecord {
     device: row.device as string,
     deviceInstanceId: row.device_instance_id as string,
     platform: (row.platform as string) || undefined,
+    origin: ((row.origin as string) || 'local') as RecordOrigin,
   }
 }

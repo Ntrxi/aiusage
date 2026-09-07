@@ -18,12 +18,15 @@ const RECORD_ID_SYNC_TOOLS = new Set<Tool>([
 ])
 
 export function mapStatsRecordToSyncRecord(record: StatsRecord): SyncRecord {
-  // Records merged from synced_records have source_file='synced/<deviceId>' and lineOffset=0,
-  // which would cause all records from the same device to collide to one ID.
-  // Use the existing record ID directly for these — it's already a valid sync record ID.
+  // Records merged from synced_records already carry their wire-format id and
+  // have lineOffset=0, so regenerating the id from (device, sourceFile, 0)
+  // would collapse every record of a source file into one id. Their
+  // provenance is the explicit `origin` flag — never the source_file value.
+  // (Such records are never uploaded; this keeps the id stable if they are
+  // ever mapped, e.g. for export.)
   // Several imports use database rows or JSON-array indexes, where lineOffset is not a
   // stable byte position. Use record.id because those parsers already encode row/session identity.
-  const id = record.sourceFile.startsWith('synced/')
+  const id = record.origin === 'synced'
     ? record.id
     : RECORD_ID_SYNC_TOOLS.has(record.tool)
       ? record.id

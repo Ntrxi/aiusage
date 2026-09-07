@@ -1,3 +1,4 @@
+import { LOCAL_RECORDS_WHERE } from '../db/records.js'
 import { createDatabase } from '../db/index.js'
 import { getState } from '../init.js'
 import { AIUSAGE_DIR } from '../config.js'
@@ -148,7 +149,7 @@ function getPeriodUsageGroups(
   endTs: number
 ): UsageGroup[] {
   const timeWhere = 'AND ts >= @startTs AND ts <= @endTs'
-  const localOnlyFilter = "AND source_file NOT LIKE 'synced/%'"
+  const localOnlyFilter = `AND ${LOCAL_RECORDS_WHERE}`
   const params = { currentId: currentDeviceInstanceId ?? '', startTs, endTs }
 
   if (currentDeviceInstanceId) {

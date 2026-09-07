@@ -28,7 +28,7 @@ import { clearCredentials, hasCredentials, loadCredentials, saveCredentials } fr
 import { base64url, sha256Buffer } from '../leaderboard/crypto.js'
 import { uploadLeaderboardData } from '../commands/leaderboard-upload.js'
 import { runParseKelivo } from '../commands/parse-kelivo.js'
-import { insertRecord } from '../db/records.js'
+import { insertRecord, LOCAL_RECORDS_WHERE } from '../db/records.js'
 import { AsyncTaskQueue, type AsyncTaskQueueStatus } from '../db/write-queue.js'
 import { getPricingRegistrySummary, getUserAliasBindings, hasUserPrice, listLocalModelBindings, listPricingAliasTargets, listPricingModels, loadPricingRuntime, removeUserPricingAlias, resetUserPriceToSynced, resolvePriceFromRegistry, setUserPrice, setUserPricingAlias, syncPricingFromLitellm } from '../pricing-registry.js'
 import type { DetectedTool } from '../discovery.js'
@@ -393,7 +393,8 @@ function getToolTypeFilter(toolType: string | null): string {
   return ''
 }
 
-const LOCAL_ONLY_FILTER = "AND source_file NOT LIKE 'synced/%'"
+// Rows merged from synced_records carry origin = 'synced' (see db/records.ts LOCAL_RECORDS_WHERE).
+const LOCAL_ONLY_FILTER = `AND ${LOCAL_RECORDS_WHERE}`
 
 function getDeviceFilter(
   device: string | null | undefined,
@@ -1656,7 +1657,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         const localRows = db.prepare(`
           SELECT device, device_instance_id AS deviceInstanceId, COUNT(*) AS recordCount
           FROM records
-          WHERE device_instance_id = @currentId AND source_file NOT LIKE 'synced/%'
+          WHERE device_instance_id = @currentId AND ${LOCAL_RECORDS_WHERE}
           GROUP BY device_instance_id
         `).all({ currentId }) as any[]
 

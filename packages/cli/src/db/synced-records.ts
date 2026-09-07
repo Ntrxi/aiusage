@@ -69,15 +69,26 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 /**
  * Merge synced_records into records table so API queries can see them.
  * Only inserts records that don't already exist in records.
+ *
+ * Every row written here is stamped `origin = 'synced'` — that flag, not the
+ * `source_file` value, is what marks it as pulled. `source_file` and `cwd`
+ * are copied verbatim so cross-device project stats keep working.
+ *
+ * Rows carrying `currentDeviceInstanceId` (when given) are skipped: a copy of
+ * this device's own record can only reach `synced_records` by being echoed
+ * through another device's namespace, and the authoritative row already lives
+ * in `records` with `origin = 'local'`.
+ *
  * Returns the number of newly inserted records.
  */
-export function mergeSyncedRecordsIntoRecords(db: Database.Database): number {
+export function mergeSyncedRecordsIntoRecords(db: Database.Database, currentDeviceInstanceId?: string): number {
   const now = Date.now()
+  const ownFilter = currentDeviceInstanceId !== undefined ? 'AND sr.device_instance_id != @currentDeviceInstanceId' : ''
   const newRows = db.prepare(`
     SELECT sr.* FROM synced_records sr
     LEFT JOIN records r ON sr.id = r.id
-    WHERE r.id IS NULL
-  `).all() as Record<string, unknown>[]
+    WHERE r.id IS NULL ${ownFilter}
+  `).all(currentDeviceInstanceId !== undefined ? { currentDeviceInstanceId } : {}) as Record<string, unknown>[]
 
   if (newRows.length === 0) return 0
 
@@ -86,12 +97,12 @@ export function mergeSyncedRecordsIntoRecords(db: Database.Database): number {
       id, ts, ingested_at, synced_at, updated_at, line_offset,
       tool, model, provider, input_tokens, output_tokens,
       cache_read_tokens, cache_write_tokens, thinking_tokens,
-      cost, cost_source, session_id, source_file, device, device_instance_id
+      cost, cost_source, session_id, source_file, cwd, device, device_instance_id, platform, origin
     ) VALUES (
       @id, @ts, @ingestedAt, @syncedAt, @updatedAt, 0,
       @tool, @model, @provider, @inputTokens, @outputTokens,
       @cacheReadTokens, @cacheWriteTokens, @thinkingTokens,
-      @cost, @costSource, @sessionId, @sourceFile, @device, @deviceInstanceId
+      @cost, @costSource, @sessionId, @sourceFile, @cwd, @device, @deviceInstanceId, @platform, 'synced'
     )
   `)
 
@@ -118,9 +129,10 @@ export function mergeSyncedRecordsIntoRecords(db: Database.Database): number {
         costSource: row.cost_source,
         sessionId: row.session_key,
         sourceFile,
+        cwd: (typeof row.cwd === 'string' ? row.cwd : '') || '',
         device: row.device,
         deviceInstanceId: row.device_instance_id,
-        cwd: (typeof row.cwd === 'string' ? row.cwd : '') || '',
+        platform: (typeof row.platform === 'string' ? row.platform : '') || '',
       })
     }
   })

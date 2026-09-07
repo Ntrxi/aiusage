@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3'
 import type { SyncRecord, SyncTombstone } from '@aiusage/core'
-import { getUnsyncedRecords, markRecordsSynced } from '../db/records.js'
+import { getUnsyncedRecords, isUploadableLocalRecord, markRecordsSynced, repairRecordProvenance } from '../db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import { cloudPush, cloudPull, CloudSyncError } from './cloud.js'
@@ -32,13 +32,22 @@ export class CloudSyncOrchestrator {
 
   async sync(syncGeneration: number = 1): Promise<CloudSyncResult> {
     try {
+      // Step 0: provenance guard — rows stamped with another device's id are
+      // never local, whatever their source_file says.
+      repairRecordProvenance(this.db, this.options.deviceInstanceId)
+
       // Step 1: Pull records from other devices
       this.options.onProgress?.({ phase: 'pulling', pulledCount: 0 })
       const pullResult = await this.pullAll(syncGeneration)
 
-      // Step 2: Insert pulled records into synced_records
+      // Step 2: Insert pulled records into synced_records.
+      // The server returns every device's records, including our own. Our own
+      // rows already live in `records` (origin = local) — and for tools whose
+      // local id differs from the wire id (e.g. Claude Code message ids) they
+      // would otherwise be merged back as fresh "local" rows and re-pushed.
       let insertedCount = 0
       for (const record of pullResult.records) {
+        if (record.deviceInstanceId === this.options.deviceInstanceId) continue
         try {
           insertSyncedRecord(this.db, record)
           insertedCount++
@@ -47,7 +56,7 @@ export class CloudSyncOrchestrator {
 
       // Step 3: Merge synced_records into records
       this.options.onProgress?.({ phase: 'merging', pulledCount: insertedCount })
-      const mergedCount = mergeSyncedRecordsIntoRecords(this.db)
+      const mergedCount = mergeSyncedRecordsIntoRecords(this.db, this.options.deviceInstanceId)
 
       // Step 4: Push local records to cloud
       this.options.onProgress?.({ phase: 'uploading', pulledCount: insertedCount })
@@ -55,7 +64,7 @@ export class CloudSyncOrchestrator {
 
       // Step 5: Mark local records as synced
       const target = this.options.target ?? 'cloud'
-      const unsynced = getUnsyncedRecords(this.db, target)
+      const unsynced = this.getUploadableRecords(target)
       if (unsynced.length > 0) {
         markRecordsSynced(this.db, unsynced.map(r => r.id), Date.now(), target)
       }
@@ -104,8 +113,19 @@ export class CloudSyncOrchestrator {
     return { records: allRecords, syncGeneration }
   }
 
+  /**
+   * Local rows eligible for push: parsed on this device and stamped with its
+   * id. The query filters on provenance; the explicit predicate is the final
+   * guard so nothing pulled from another device is ever pushed as ours.
+   */
+  private getUploadableRecords(target: string) {
+    const deviceInstanceId = this.options.deviceInstanceId
+    return getUnsyncedRecords(this.db, target, deviceInstanceId)
+      .filter(record => isUploadableLocalRecord(record, deviceInstanceId))
+  }
+
   private async push(syncGeneration: number): Promise<number> {
-    const unsynced = getUnsyncedRecords(this.db, this.options.target ?? 'cloud')
+    const unsynced = this.getUploadableRecords(this.options.target ?? 'cloud')
     if (unsynced.length === 0) {
       return 0
     }

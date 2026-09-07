@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import { getToolCallStats } from '../db/tool-calls.js'
+import { LOCAL_RECORDS_WHERE } from '../db/records.js'
 
 export interface SummaryOptions {
   device?: string
@@ -28,7 +29,8 @@ export function generateSummary(db: Database.Database, options?: SummaryOptions)
   let byToolSql: string
   let byToolParams: Record<string, unknown> = {}
 
-  const localOnlyFilter = "AND source_file NOT LIKE 'synced/%'"
+  // Rows merged from synced_records carry origin = 'synced'; they are counted via synced_records instead.
+  const localOnlyFilter = `AND ${LOCAL_RECORDS_WHERE}`
   const toolWhere = options?.tool ? 'AND tool = @tool' : ''
   const toolParam = options?.tool ? { tool: options.tool } : {}
   const timeWhere = [

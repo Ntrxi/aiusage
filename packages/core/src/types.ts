@@ -28,6 +28,15 @@ export const TOOLS = [
 ] as const
 export type Tool = (typeof TOOLS)[number]
 
+/**
+ * Provenance of a row in the local `records` table.
+ * - `local`: produced by a parser on this device. Only these rows may be uploaded, and only
+ *   under this device's own sync namespace.
+ * - `synced`: copied from `synced_records` (pulled from another device) so local queries can
+ *   see it. Never uploaded, never counted as local usage.
+ */
+export type RecordOrigin = 'local' | 'synced'
+
 export interface StatsRecord {
   id: string                           // sha256(sourceFile + lineOffset) 前 16 位 hex
   ts: number                           // Unix 时间戳（毫秒）
@@ -51,6 +60,7 @@ export interface StatsRecord {
   device: string                       // 设备别名
   deviceInstanceId: string             // 当前安装实例生成的稳定设备实例 ID
   platform?: string                    // 'win32' | 'darwin' | 'linux'
+  origin?: RecordOrigin               // 'local' = parsed on this device (uploadable); 'synced' = pulled from another device (never re-uploaded)
 }
 
 export interface ToolCallRecord {
