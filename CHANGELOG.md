@@ -5,10 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.14] - 2026-09-07
 
 ### Fixed
-- **Cross-device sync re-uploaded pulled records** — records pulled from another device kept their real `source_file`, so the `source_file NOT LIKE 'synced/%'` heuristic treated them as local and re-uploaded them under the pulling device's namespace with colliding ids (`line_offset = 0`), double-counting usage on every machine. Provenance is now an explicit `records.origin` column (`local` | `synced`); only local rows stamped with the current device id are uploaded, and only under that device's namespace. Pull ignores lines that do not belong to the namespace they sit in, and echoes of the device's own records. Migration v13 back-fills `origin` deterministically for existing databases. A new `aiusage sync --repair [--apply] [--all-namespaces]` command reports and, on request, removes contamination from the local database and the remote namespaces. See `docs/sync-repair.md`.
+- **Cross-device sync re-uploaded pulled records** ([#51](https://github.com/juliantanx/aiusage/pull/51) by [@Ntrxi](https://github.com/Ntrxi)) — records pulled from another device kept their real `source_file`, so the `source_file NOT LIKE 'synced/%'` heuristic treated them as local and re-uploaded them under the pulling device's namespace with colliding ids (`line_offset = 0`), double-counting usage on every machine. Provenance is now an explicit `records.origin` column (`local` | `synced`); only local rows stamped with the current device id are uploaded, and only under that device's namespace. Pull ignores lines that do not belong to the namespace they sit in, and echoes of the device's own records. Migration v13 back-fills `origin` deterministically for existing databases. A new `aiusage sync --repair [--apply] [--all-namespaces]` command reports and, on request, removes contamination from the local database and the remote namespaces. See [`docs/sync-repair.md`](./docs/sync-repair.md).
 
 ---
 
@@ -446,6 +446,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/juliantanx/aiusage/compare/v1.5.10...v1.5.11

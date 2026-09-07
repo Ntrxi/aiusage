@@ -75,6 +75,7 @@ Docker persists AIUsage data with the `~/.aiusage` mount. To parse AI tool logs 
 | `aiusage export --range month` | Export usage data |
 | `aiusage init` | Configure optional sync |
 | `aiusage sync` | Sync with the configured backend |
+| `aiusage sync --repair` | Inspect and repair cross-device sync contamination (dry run by default) |
 | `aiusage widget` | Launch the desktop tray widget |
 | `aiusage leaderboard` | View public leaderboard rankings |
 | `aiusage login` / `aiusage upload` | Authorize this device and upload aggregate leaderboard data |
@@ -124,6 +125,7 @@ Security issues should be reported privately when possible. See [SECURITY.md](./
 Sync and leaderboard are independent optional features.
 
 - **Sync** keeps your own devices aligned through GitHub, S3, R2, or MinIO. Configure it with `aiusage init`, then run `aiusage sync`.
+- If versions up to 1.5.13 caused duplicate cross-device records, use `aiusage sync --repair` to inspect them before applying cleanup. See the [sync repair guide](./docs/sync-repair.md).
 - **Leaderboard** is public ranking for users who explicitly upload aggregate totals. Authorize a device with `aiusage login`, then run `aiusage upload`.
 - Anonymous mode is available in [site settings](https://aiusage.jtanx.com/settings) for leaderboard participation.
 

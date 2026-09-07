@@ -1,6 +1,6 @@
 {
   "name": "@juliantanx/aiusage-widget",
-  "version": "1.5.13",
+  "version": "1.5.14",
   "private": false,
   "description": "System tray widget for AIUsage — view AI token usage from your system tray",
   "keywords": [

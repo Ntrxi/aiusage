@@ -75,6 +75,7 @@ Docker 示例中的 `~/.aiusage` 挂载只会持久化 AIUsage 自己的数据�
 | `aiusage export --range month` | 导出用量数据 |
 | `aiusage init` | 配置可选同步 |
 | `aiusage sync` | 使用已配置的后端同步数据 |
+| `aiusage sync --repair` | 检查并修复跨设备同步污染（默认仅预览） |
 | `aiusage widget` | 启动桌面托盘小组件 |
 | `aiusage leaderboard` | 查看公开排行榜 |
 | `aiusage login` / `aiusage upload` | 授权当前设备并上传聚合排行榜数据 |
@@ -124,6 +125,7 @@ AIUsage 采用本地优先设计。
 同步和排行榜是两个互相独立的可选功能。
 
 - **同步** 用于在自己的多台设备之间保持数据一致，支持 GitHub、S3、R2 或 MinIO。使用 `aiusage init` 配置，再运行 `aiusage sync`。
+- 如果 1.5.13 及更早版本产生了跨设备重复记录，可先用 `aiusage sync --repair` 检查，再决定是否执行清理。详见[同步修复指南](./docs/sync-repair.md)。
 - **排行榜** 面向明确选择分享聚合数据的用户。先用 `aiusage login` 授权设备，再运行 `aiusage upload`。
 - 参与排行榜时，可在 [站点设置](https://aiusage.jtanx.com/settings) 中开启匿名模式。
 

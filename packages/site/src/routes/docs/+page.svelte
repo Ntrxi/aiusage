@@ -329,7 +329,7 @@
       <div class="hero-meta">
         <span class="meta-tag">{zh ? '开源' : 'Open Source'}</span>
         <span class="meta-tag">MIT</span>
-        <span class="meta-tag">v1.5.13</span>
+        <span class="meta-tag">v1.5.14</span>
       </div>
     </header>
 
@@ -1015,6 +1015,13 @@
           ['S3 / R2 / MinIO', '<code>aiusage init --backend s3 --bucket my-bucket --prefix aiusage/ --endpoint https://example.r2.cloudflarestorage.com --access-key-id xxx --secret-access-key yyy<br>aiusage sync</code>'],
         ]}
       />
+      <Callout type="info">
+        {zh
+          ? '如果 1.5.13 及更早版本产生了跨设备重复记录，请先升级所有设备，再运行 aiusage sync --repair 预览清理范围；确认报告后使用 --apply 执行。'
+          : 'If versions up to 1.5.13 caused duplicate cross-device records, upgrade every device, then run aiusage sync --repair to preview cleanup. After reviewing the report, use --apply to proceed.'
+        }
+        {' '}<a href="https://github.com/juliantanx/aiusage/blob/main/docs/sync-repair.md">{zh ? '查看同步修复指南' : 'Read the sync repair guide'}</a>.
+      </Callout>
       <Callout type="warn">
         {zh
           ? 'GitHub 和 S3 同步会记录 consent 指纹。如果 repo、bucket、prefix、endpoint、region 或同步字段发生变化，需要重新运行 aiusage init 批准新目标。'
@@ -1511,6 +1518,7 @@ aiusage upload-status
           ['<code>login</code>', zh ? '授权当前设备（用于排行榜上传）' : 'Authorize this device (for leaderboard uploads)'],
           ['<code>logout</code>', zh ? '删除本地设备凭证' : 'Remove local device credentials'],
           ['<code>sync</code>', zh ? '与远程后端执行推送 / 拉取 / 合并同步（支持 GitHub / S3）' : 'Push, pull, and merge data with the remote backend (GitHub / S3)'],
+          ['<code>sync --repair [--apply] [--all-namespaces]</code>', zh ? '预览或执行跨设备同步污染清理；默认仅检查当前设备命名空间和本地数据库' : 'Preview or apply cross-device sync cleanup; defaults to this device namespace and local database'],
           ['<code>recalc</code>', zh ? '按最新定价重新计算费用' : 'Recalculate costs with latest pricing'],
           ['<code>init</code>', zh ? '初始化同步后端（支持 GitHub / S3）' : 'Initialize sync backend (GitHub / S3)'],
           ['<code>widget</code>', zh ? '启动桌面托盘 Widget' : 'Launch the desktop tray widget'],

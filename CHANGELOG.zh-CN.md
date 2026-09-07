@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [1.5.14] - 2026-09-07
+
+### 修复
+- **跨设备同步会重新上传已拉取记录**（[#51](https://github.com/juliantanx/aiusage/pull/51)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 从其他设备拉取的记录保留了真实 `source_file`，旧逻辑因此误将其视为本地记录，并以当前设备的命名空间和冲突 ID 重新上传，造成各设备重复计量。现在使用显式的 `records.origin` 字段标记来源，只上传属于当前设备的本地记录，并忽略命名空间不匹配及本机回声记录；迁移 v13 会确定性地回填现有数据库。新增 `aiusage sync --repair [--apply] [--all-namespaces]`，可先报告、再按需清理本地数据库和远端命名空间中的污染数据。详见[同步修复指南](./docs/sync-repair.md)。
+
+---
+
 ## [1.5.13] - 2026-09-01
 
 ### 修复
@@ -439,6 +446,7 @@
 
 ---
 
+[1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12
 [1.5.11]: https://github.com/juliantanx/aiusage/compare/v1.5.10...v1.5.11
