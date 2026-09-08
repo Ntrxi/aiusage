@@ -38,6 +38,8 @@ describe('discovery path resolution', () => {
     delete process.env.AIUSAGE_CODEFUSE_PATH
     delete process.env.CODEFUSE_HOME
     delete process.env.GROK_HOME
+    delete process.env.GEMINI_HOME
+    delete process.env.AIUSAGE_ANTIGRAVITY_PATH
     for (const dir of tempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -162,6 +164,44 @@ describe('discovery path resolution', () => {
     const { discoverLogFiles } = await loadDiscovery({ home, platform: 'linux' })
 
     expect(discoverLogFiles().find((result) => result.tool === 'grok')?.paths).toEqual([updatesPath])
+  })
+
+  it('discovers Antigravity conversation databases without mirrored transcripts', async () => {
+    const home = makeHome()
+    const appRoot = join(home, '.gemini', 'antigravity')
+    const cliRoot = join(home, '.gemini', 'antigravity-cli')
+    const backupRoot = join(home, '.gemini', 'antigravity-backup')
+    const configRoot = join(home, '.config', 'antigravity')
+    const appConversations = join(appRoot, 'conversations')
+    const cliConversations = join(cliRoot, 'conversations')
+    const backupConversations = join(backupRoot, 'conversations')
+    const configConversations = join(configRoot, 'conversations')
+    const transcriptDir = join(appRoot, 'brain', 'session-1', '.system_generated', 'logs')
+    mkdirSync(appConversations, { recursive: true })
+    mkdirSync(cliConversations, { recursive: true })
+    mkdirSync(backupConversations, { recursive: true })
+    mkdirSync(configConversations, { recursive: true })
+    mkdirSync(join(transcriptDir, 'chunks', 'transcript'), { recursive: true })
+    const appDb = join(appConversations, 'session-1.db')
+    const cliDb = join(cliConversations, 'session-2.db')
+    const backupDb = join(backupConversations, 'session-3.db')
+    const configDb = join(configConversations, 'session-4.db')
+    writeFileSync(appDb, '')
+    writeFileSync(cliDb, '')
+    writeFileSync(backupDb, '')
+    writeFileSync(configDb, '')
+    writeFileSync(join(transcriptDir, 'transcript.jsonl'), '{}\n')
+    writeFileSync(join(transcriptDir, 'transcript_full.jsonl'), '{}\n')
+    writeFileSync(join(transcriptDir, 'chunks', 'transcript', '00000000.jsonl'), '{}\n')
+
+    const { discoverLogFiles, discoverTools } = await loadDiscovery({ home, platform: 'win32' })
+    const detected = discoverTools().find((tool) => tool.sourceKey === 'antigravity')
+
+    expect(detected?.status).toBe('found')
+    expect(detected?.fileCount).toBe(4)
+    expect(detected?.path).toBe(appRoot)
+    expect(detected?.paths).toEqual([appRoot, cliRoot, backupRoot, configRoot])
+    expect(discoverLogFiles().find((result) => result.tool === 'antigravity')?.paths).toEqual([appDb, cliDb, backupDb, configDb])
   })
 
   it('counts Codex archived sessions when regular sessions are absent', async () => {

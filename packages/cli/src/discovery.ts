@@ -526,8 +526,60 @@ function probeAntigravity(ctx: ProbeContext): string | null {
   const legacy = ctx.legacySources?.['antigravity']
   if (legacy) return legacy
   const home = ctx.env.GEMINI_HOME ?? join(ctx.home, '.gemini')
-  const dir = join(home, 'tmp', 'antigravity')
-  return existsSync(dir) ? dir : null
+  const roots = [
+    join(home, 'antigravity'),
+    join(home, 'antigravity-cli'),
+    join(home, 'antigravity-ide'),
+    join(home, 'antigravity-backup'),
+    join(home, 'tmp', 'antigravity'),
+    join(ctx.home, '.config', 'antigravity'),
+  ]
+  return roots.find((dir) => existsSync(dir)) ?? null
+}
+
+function antigravityRoots(ctx: ProbeContext, primaryPath: string): string[] {
+  if (envOverride('antigravity', ctx.env) || ctx.legacySources?.['antigravity']) return [primaryPath]
+  const home = ctx.env.GEMINI_HOME ?? join(ctx.home, '.gemini')
+  return unique([
+    join(home, 'antigravity'),
+    join(home, 'antigravity-cli'),
+    join(home, 'antigravity-ide'),
+    join(home, 'antigravity-backup'),
+    join(home, 'tmp', 'antigravity'),
+    join(ctx.home, '.config', 'antigravity'),
+  ].filter((dir) => existsSync(dir)))
+}
+
+function findAntigravityDataFiles(ctx: ProbeContext, primaryPath: string): string[] {
+  const roots = antigravityRoots(ctx, primaryPath)
+  const paths: string[] = []
+  const customPath = Boolean(envOverride('antigravity', ctx.env) || ctx.legacySources?.['antigravity'])
+
+  for (const root of roots) {
+    try {
+      const stat = statSync(root)
+      if (stat.isFile()) {
+        if (extname(root) === '.db' || extname(root) === '.jsonl') paths.push(root)
+        continue
+      }
+
+      const conversationsDir = basename(root) === 'conversations' ? root : join(root, 'conversations')
+      const databaseCount = paths.length
+      if (existsSync(conversationsDir)) {
+        for (const entry of readdirSync(conversationsDir, { withFileTypes: true })) {
+          if (entry.isFile() && extname(entry.name) === '.db') paths.push(join(conversationsDir, entry.name))
+        }
+      }
+
+      // Preserve explicitly configured and legacy JSONL sources. Current Antigravity
+      // transcripts do not contain usage counters and have multiple mirrored copies.
+      if (paths.length === databaseCount && (customPath || root.replace(/\\/g, '/').endsWith('/tmp/antigravity'))) {
+        paths.push(...findJsonlFiles(root))
+      }
+    } catch {}
+  }
+
+  return unique(paths)
 }
 
 function ideRoots(ctx: ProbeContext): string[] {
@@ -755,10 +807,14 @@ export function discoverTools(env: NodeJS.ProcessEnv = process.env): DetectedToo
         ? codexLogDirs(ctx, path)
         : entry.sourceKey === 'codefuse'
           ? codeFuseLogDirs(ctx, path)
-          : [path]
+          : entry.sourceKey === 'antigravity'
+            ? antigravityRoots(ctx, path)
+            : [path]
     let fileCount = 0
     if (entry.sourceKey === 'codefuse') {
       fileCount = findCodeFuseLogFiles(ctx, path).length
+    } else if (entry.sourceKey === 'antigravity') {
+      fileCount = findAntigravityDataFiles(ctx, path).length
     } else {
       for (const detectedPath of detectedPaths) {
         try {
@@ -786,7 +842,7 @@ export function discoverTools(env: NodeJS.ProcessEnv = process.env): DetectedToo
     }
 
     const status = fileCount > 0 ? 'found' as const : 'empty' as const
-    const visiblePaths = entry.sourceKey === 'codex' || entry.sourceKey === 'codefuse'
+    const visiblePaths = entry.sourceKey === 'codex' || entry.sourceKey === 'codefuse' || entry.sourceKey === 'antigravity'
       ? detectedPaths.filter((detectedPath) => existsSync(detectedPath))
       : detectedPaths
     return {
@@ -794,7 +850,7 @@ export function discoverTools(env: NodeJS.ProcessEnv = process.env): DetectedToo
       sourceKey: entry.sourceKey,
       label: entry.label,
       path,
-      paths: visiblePaths.length > 1 || ((entry.sourceKey === 'codex' || entry.sourceKey === 'codefuse') && visiblePaths.length > 0) ? visiblePaths : undefined,
+      paths: visiblePaths.length > 1 || ((entry.sourceKey === 'codex' || entry.sourceKey === 'codefuse' || entry.sourceKey === 'antigravity') && visiblePaths.length > 0) ? visiblePaths : undefined,
       fileCount,
       status,
     }
@@ -903,7 +959,6 @@ export function discoverLogFiles(env: NodeJS.ProcessEnv = process.env): { tool: 
     { tool: 'kiro', path: probeKiroOverridePath(ctx), filter: (p) => extname(p) === '.jsonl' || extname(p) === '.json' },
     { tool: 'kiro', path: kiroWorkspaceSessionsDir(ctx), filter: (p) => extname(p) === '.json' && basename(p) !== 'sessions.json' },
     { tool: 'grok', path: probeGrok(ctx), filter: (p) => basename(p) === 'updates.jsonl' },
-    { tool: 'antigravity', path: probeAntigravity(ctx) },
     { tool: 'omp', path: probeOmp(ctx) },
     { tool: 'pi', path: probePi(ctx) },
     { tool: 'craft', path: probeCraft(ctx) },
@@ -917,6 +972,12 @@ export function discoverLogFiles(env: NodeJS.ProcessEnv = process.env): { tool: 
       : findJsonlFiles(source.path)
     if (source.filter) paths = paths.filter(source.filter)
     if (paths.length > 0) results.push({ tool: source.tool, paths: unique(paths) })
+  }
+
+  const antigravityPath = probeAntigravity(ctx)
+  if (antigravityPath) {
+    const paths = findAntigravityDataFiles(ctx, antigravityPath)
+    if (paths.length > 0) results.push({ tool: 'antigravity', paths })
   }
 
   const roocodePath = probeRooCode(ctx)

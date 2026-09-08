@@ -23,6 +23,7 @@ import { runParseKiro } from './parse-kiro.js'
 import { runParseZcode } from './parse-zcode.js'
 import { runParseTrae } from './parse-trae.js'
 import { runParseCodeBuddy } from './parse-codebuddy.js'
+import { runParseAntigravity } from './parse-antigravity.js'
 import type { ProgressInfo } from '../progress.js'
 
 interface ParseResult {
@@ -525,6 +526,37 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
         const stat = statSync(filePath)
         const entry = wm.getEntry(tool, filePath)
         const offset = entry?.offset ?? 0
+
+        if (tool === 'antigravity' && filePath.endsWith('.db')) {
+          // Query from the row cursor even when the main file is unchanged because
+          // active Antigravity sessions can append usage through SQLite's WAL.
+          const antigravityDb = new Database(filePath, { readonly: true })
+          try {
+            const result = runParseAntigravity(antigravityDb, {
+              dbPath: filePath,
+              device,
+              deviceInstanceId,
+              platform: devicePlatform,
+              now: Date.now(),
+              fallbackTs: stat.mtimeMs,
+              startIndex: entry && stat.size >= entry.size ? offset : 0,
+              exchangeRate,
+            })
+            for (const record of result.records) insertRecord(db, record)
+            parsedCount += result.records.length
+            errors.push(...result.errors.map((error) => `${filePath}: ${error}`))
+            wm.setEntry(tool, filePath, {
+              offset: result.nextIndex,
+              size: stat.size,
+              mtime: stat.mtimeMs,
+            })
+            wm.save()
+          } finally {
+            antigravityDb.close()
+          }
+          onProgress({ phase: 'Parsing SQLite', tool, current: toolIndex, total: toolTotal, records: parsedCount, toolCalls: toolCallCount })
+          continue
+        }
 
         if (offset >= stat.size) {
           onProgress({ phase: 'Parsing logs', tool, current: toolIndex, total: toolTotal, records: parsedCount, toolCalls: toolCallCount })
