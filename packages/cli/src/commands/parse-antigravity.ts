@@ -160,10 +160,71 @@ function generationTimestamp(chatModel: ProtoField[]): number | undefined {
   return timestampFromFields(firstMessage(generationInfo, 4))
 }
 
+const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
+  'gemini 3.8 flash': 'gemini-3.8-flash',
+  'gemini 3.7 flash': 'gemini-3.7-flash',
+  'gemini 3.7 flash thinking': 'gemini-3.7-flash',
+  'gemini 3.7 pro': 'gemini-3.7-pro',
+  'gemini 3.7 pro thinking': 'gemini-3.7-pro',
+  'gemini 3.6 flash': 'gemini-3.6-flash',
+  'gemini 3 flash': 'gemini-3.6-flash',
+  'gemini 3.6 pro': 'gemini-3.6-pro',
+  'gemini 3 pro': 'gemini-3-pro',
+  'gemini 3 pro thinking': 'gemini-3-pro',
+  'gemini 2.5 flash': 'gemini-2.5-flash',
+  'gemini 2.5 pro': 'gemini-2.5-pro',
+  'gemini 2.0 flash': 'gemini-2.0-flash',
+  'gemini 2 flash': 'gemini-2.0-flash',
+  'gemini 2.0 pro': 'gemini-2.0-pro',
+  'gemini 1.5 flash': 'gemini-1.5-flash',
+  'gemini 1.5 pro': 'gemini-1.5-pro',
+  'claude opus 4.6': 'claude-opus-4-6',
+  'claude 4.6 opus': 'claude-opus-4-6',
+  'claude sonnet 4.6': 'claude-sonnet-4-6',
+  'claude 4.6 sonnet': 'claude-sonnet-4-6',
+  'claude sonnet 4.5': 'claude-sonnet-4-5',
+  'claude 3.7 sonnet': 'claude-3-7-sonnet',
+  'claude 3.7 sonnet thinking': 'claude-3-7-sonnet',
+  'claude 3.5 sonnet': 'claude-3-5-sonnet',
+  'claude 3.5 haiku': 'claude-3-5-haiku',
+  'claude 3 opus': 'claude-3-opus',
+  'gpt-oss 120b': 'gpt-oss-120b-medium',
+  'model_placeholder_m26': 'claude-opus-4-6',
+  'model_placeholder_m35': 'claude-sonnet-4-6',
+  'model_placeholder_m16': 'gemini-3.1-pro',
+  'model_placeholder_m36': 'gemini-3.1-pro',
+  'model_placeholder_m37': 'gemini-3.1-pro',
+  'model_placeholder_m18': 'gemini-3-flash-preview',
+  'model_placeholder_m47': 'gemini-3-flash-preview',
+  'model_placeholder_m84': 'gemini-3-flash-preview',
+  'model_placeholder_m20': 'gemini-3.5-flash-medium',
+  'model_placeholder_m132': 'gemini-3.5-flash-high',
+  'model_placeholder_m133': 'gemini-3.5-flash-high',
+  'model_placeholder_m187': 'gemini-3.5-flash-extra-low',
+  'model_openai_gpt_oss_120b_medium': 'gpt-oss-120b-medium',
+  'gemini-pro-default': 'gemini-3.1-pro',
+  'gemini-pro-agent': 'gemini-3.1-pro',
+  'gemini-3-flash-agent': 'gemini-3.5-flash-high',
+  'gemini-3-flash-agent-a': 'gemini-3.5-flash-high',
+  'gemini-3-flash-agent-b': 'gemini-3.5-flash-high',
+  'gemini-3-flash-a': 'gemini-3.5-flash-high',
+  'gemini-3-flash-b': 'gemini-3.5-flash-high',
+  'gemini-3-flash-c': 'gemini-3-flash-preview',
+  'gemini-3-flash': 'gemini-3-flash-preview',
+  'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
+  'gemini-3.1-pro-high': 'gemini-3.1-pro',
+  'gemini-3.1-pro-low': 'gemini-3.1-pro',
+  'gemini-3-pro-high': 'gemini-3-pro',
+  'gemini-3-pro-low': 'gemini-3-pro',
+}
+
 function normalizeModel(value: string | undefined): string | undefined {
   if (!value?.trim()) return undefined
-  const model = value.includes('/') ? value.split('/').pop() : value
-  return model?.trim() || undefined
+  const model = (value.includes('/') ? value.split('/').pop() : value)?.trim()
+  if (!model) return undefined
+  const key = model.toLowerCase()
+  const base = key.replace(/\s*\([^)]*\)\s*$/, '').trim()
+  return ANTIGRAVITY_MODEL_ALIASES[key] ?? ANTIGRAVITY_MODEL_ALIASES[base] ?? model
 }
 
 function modelNameFromId(modelId: number): string {
@@ -310,6 +371,27 @@ function hasTable(db: Database.Database, table: string): boolean {
   return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(table) != null
 }
 
+function readTrajectoryTimestamp(db: Database.Database, errors: string[]): number | undefined {
+  try {
+    if (!hasTable(db, 'trajectory_metadata_blob')) return undefined
+    const rows = db.prepare('SELECT data FROM trajectory_metadata_blob ORDER BY rowid').all() as Array<{ data: unknown }>
+    let timestamp: number | undefined
+    for (const [index, row] of rows.entries()) {
+      try {
+        if (!Buffer.isBuffer(row.data)) throw new Error('trajectory metadata is not a blob')
+        const candidate = timestampFromFields(firstMessage(readFields(row.data), 2))
+        timestamp ??= candidate
+      } catch (error) {
+        errors.push(`trajectory metadata ${index}: ${error instanceof Error ? error.message : error}`)
+      }
+    }
+    return timestamp
+  } catch (error) {
+    errors.push(`trajectory metadata: ${error instanceof Error ? error.message : error}`)
+    return undefined
+  }
+}
+
 export function runParseAntigravity(db: Database.Database, options: AntigravityImportOptions): AntigravityImportResult {
   const { dbPath, device, deviceInstanceId, platform, now, fallbackTs, startIndex, exchangeRate } = options
   const errors: string[] = []
@@ -320,8 +402,10 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     return { records: [], nextIndex, errors: ['conversation database does not contain gen_metadata table'] }
   }
 
+  const trajectoryTs = readTrajectoryTimestamp(db, errors)
   const generations: GenerationMetadata[] = []
   const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx').all() as Array<{ idx: number; data: Buffer }>
+  const latestGenerationIndex = Math.max(-1, ...rows.map((row) => Number(row.idx)).filter(Number.isFinite))
   for (const row of rows) {
     const index = Number(row.idx)
     try {
@@ -370,11 +454,12 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
         .flatMap(([, step]) => step.events),
       ...generation.events.map((event) => ({ ...event, model: event.model ?? currentModel, ts: event.ts ?? linkedTs })),
     ]
-    if (rowEvents.length === 0) break
-    for (const event of rowEvents) event.model ??= currentModel ?? generationModel
-    events.push(...rowEvents)
+    if (rowEvents.length === 0 && generation.index === latestGenerationIndex) break
     nextIndex = generation.index + 1
     previousStep = lastStep
+    if (rowEvents.length === 0) continue
+    for (const event of rowEvents) event.model ??= currentModel ?? generationModel
+    events.push(...rowEvents)
   }
 
   const sessionId = basename(dbPath).replace(/\.db$/i, '') || 'unknown'
@@ -387,7 +472,7 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     const identity = [...event.usage.identities].sort()[0] ?? event.sourceKey
     return {
       id: generateRecordId(deviceInstanceId, `antigravity:${sessionId}:${identity}`, 0),
-      ts: event.ts ?? fallbackTs + index,
+      ts: event.ts ?? trajectoryTs ?? fallbackTs + index,
       ingestedAt: now,
       updatedAt: now,
       lineOffset: event.lineOffset,

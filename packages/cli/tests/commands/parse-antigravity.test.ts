@@ -62,10 +62,12 @@ function generationMetadata(options: {
   usage?: Buffer
   retries?: Buffer[]
   stepIndices?: number[]
+  ts?: number
 }): Buffer {
   const chatModel = message(
     options.modelId ? field(3, options.modelId) : undefined,
     options.usage ? field(4, options.usage) : undefined,
+    options.ts != null ? field(9, message(field(4, timestamp(options.ts)))) : undefined,
     ...(options.retries ?? []).map((value) => field(17, retry(value))),
     options.model ? field(19, options.model) : undefined,
   )
@@ -81,6 +83,10 @@ function timestamp(ts: number): Buffer {
     field(1, Math.floor(ts / 1000)),
     field(2, (ts % 1000) * 1_000_000),
   )
+}
+
+function trajectoryMetadata(ts: number): Buffer {
+  return message(field(2, timestamp(ts)))
 }
 
 function stepMetadata(options: {
@@ -105,6 +111,7 @@ describe('parse-antigravity', () => {
     db.exec(`
       CREATE TABLE gen_metadata (idx INTEGER, data BLOB, size INTEGER);
       CREATE TABLE steps (idx INTEGER, metadata BLOB);
+      CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);
     `)
   })
 
@@ -243,6 +250,42 @@ describe('parse-antigravity', () => {
     })
   })
 
+  it('normalizes Antigravity display labels and routing aliases before pricing', () => {
+    const models = [
+      ['Gemini 3 Pro', 'gemini-3-pro', 'google'],
+      ['Claude Sonnet 4.6 (Thinking)', 'claude-sonnet-4-6', 'anthropic'],
+      ['gemini-3-flash-agent', 'gemini-3.5-flash-high', 'google'],
+      ['MODEL_PLACEHOLDER_M35', 'claude-sonnet-4-6', 'anthropic'],
+    ] as const
+    for (const [index, [model]] of models.entries()) {
+      db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(index, generationMetadata({
+        model,
+        usage: usage({ input: 1_000_000, totalOutput: 1, responseId: `response-${index}` }),
+      }), 1)
+    }
+
+    const records = parse().records
+
+    expect(records).toHaveLength(models.length)
+    for (const [index, [, model, provider]] of models.entries()) {
+      expect(records[index]).toMatchObject({ model, provider, costSource: 'pricing' })
+      expect(records[index].cost).toBeGreaterThan(0)
+    }
+  })
+
+  it('preserves unknown Antigravity model names', () => {
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'Future Experimental Model',
+      usage: usage({ input: 20, totalOutput: 5 }),
+    }), 1)
+
+    expect(parse().records[0]).toMatchObject({
+      model: 'Future Experimental Model',
+      provider: 'unknown',
+      costSource: 'unknown',
+    })
+  })
+
   it('resumes from the generation metadata index', () => {
     const data = generationMetadata({
       model: 'gemini-2.5-flash',
@@ -255,6 +298,43 @@ describe('parse-antigravity', () => {
 
     expect(result.records.map((record) => record.lineOffset)).toEqual([1])
     expect(result.nextIndex).toBe(2)
+  })
+
+  it('advances past an empty generation when a later generation has usage', () => {
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({}), 0)
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(1, generationMetadata({
+      model: 'gemini-2.5-flash',
+      usage: usage({ input: 100, totalOutput: 25 }),
+    }), 1)
+
+    const result = parse()
+
+    expect(result.records).toHaveLength(1)
+    expect(result.records[0]).toMatchObject({ lineOffset: 1, inputTokens: 100 })
+    expect(result.nextIndex).toBe(2)
+  })
+
+  it('uses the trajectory timestamp before the database mtime fallback', () => {
+    const trajectoryTs = Date.UTC(2026, 7, 31, 10, 11, 12, 345)
+    db.prepare('INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)').run('main', trajectoryMetadata(trajectoryTs))
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'gemini-2.5-flash',
+      usage: usage({ input: 20, totalOutput: 5 }),
+    }), 1)
+
+    expect(parse().records[0].ts).toBe(trajectoryTs)
+  })
+
+  it('prefers generation timestamps over the trajectory timestamp', () => {
+    const generationTs = Date.UTC(2026, 8, 1, 1, 2, 3, 456)
+    db.prepare('INSERT INTO trajectory_metadata_blob (id, data) VALUES (?, ?)').run('main', trajectoryMetadata(generationTs - 60_000))
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'gemini-2.5-flash',
+      usage: usage({ input: 20, totalOutput: 5 }),
+      ts: generationTs,
+    }), 1)
+
+    expect(parse().records[0].ts).toBe(generationTs)
   })
 
   it('leaves an unfinished metadata row for a later parse', () => {
