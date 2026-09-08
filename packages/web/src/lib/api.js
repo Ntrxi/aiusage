@@ -11,8 +11,10 @@ function buildUrl(base, params) {
 const swrCache = new Map()
 const inflightRequests = new Map()
 
-async function apiFetch(url, { signal, swr = false } = {}) {
-  const request = () => signal ? fetch(url, { signal }) : fetch(url)
+async function apiFetch(url, { signal, swr = false, method } = {}) {
+  const request = () => method
+    ? fetch(url, signal ? { method, signal } : { method })
+    : signal ? fetch(url, { signal }) : fetch(url)
 
   // Stale-while-revalidate: return cached data immediately, refresh in background
   if (swr && swrCache.has(url)) {
@@ -96,7 +98,7 @@ export async function fetchProjects(params) {
 }
 
 export async function refreshData() {
-  return apiFetch('/api/refresh')
+  return apiFetch('/api/refresh', { method: 'POST' })
 }
 
 export async function fetchPricing() {

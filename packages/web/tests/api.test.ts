@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fetchSummary, fetchTokens, fetchCost } from '../src/lib/api.js'
+import { fetchSummary, fetchTokens, fetchCost, refreshData } from '../src/lib/api.js'
 
 // Mock fetch
 const mockFetch = vi.fn()
@@ -31,6 +31,19 @@ describe('API Client', () => {
 
     const result = await fetchTokens({ range: 'week' })
     expect(result).toEqual(mockData)
+  })
+
+  it('refreshes data via POST', async () => {
+    const mockData = { ok: true }
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(mockData),
+    })
+
+    const result = await refreshData()
+
+    expect(result).toEqual(mockData)
+    expect(mockFetch).toHaveBeenCalledWith('/api/refresh', { method: 'POST' })
   })
 
   it('handles API errors', async () => {
