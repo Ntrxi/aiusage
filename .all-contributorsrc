@@ -85,6 +85,16 @@
       "contributions": [
         "bug"
       ]
+    },
+    {
+      "login": "Ntrxi",
+      "name": "Aaron C",
+      "avatar_url": "https://avatars.githubusercontent.com/u/121737839?v=4",
+      "profile": "https://github.com/Ntrxi",
+      "contributions": [
+        "code",
+        "doc"
+      ]
     }
   ],
   "contributorsPerLine": 7,
