@@ -41,8 +41,9 @@ export function shouldProtectApiPath(pathname: string): boolean {
   if (!pathname.startsWith('/api/')) return false
   if (['/api/auth/status', '/api/auth/login', '/api/auth/logout'].includes(pathname)) return false
 
-  // The home summary is deliberately public; all detailed APIs require auth.
-  if (pathname === '/api/summary') return false
+  // The minimal home-page totals endpoint is deliberately public; every other
+  // data API, including the detailed /api/summary breakdown, requires auth.
+  if (pathname === '/api/home-summary') return false
   return true
 }
 

@@ -432,6 +432,139 @@ function getDeviceFilter(
   }
 }
 
+type SummaryFilter = { where: string; params: Record<string, unknown> }
+
+interface SummaryTotals {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  thinkingTokens: number
+  totalTokens: number
+  totalCost: number
+  activeDays: number
+  totalSessions: number
+}
+
+const SUMMARY_RANGES = ['day', 'week', 'month', 'last30', 'all']
+
+/**
+ * Aggregate totals (and optionally the per-tool breakdown) for the summary
+ * endpoints. Shared by the authenticated /api/summary route and the public
+ * /api/home-summary route so both report identical numbers.
+ */
+function querySummaryTotals(
+  db: Database.Database,
+  df: DeviceFilter,
+  dr: SummaryFilter,
+  tf: SummaryFilter,
+  includeByTool: boolean,
+): { totals: SummaryTotals; byToolRows: any[] } {
+  let totals: any
+  let byToolRows: any[] = []
+
+  if (df.useUnion) {
+    // All devices: UNION records + synced_records (excluding current device's synced copy)
+    const unionSql = `
+      SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, cost, ts, session_id
+      FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
+      UNION ALL
+      SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, cost, ts, session_key AS session_id
+      FROM synced_records WHERE device_instance_id != @currentDeviceId ${dr.where} ${tf.where}
+    `
+    totals = db.prepare(`
+      SELECT
+        COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
+        COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
+        COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
+        COALESCE(SUM(cost), 0) AS totalCost,
+        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT session_id) AS totalSessions
+      FROM (${unionSql})
+    `).get({ ...dr.params, ...df.params, ...tf.params }) as any
+
+    if (includeByTool) byToolRows = db.prepare(`
+      SELECT tool, SUM(tokens) AS tokens, SUM(cost) AS cost FROM (
+        SELECT tool,
+               SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
+               SUM(cost) AS cost
+        FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
+        GROUP BY tool
+        UNION ALL
+        SELECT tool,
+               SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
+               SUM(cost) AS cost
+        FROM synced_records WHERE device_instance_id != @currentDeviceId ${dr.where} ${tf.where}
+        GROUP BY tool
+      ) GROUP BY tool ORDER BY cost DESC
+    `).all({ ...dr.params, ...df.params, ...tf.params }) as any[]
+  } else if (df.where) {
+    // Specific other device: query synced_records only
+    totals = db.prepare(`
+      SELECT
+        COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
+        COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
+        COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
+        COALESCE(SUM(cost), 0) AS totalCost,
+        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT session_key) AS totalSessions
+      FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
+    `).get({ ...dr.params, ...df.params, ...tf.params }) as any
+
+    if (includeByTool) byToolRows = db.prepare(`
+      SELECT tool,
+             SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
+             SUM(cost) AS cost
+      FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
+      GROUP BY tool ORDER BY cost DESC
+    `).all({ ...dr.params, ...df.params, ...tf.params }) as any[]
+  } else {
+    // Current device or legacy: query records only
+    totals = db.prepare(`
+      SELECT
+        COALESCE(SUM(input_tokens), 0) AS inputTokens,
+        COALESCE(SUM(output_tokens), 0) AS outputTokens,
+        COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
+        COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
+        COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
+        COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
+        COALESCE(SUM(cost), 0) AS totalCost,
+        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT session_id) AS totalSessions
+      FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
+    `).get({ ...dr.params, ...tf.params }) as any
+
+    if (includeByTool) byToolRows = db.prepare(`
+      SELECT tool,
+             SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
+             SUM(cost) AS cost
+      FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
+      GROUP BY tool ORDER BY cost DESC
+    `).all({ ...dr.params, ...tf.params }) as any[]
+  }
+  return { totals, byToolRows }
+}
+
+function summaryTotalsPayload(totals: SummaryTotals): SummaryTotals {
+  return {
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    cacheReadTokens: totals.cacheReadTokens,
+    cacheWriteTokens: totals.cacheWriteTokens,
+    thinkingTokens: totals.thinkingTokens,
+    totalTokens: totals.totalTokens,
+    totalCost: totals.totalCost,
+    activeDays: totals.activeDays,
+    totalSessions: totals.totalSessions,
+  }
+}
+
 export function createApiServer(db: Database.Database, options?: ApiServerOptions): http.Server {
   const cfg = loadConfig()
   let weekStart: 0 | 1 = (cfg?.weekStart ?? 1) as 0 | 1
@@ -598,9 +731,26 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
     }
 
     try {
+      // ── /api/home-summary ─────────────────────────────────────────
+      // Deliberately public when a dashboard password is set (see auth.ts).
+      // Only aggregate totals across all devices and tools are returned; the
+      // device/tool filters and per-tool, tool-call, and MCP breakdowns are
+      // reserved for the authenticated /api/summary route.
+      if (url.pathname === '/api/home-summary') {
+        if (range && !SUMMARY_RANGES.includes(range)) {
+          json(res, { error: { code: 'INVALID_PARAM', message: 'Invalid range' } }, 400)
+          return
+        }
+        const df = getDeviceFilter(null, options?.currentDeviceInstanceId)
+        const dr = getDateRangeFilter(range, null, null, '', weekStart)
+        const { totals } = querySummaryTotals(db, df, dr, getToolFilter(null), false)
+        json(res, summaryTotalsPayload(totals))
+        return
+      }
+
       // ── /api/summary ──────────────────────────────────────────────
       if (url.pathname === '/api/summary') {
-        if (range && !['day', 'week', 'month', 'last30', 'all'].includes(range)) {
+        if (range && !SUMMARY_RANGES.includes(range)) {
           json(res, { error: { code: 'INVALID_PARAM', message: 'Invalid range' } }, 400)
           return
         }
@@ -610,94 +760,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         const tool = url.searchParams.get('tool')
         const tf = getToolFilter(tool)
 
-        let totals: any
-        let byToolRows: any[]
-
-        if (df.useUnion) {
-          // All devices: UNION records + synced_records (excluding current device's synced copy)
-          const unionSql = `
-            SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, cost, ts, session_id
-            FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-            UNION ALL
-            SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thinking_tokens, cost, ts, session_key AS session_id
-            FROM synced_records WHERE device_instance_id != @currentDeviceId ${dr.where} ${tf.where}
-          `
-          totals = db.prepare(`
-            SELECT
-              COALESCE(SUM(input_tokens), 0) AS inputTokens,
-              COALESCE(SUM(output_tokens), 0) AS outputTokens,
-              COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
-              COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
-              COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
-              COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
-              COALESCE(SUM(cost), 0) AS totalCost,
-              COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
-              COUNT(DISTINCT session_id) AS totalSessions
-            FROM (${unionSql})
-          `).get({ ...dr.params, ...df.params, ...tf.params }) as any
-
-          byToolRows = db.prepare(`
-            SELECT tool, SUM(tokens) AS tokens, SUM(cost) AS cost FROM (
-              SELECT tool,
-                     SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
-                     SUM(cost) AS cost
-              FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-              GROUP BY tool
-              UNION ALL
-              SELECT tool,
-                     SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
-                     SUM(cost) AS cost
-              FROM synced_records WHERE device_instance_id != @currentDeviceId ${dr.where} ${tf.where}
-              GROUP BY tool
-            ) GROUP BY tool ORDER BY cost DESC
-          `).all({ ...dr.params, ...df.params, ...tf.params }) as any[]
-        } else if (df.where) {
-          // Specific other device: query synced_records only
-          totals = db.prepare(`
-            SELECT
-              COALESCE(SUM(input_tokens), 0) AS inputTokens,
-              COALESCE(SUM(output_tokens), 0) AS outputTokens,
-              COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
-              COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
-              COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
-              COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
-              COALESCE(SUM(cost), 0) AS totalCost,
-              COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
-              COUNT(DISTINCT session_key) AS totalSessions
-            FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
-          `).get({ ...dr.params, ...df.params, ...tf.params }) as any
-
-          byToolRows = db.prepare(`
-            SELECT tool,
-                   SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
-                   SUM(cost) AS cost
-            FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
-            GROUP BY tool ORDER BY cost DESC
-          `).all({ ...dr.params, ...df.params, ...tf.params }) as any[]
-        } else {
-          // Current device or legacy: query records only
-          totals = db.prepare(`
-            SELECT
-              COALESCE(SUM(input_tokens), 0) AS inputTokens,
-              COALESCE(SUM(output_tokens), 0) AS outputTokens,
-              COALESCE(SUM(cache_read_tokens), 0) AS cacheReadTokens,
-              COALESCE(SUM(cache_write_tokens), 0) AS cacheWriteTokens,
-              COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
-              COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
-              COALESCE(SUM(cost), 0) AS totalCost,
-              COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
-              COUNT(DISTINCT session_id) AS totalSessions
-            FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-          `).get({ ...dr.params, ...tf.params }) as any
-
-          byToolRows = db.prepare(`
-            SELECT tool,
-                   SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens) AS tokens,
-                   SUM(cost) AS cost
-            FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
-            GROUP BY tool ORDER BY cost DESC
-          `).all({ ...dr.params, ...tf.params }) as any[]
-        }
+        const { totals, byToolRows } = querySummaryTotals(db, df, dr, tf, true)
 
         const byTool: Record<string, { tokens: number; cost: number }> = {}
         for (const row of byToolRows) {
@@ -750,15 +813,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           .map(([server, count]) => ({ server, count }))
 
         json(res, {
-          inputTokens: totals.inputTokens,
-          outputTokens: totals.outputTokens,
-          cacheReadTokens: totals.cacheReadTokens,
-          cacheWriteTokens: totals.cacheWriteTokens,
-          thinkingTokens: totals.thinkingTokens,
-          totalTokens: totals.totalTokens,
-          totalCost: totals.totalCost,
-          activeDays: totals.activeDays,
-          totalSessions: totals.totalSessions,
+          ...summaryTotalsPayload(totals),
           byTool,
           topToolCalls,
           topMcpServers,

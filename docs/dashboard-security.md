@@ -7,18 +7,22 @@ keeps the selected host, and the startup message reports the actual bind address
 Other bind addresses, including `0.0.0.0`, `::`, LAN addresses, and hostnames,
 require a non-empty `AIUSAGE_DASHBOARD_PASSWORD`. Set it before starting the
 process. The Docker command explicitly binds to `0.0.0.0`, so containers also
-require this variable. For access over a network, terminate HTTPS at a trusted
-reverse proxy. The proxy must preserve the browser-facing Host header and replace
-any incoming `X-Forwarded-Proto` header with the browser-facing scheme. HTTPS
-login and logout responses then set the dashboard cookie with `Secure`; direct
-localhost HTTP keeps a non-`Secure` cookie for local development. Do not expose a
-passwordless loopback service through a proxy or tunnel; configure the password
-for that use.
+require this variable; the documented `docker run` examples pass it with `-e`.
+For access over a network, terminate HTTPS at a trusted reverse proxy. The proxy
+must preserve the browser-facing Host header and replace any incoming
+`X-Forwarded-Proto` header with the browser-facing scheme. HTTPS login and logout
+responses then set the dashboard cookie with `Secure`; direct localhost HTTP keeps
+a non-`Secure` cookie for local development. Do not expose a passwordless loopback
+service through a proxy or tunnel; configure the password for that use.
 
 With a password enabled, all detailed API routes require the dashboard login
 cookie, including quotas, credential status, configuration, session details,
-imports, sync, and the cloud sync availability proxy. `/api/summary` remains
-deliberately public, as do the static dashboard shell and authentication routes.
+imports, sync, the cloud sync availability proxy, and the detailed `/api/summary`
+breakdown (per-tool totals, top tool calls, MCP servers, and device/tool filters).
+Only `/api/home-summary` remains deliberately public, as do the static dashboard
+shell and authentication routes. It accepts only `range` and returns the aggregate
+totals shown on the home page (tokens, cost, sessions, active days) across all
+devices and tools, with no breakdowns or filtering.
 Quota warnings are available after authentication. A filename-like session ID
 does not bypass API authentication.
 Quota errors omit raw credential JSON, exception details, and upstream error
@@ -70,7 +74,8 @@ unchanged. The UI no longer infers a sync target by enumerating stored keys.
 - Cross-origin browser API clients must move behind a same-origin proxy.
 - Consumers of credential reads/references must migrate to the configured-state
   and replacement APIs above.
-- Password-protected quota and cloud sync availability clients must log in.
+- Password-protected quota, cloud sync availability, and `/api/summary` clients
+  must log in; the home page uses the public `/api/home-summary` totals instead.
 - `/api/refresh` requires POST; GET returns 405 and does not parse logs.
 
 Request-body size limits are outside this change.

@@ -19,9 +19,9 @@ describe('local API trust boundary', () => {
   let base: string
   const refresh = vi.fn(async () => ({ parsedCount: 0 }))
 
-  async function start(password = '') {
+  async function start(password = '', extraOptions: Parameters<typeof createApiServer>[1] = {}) {
     vi.stubEnv('AIUSAGE_DASHBOARD_PASSWORD', password)
-    server = createApiServer(db, { onRefresh: refresh })
+    server = createApiServer(db, { onRefresh: refresh, ...extraOptions })
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     base = `http://127.0.0.1:${(server.address() as any).port}`
   }
@@ -114,7 +114,7 @@ describe('local API trust boundary', () => {
       expect((await fetch(`${base}${route}`)).status).toBe(401)
     }
     expect(queryAllQuotas).not.toHaveBeenCalled()
-    expect((await fetch(`${base}/api/summary?range=day`)).status).toBe(200)
+    expect((await fetch(`${base}/api/home-summary?range=day`)).status).toBe(200)
     const wrong = await fetch(`${base}/api/auth/login`, { method: 'POST', body: JSON.stringify({ password: 'wrong' }) })
     expect(wrong.status).toBe(401)
     const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { Origin: base }, body: JSON.stringify({ password: 'secret' }) })
@@ -188,6 +188,83 @@ describe('local API trust boundary', () => {
   it('retains passwordless local quota access', async () => {
     await start()
     expect((await fetch(`${base}/api/quotas`)).status).toBe(200)
+  })
+
+  function seedSummaryData() {
+    const insertRecord = db.prepare(`
+      INSERT INTO records (id, ts, ingested_at, synced_at, updated_at, line_offset,
+        tool, model, provider, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens, thinking_tokens, cost, cost_source, session_id,
+        source_file, device, device_instance_id)
+      VALUES (@id, @ts, @ts, NULL, @ts, 0,
+        @tool, @model, 'provider', @input, @output, 0,
+        0, 0, @cost, 'pricing', @session,
+        '/logs/' || @id || '.jsonl', 'local-device', 'local-uuid-0000')
+    `)
+    const now = Date.now()
+    insertRecord.run({ id: 'r-claude', ts: now, tool: 'claude-code', model: 'claude-sonnet-4-5', input: 100, output: 50, cost: 0.5, session: 's-claude' })
+    insertRecord.run({ id: 'r-codex', ts: now, tool: 'codex', model: 'gpt-5', input: 20, output: 10, cost: 0.2, session: 's-codex' })
+    db.prepare(`
+      INSERT INTO synced_records (id, ts, tool, model, provider, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens, thinking_tokens, cost, cost_source, session_key, device, device_instance_id, updated_at)
+      VALUES ('r-remote', ?, 'codex', 'gpt-5', 'provider', 7, 3, 0, 0, 0, 0.1, 'pricing', 's-remote', 'remote-device', 'remote-uuid-0001', ?)
+    `).run(now, now)
+    const insertToolCall = db.prepare('INSERT INTO tool_calls (id, record_id, tool, name, ts, call_index) VALUES (?, ?, ?, ?, ?, ?)')
+    insertToolCall.run('tc-bash', 'r-claude', null, 'Bash', now, 0)
+    insertToolCall.run('tc-mcp', 'r-claude', null, 'mcp__github__search', now, 1)
+  }
+
+  const TOTAL_KEYS = ['activeDays', 'cacheReadTokens', 'cacheWriteTokens', 'inputTokens', 'outputTokens', 'thinkingTokens', 'totalCost', 'totalSessions', 'totalTokens']
+  const DETAIL_KEYS = ['byTool', 'topToolCalls', 'topMcpServers']
+
+  it('exposes only aggregate home totals without authentication and keeps summary detail and filtering behind login', async () => {
+    seedSummaryData()
+    await start('secret', { currentDeviceInstanceId: 'local-uuid-0000' })
+
+    // Detailed summary, with or without filters, is unavailable before login.
+    for (const route of ['/api/summary', '/api/summary?range=day', '/api/summary?device=remote-uuid-0001', '/api/summary?tool=codex']) {
+      const response = await fetch(base + route)
+      expect(response.status).toBe(401)
+      const body = await response.text()
+      for (const key of [...TOTAL_KEYS, ...DETAIL_KEYS, 'Bash', 'github', 'claude-code']) expect(body).not.toContain(key)
+    }
+
+    // The public home endpoint returns aggregate totals only and ignores device/tool filters.
+    const home = await fetch(`${base}/api/home-summary?range=all&device=remote-uuid-0001&tool=codex`)
+    expect(home.status).toBe(200)
+    const homeBody = await home.json()
+    expect(Object.keys(homeBody).sort()).toEqual(TOTAL_KEYS)
+    expect(homeBody.totalTokens).toBe(190)
+    expect(homeBody.totalSessions).toBe(3)
+    expect(homeBody.totalCost).toBeCloseTo(0.8)
+    expect(JSON.stringify(homeBody)).not.toMatch(/claude-code|codex|Bash|github/)
+    expect((await fetch(`${base}/api/home-summary?range=bogus`)).status).toBe(400)
+
+    // Authenticated access still returns the full breakdown and honors filters.
+    const login = await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { Origin: base }, body: JSON.stringify({ password: 'secret' }) })
+    const headers = { Cookie: login.headers.get('set-cookie')!.split(';')[0] }
+    const full = await (await fetch(`${base}/api/summary?range=all`, { headers })).json()
+    expect(Object.keys(full).sort()).toEqual([...TOTAL_KEYS, ...DETAIL_KEYS].sort())
+    expect(full.totalTokens).toBe(homeBody.totalTokens)
+    expect(Object.keys(full.byTool).sort()).toEqual(['claude-code', 'codex'])
+    expect(full.topToolCalls).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'Bash', count: 1 })]))
+    expect(full.topMcpServers).toEqual([{ server: 'github', count: 1 }])
+    const filtered = await (await fetch(`${base}/api/summary?tool=codex`, { headers })).json()
+    expect(Object.keys(filtered.byTool)).toEqual(['codex'])
+    expect(filtered.totalTokens).toBe(40)
+    const remote = await (await fetch(`${base}/api/summary?device=remote-uuid-0001`, { headers })).json()
+    expect(remote.totalTokens).toBe(10)
+  })
+
+  it('serves both summary endpoints without a cookie when no password is configured', async () => {
+    seedSummaryData()
+    await start('', { currentDeviceInstanceId: 'local-uuid-0000' })
+    const full = await fetch(`${base}/api/summary?range=all`)
+    expect(full.status).toBe(200)
+    expect(Object.keys(await full.json())).toEqual(expect.arrayContaining(DETAIL_KEYS))
+    const home = await fetch(`${base}/api/home-summary?range=all`)
+    expect(home.status).toBe(200)
+    expect((await home.json()).totalTokens).toBe(190)
   })
 
   it('never reveals configured secrets or references even to an authenticated browser', async () => {

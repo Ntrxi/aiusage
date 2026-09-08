@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fetchSummary, fetchTokens, fetchCost, refreshData } from '../src/lib/api.js'
+import { fetchSummary, fetchHomeSummary, fetchTokens, fetchCost, refreshData } from '../src/lib/api.js'
 
 // Mock fetch
 const mockFetch = vi.fn()
@@ -20,6 +20,18 @@ describe('API Client', () => {
     const result = await fetchSummary({ range: 'day' })
     expect(result).toEqual(mockData)
     expect(mockFetch).toHaveBeenCalledWith('/api/summary?range=day')
+  })
+
+  it('fetches the public home summary with only the range parameter', async () => {
+    const mockData = { totalTokens: 1000, totalCost: 0.001 }
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve(mockData),
+    })
+
+    const result = await fetchHomeSummary({ range: 'week', device: 'other', tool: 'codex' } as any)
+    expect(result).toEqual(mockData)
+    expect(mockFetch).toHaveBeenCalledWith('/api/home-summary?range=week')
   })
 
   it('fetches tokens data', async () => {

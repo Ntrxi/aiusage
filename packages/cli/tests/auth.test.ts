@@ -34,8 +34,9 @@ describe('dashboard auth helpers', () => {
     expect(isPublicPath('/sessions/session-1')).toBe(false)
   })
 
-  it('protects data and mutating API routes while leaving home summary public', () => {
-    expect(shouldProtectApiPath('/api/summary')).toBe(false)
+  it('protects data and mutating API routes while leaving the home totals public', () => {
+    expect(shouldProtectApiPath('/api/home-summary')).toBe(false)
+    expect(shouldProtectApiPath('/api/summary')).toBe(true)
     expect(shouldProtectApiPath('/api/tokens')).toBe(true)
     expect(shouldProtectApiPath('/api/config')).toBe(true)
     expect(shouldProtectApiPath('/api/sync')).toBe(true)

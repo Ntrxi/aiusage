@@ -58,11 +58,12 @@ Use Docker:
 ```bash
 docker run -d \
   -p 3847:3847 \
+  -e AIUSAGE_DASHBOARD_PASSWORD=change-me \
   -v ~/.aiusage:/root/.aiusage \
   juliantanx/aiusage
 ```
 
-Docker persists AIUsage data with the `~/.aiusage` mount. To parse AI tool logs from the host, also mount each source log directory and configure the matching `AIUSAGE_*_PATH` variable. See the [Docker docs](https://aiusage.jtanx.com/docs#docker).
+The container binds to `0.0.0.0` so it is reachable from outside Docker, and startup is refused unless `AIUSAGE_DASHBOARD_PASSWORD` is set to a non-empty value; replace `change-me` with your own password. Docker persists AIUsage data with the `~/.aiusage` mount. To parse AI tool logs from the host, also mount each source log directory and configure the matching `AIUSAGE_*_PATH` variable. See the [Docker docs](https://aiusage.jtanx.com/docs#docker).
 
 ## Common Commands
 
@@ -97,7 +98,7 @@ Default paths and environment variable overrides are documented in [Data Sources
 
 ## Dashboard Password
 
-The dashboard binds to `127.0.0.1` by default. Use `aiusage serve --host ::1` for IPv6 loopback. Local access can remain passwordless; set `AIUSAGE_DASHBOARD_PASSWORD` to require authentication for detailed APIs, including quotas and settings. The home summary remains public.
+The dashboard binds to `127.0.0.1` by default. Use `aiusage serve --host ::1` for IPv6 loopback. Local access can remain passwordless; set `AIUSAGE_DASHBOARD_PASSWORD` to require authentication for detailed APIs, including the detailed summary, quotas, and settings. Only the aggregate totals shown on the home page stay public, through the minimal `/api/home-summary` endpoint.
 
 | Shell | Command |
 |---|---|
@@ -105,7 +106,7 @@ The dashboard binds to `127.0.0.1` by default. Use `aiusage serve --host ::1` fo
 | Windows PowerShell | `$env:AIUSAGE_DASHBOARD_PASSWORD="change-me"; aiusage serve` |
 | Windows CMD | `set AIUSAGE_DASHBOARD_PASSWORD=change-me && aiusage serve` |
 
-To allow network access, explicitly use `aiusage serve --host 0.0.0.0` (or `--host ::` for IPv6) and set a non-empty `AIUSAGE_DASHBOARD_PASSWORD`; startup is refused without it. Docker uses this explicit network binding and now requires the password too. For remote access, use HTTPS through a trusted reverse proxy that preserves the browser-facing Host header and replaces `X-Forwarded-Proto` with the browser-facing scheme.
+To allow network access, explicitly use `aiusage serve --host 0.0.0.0` (or `--host ::` for IPv6) and set a non-empty `AIUSAGE_DASHBOARD_PASSWORD`; startup is refused without it. The Docker image uses this explicit network binding, so the password is mandatory there. For remote access, use HTTPS through a trusted reverse proxy that preserves the browser-facing Host header and replaces `X-Forwarded-Proto` with the browser-facing scheme.
 
 The API accepts same-origin browser requests only; cross-origin integrations are no longer supported. Native local clients can omit Origin. Credential settings show configured state and accept replacements; existing secret values and credential references are never returned. Blank credential fields keep the saved value. See [local API security and compatibility](docs/dashboard-security.md).
 

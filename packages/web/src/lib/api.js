@@ -58,6 +58,12 @@ export async function fetchSummary(params, { signal, swr = true } = {}) {
   return apiFetch(buildUrl('/api/summary', params), { signal, swr })
 }
 
+// Public aggregate totals for the home page; stays reachable without the
+// dashboard password and only accepts `range`.
+export async function fetchHomeSummary(params, { signal, swr = true } = {}) {
+  return apiFetch(buildUrl('/api/home-summary', { range: params?.range }), { signal, swr })
+}
+
 export async function fetchBootstrap(params = {}) {
   return apiFetch(buildUrl('/api/bootstrap', params))
 }
