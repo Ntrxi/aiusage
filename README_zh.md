@@ -105,7 +105,7 @@ Docker 示例中的 `~/.aiusage` 挂载只会持久化 AIUsage 自己的数据�
 | Windows PowerShell | `$env:AIUSAGE_DASHBOARD_PASSWORD="change-me"; aiusage serve` |
 | Windows CMD | `set AIUSAGE_DASHBOARD_PASSWORD=change-me && aiusage serve` |
 
-如需网络访问，请显式使用 `aiusage serve --host 0.0.0.0`（IPv6 使用 `--host ::`），并设置非空 `AIUSAGE_DASHBOARD_PASSWORD`，否则启动会被拒绝。Docker 同样使用显式网络监听，因此也必须设置密码。远程访问建议通过保留浏览器 Host 请求头的 HTTPS 反向代理。
+如需网络访问，请显式使用 `aiusage serve --host 0.0.0.0`（IPv6 使用 `--host ::`），并设置非空 `AIUSAGE_DASHBOARD_PASSWORD`，否则启动会被拒绝。Docker 同样使用显式网络监听，因此也必须设置密码。远程访问建议使用可信的 HTTPS 反向代理；代理必须保留浏览器侧的 Host 请求头，并将 `X-Forwarded-Proto` 覆盖为浏览器侧协议。
 
 API 仅接受同源浏览器请求，不再支持跨源集成。本地非浏览器客户端可以省略 Origin。凭据设置只显示是否已配置并允许替换，不返回已有密钥或凭据引用；输入留空会保留原值。详见[本地 API 安全与兼容性说明](docs/dashboard-security.md)。
 

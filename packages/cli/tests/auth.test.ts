@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   AUTH_COOKIE_NAME,
   buildAuthCookie,
+  buildClearAuthCookie,
   isAuthenticated,
   isPublicPath,
   shouldProtectApiPath,
@@ -49,5 +50,12 @@ describe('dashboard auth helpers', () => {
     expect(cookieHeader.startsWith(`${AUTH_COOKIE_NAME}=`)).toBe(true)
     expect(isAuthenticated('secret', cookieHeader)).toBe(true)
     expect(isAuthenticated('different', cookieHeader)).toBe(false)
+  })
+
+  it('adds Secure to auth and clear cookies only when requested', () => {
+    expect(buildAuthCookie('secret')).not.toContain('; Secure')
+    expect(buildClearAuthCookie()).not.toContain('; Secure')
+    expect(buildAuthCookie('secret', true)).toContain('; Secure')
+    expect(buildClearAuthCookie(true)).toContain('; Secure')
   })
 })

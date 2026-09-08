@@ -7,9 +7,13 @@ keeps the selected host, and the startup message reports the actual bind address
 Other bind addresses, including `0.0.0.0`, `::`, LAN addresses, and hostnames,
 require a non-empty `AIUSAGE_DASHBOARD_PASSWORD`. Set it before starting the
 process. The Docker command explicitly binds to `0.0.0.0`, so containers also
-require this variable. For access over a network, terminate HTTPS at a reverse
-proxy and preserve the browser-facing Host header. Do not expose a passwordless
-loopback service through a proxy or tunnel; configure the password for that use.
+require this variable. For access over a network, terminate HTTPS at a trusted
+reverse proxy. The proxy must preserve the browser-facing Host header and replace
+any incoming `X-Forwarded-Proto` header with the browser-facing scheme. HTTPS
+login and logout responses then set the dashboard cookie with `Secure`; direct
+localhost HTTP keeps a non-`Secure` cookie for local development. Do not expose a
+passwordless loopback service through a proxy or tunnel; configure the password
+for that use.
 
 With a password enabled, all detailed API routes require the dashboard login
 cookie, including quotas, credential status, configuration, session details,
@@ -23,6 +27,9 @@ bodies so failures cannot echo credentials into the dashboard.
 Browser API requests must be same-origin. No wildcard CORS headers are sent.
 Requests with a foreign or opaque (`null`) Origin, or cross-site Fetch Metadata,
 are rejected before handlers run, including login and mutating endpoints.
+When `X-Forwarded-Proto` is present, it must be exactly `http` or `https` and must
+agree with the Origin scheme. Forwarded Host headers are not trusted; the proxy
+must preserve the browser-facing `Host` value.
 Native clients may omit Origin. Without a password, the API additionally rejects
 non-loopback Host names to prevent DNS rebinding. The Vite development proxy
 preserves Host and Origin and forwards `/api` to `127.0.0.1:3847`.

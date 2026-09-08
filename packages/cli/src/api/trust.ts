@@ -25,6 +25,29 @@ export function dashboardHost(host: string | undefined, password: string | null)
   return normalized.toLowerCase() === 'localhost' ? DEFAULT_DASHBOARD_HOST : normalized
 }
 
+type BrowserProtocol = 'http:' | 'https:'
+
+function forwardedProtocol(req: http.IncomingMessage): BrowserProtocol | null | undefined {
+  const value = req.headers['x-forwarded-proto']
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'http' || normalized === 'https') return `${normalized}:`
+  return null
+}
+
+function directProtocol(req: http.IncomingMessage): BrowserProtocol {
+  return (req.socket as http.IncomingMessage['socket'] & { encrypted?: boolean }).encrypted === true ? 'https:' : 'http:'
+}
+
+/**
+ * Return the browser-facing protocol after the request has passed
+ * isTrustedApiRequest. Proxies must preserve Host and set X-Forwarded-Proto.
+ */
+export function browserProtocol(req: http.IncomingMessage): BrowserProtocol {
+  return forwardedProtocol(req) ?? directProtocol(req)
+}
+
 /** Same-origin browser requests only; native clients may omit Origin. */
 export function isTrustedApiRequest(req: http.IncomingMessage, password: string | null): boolean {
   try {
@@ -36,11 +59,13 @@ export function isTrustedApiRequest(req: http.IncomingMessage, password: string 
     // Prevent DNS rebinding against the passwordless loopback service.
     if (!password && !isLoopbackHost(target.hostname)) return false
     if (req.headers['sec-fetch-site'] === 'cross-site') return false
+    const forwarded = forwardedProtocol(req)
+    if (forwarded === null) return false
+    const protocol = forwarded ?? directProtocol(req)
     const origin = req.headers.origin
     if (origin !== undefined) {
       const source = new URL(origin)
-      // HTTPS is allowed for a reverse proxy preserving the external Host.
-      if (!['http:', 'https:'].includes(source.protocol) || source.host !== target.host || source.origin !== origin) return false
+      if (source.protocol !== protocol || source.host !== target.host || source.origin !== origin) return false
     }
     return true
   } catch {

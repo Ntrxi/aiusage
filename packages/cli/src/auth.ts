@@ -15,12 +15,12 @@ export function verifyPassword(configuredPassword: string | null | undefined, su
   return safeEqual(configuredPassword, submittedPassword)
 }
 
-export function buildAuthCookie(password: string): string {
-  return `${AUTH_COOKIE_NAME}=${hashPassword(password)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${AUTH_COOKIE_MAX_AGE_SECONDS}`
+export function buildAuthCookie(password: string, secure = false): string {
+  return `${AUTH_COOKIE_NAME}=${hashPassword(password)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${AUTH_COOKIE_MAX_AGE_SECONDS}${secure ? '; Secure' : ''}`
 }
 
-export function buildClearAuthCookie(): string {
-  return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+export function buildClearAuthCookie(secure = false): string {
+  return `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
 }
 
 export function isAuthenticated(configuredPassword: string | null | undefined, cookieHeader: string | null | undefined): boolean {

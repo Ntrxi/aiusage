@@ -26,6 +26,31 @@ describe('local API trust boundary', () => {
     base = `http://127.0.0.1:${(server.address() as any).port}`
   }
 
+  async function requestWithHost(route: string, options: { method: string, host: string, origin: string, forwardedProto: string, body?: string }) {
+    const target = new URL(route, base)
+    return await new Promise<{ status: number, setCookie: string | undefined }>((resolve, reject) => {
+      const request = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: options.method,
+        headers: {
+          Host: options.host,
+          Origin: options.origin,
+          'X-Forwarded-Proto': options.forwardedProto,
+        },
+      }, (response) => {
+        response.resume()
+        response.on('end', () => resolve({
+          status: response.statusCode ?? 0,
+          setCookie: response.headers['set-cookie']?.[0],
+        }))
+      })
+      request.on('error', reject)
+      request.end(options.body)
+    })
+  }
+
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(loadConfig).mockReturnValue(null)
@@ -65,7 +90,12 @@ describe('local API trust boundary', () => {
 
   it('rejects a rebinding Host even when Origin matches it', async () => {
     await start()
-    const response = await fetch(`${base}/api/config`, { headers: { Host: 'evil.example', Origin: 'http://evil.example' } })
+    const response = await requestWithHost('/api/config', {
+      method: 'GET',
+      host: 'evil.example',
+      origin: 'http://evil.example',
+      forwardedProto: 'http',
+    })
     expect(response.status).toBe(403)
   })
 
@@ -95,6 +125,64 @@ describe('local API trust boundary', () => {
     expect(queryAllQuotas).toHaveBeenCalledOnce()
     expect((await fetch(`${base}/api/quotas`, { headers: { Cookie: cookie, Origin: 'https://evil.example' } })).status).toBe(403)
     expect(queryAllQuotas).toHaveBeenCalledOnce()
+  })
+
+  it('keeps auth and clear cookies usable over localhost HTTP', async () => {
+    await start('secret')
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { Origin: base },
+      body: JSON.stringify({ password: 'secret' }),
+    })
+    expect(login.status).toBe(200)
+    expect(login.headers.get('set-cookie')).not.toContain('Secure')
+
+    const logout = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { Origin: base } })
+    expect(logout.status).toBe(200)
+    expect(logout.headers.get('set-cookie')).not.toContain('Secure')
+  })
+
+  it('sets Secure on auth and clear cookies behind an HTTPS reverse proxy', async () => {
+    await start('secret')
+    const login = await requestWithHost('/api/auth/login', {
+      method: 'POST',
+      host: 'dashboard.example',
+      origin: 'https://dashboard.example',
+      forwardedProto: 'https',
+      body: JSON.stringify({ password: 'secret' }),
+    })
+    expect(login.status).toBe(200)
+    expect(login.setCookie).toContain('; Secure')
+
+    const logout = await requestWithHost('/api/auth/logout', {
+      method: 'POST',
+      host: 'dashboard.example',
+      origin: 'https://dashboard.example',
+      forwardedProto: 'https',
+    })
+    expect(logout.status).toBe(200)
+    expect(logout.setCookie).toContain('; Secure')
+  })
+
+  it('rejects forwarded protocols that disagree with Origin or are ambiguous', async () => {
+    await start('secret')
+    const mismatched = await requestWithHost('/api/auth/login', {
+      method: 'POST',
+      host: 'dashboard.example',
+      origin: 'https://dashboard.example',
+      forwardedProto: 'http',
+      body: JSON.stringify({ password: 'secret' }),
+    })
+    expect(mismatched.status).toBe(403)
+
+    const ambiguous = await requestWithHost('/api/auth/login', {
+      method: 'POST',
+      host: 'dashboard.example',
+      origin: 'https://dashboard.example',
+      forwardedProto: 'https, http',
+      body: JSON.stringify({ password: 'secret' }),
+    })
+    expect(ambiguous.status).toBe(403)
   })
 
   it('retains passwordless local quota access', async () => {

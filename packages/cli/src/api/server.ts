@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type Database from 'better-sqlite3'
 import { calculateCostForPrice, removePriceOverride, inferProvider, normalizeQoderModel, resolveExchangeRate, fetchExchangeRate, TOOLS, type PriceEntry } from '@aiusage/core'
 import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig } from '../config.js'
-import { isTrustedApiRequest } from './trust.js'
+import { browserProtocol, isTrustedApiRequest } from './trust.js'
 import { credentialStatus, publicSyncConfig, setSyncCredentials } from './credential-settings.js'
 import type { Config, SyncConfig } from '../config.js'
 import { setSyncConsent } from '../init.js'
@@ -561,7 +561,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         }
 
         if (dashboardPassword) {
-          res.setHeader('Set-Cookie', buildAuthCookie(dashboardPassword))
+          res.setHeader('Set-Cookie', buildAuthCookie(dashboardPassword, browserProtocol(req) === 'https:'))
         }
         json(res, { ok: true })
       } catch {
@@ -571,7 +571,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
     }
 
     if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
-      res.setHeader('Set-Cookie', buildClearAuthCookie())
+      res.setHeader('Set-Cookie', buildClearAuthCookie(browserProtocol(req) === 'https:'))
       json(res, { ok: true })
       return
     }

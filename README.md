@@ -105,7 +105,7 @@ The dashboard binds to `127.0.0.1` by default. Use `aiusage serve --host ::1` fo
 | Windows PowerShell | `$env:AIUSAGE_DASHBOARD_PASSWORD="change-me"; aiusage serve` |
 | Windows CMD | `set AIUSAGE_DASHBOARD_PASSWORD=change-me && aiusage serve` |
 
-To allow network access, explicitly use `aiusage serve --host 0.0.0.0` (or `--host ::` for IPv6) and set a non-empty `AIUSAGE_DASHBOARD_PASSWORD`; startup is refused without it. Docker uses this explicit network binding and now requires the password too. For remote access, use HTTPS through a reverse proxy that preserves the browser-facing Host header.
+To allow network access, explicitly use `aiusage serve --host 0.0.0.0` (or `--host ::` for IPv6) and set a non-empty `AIUSAGE_DASHBOARD_PASSWORD`; startup is refused without it. Docker uses this explicit network binding and now requires the password too. For remote access, use HTTPS through a trusted reverse proxy that preserves the browser-facing Host header and replaces `X-Forwarded-Proto` with the browser-facing scheme.
 
 The API accepts same-origin browser requests only; cross-origin integrations are no longer supported. Native local clients can omit Origin. Credential settings show configured state and accept replacements; existing secret values and credential references are never returned. Blank credential fields keep the saved value. See [local API security and compatibility](docs/dashboard-security.md).
 
