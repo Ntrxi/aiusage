@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.15] - 2026-09-08
+
+### Added
+- **Antigravity usage parsing** ([#52](https://github.com/juliantanx/aiusage/pull/52) by [@Ntrxi](https://github.com/Ntrxi)) — discover Antigravity conversation databases across supported installation, backup, and configuration roots, then import token usage from SQLite generation, step, and retry metadata. The parser deduplicates overlapping records, normalizes model aliases for provider and pricing resolution, and maintains a WAL-safe incremental cursor without stalling on empty generations.
+
+---
+
 ## [1.5.14] - 2026-09-07
 
 ### Fixed
@@ -446,6 +453,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.15]: https://github.com/juliantanx/aiusage/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12

@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [1.5.15] - 2026-09-08
+
+### 新增
+- **Antigravity 用量解析**（[#52](https://github.com/juliantanx/aiusage/pull/52)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 从支持的安装、备份及配置目录中发现 Antigravity 对话数据库，并从 SQLite 的 generation、step 和 retry 元数据导入 token 用量。解析器会对重叠记录去重、规范化模型别名以正确解析供应商和价格，并使用兼容 WAL 活跃会话的增量游标，避免空 generation 阻塞后续解析。
+
+---
+
 ## [1.5.14] - 2026-09-07
 
 ### 修复
@@ -446,6 +453,7 @@
 
 ---
 
+[1.5.15]: https://github.com/juliantanx/aiusage/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
 [1.5.12]: https://github.com/juliantanx/aiusage/compare/v1.5.11...v1.5.12
