@@ -5,7 +5,9 @@ import { randomBytes } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import type Database from 'better-sqlite3'
 import { calculateCostForPrice, removePriceOverride, inferProvider, normalizeQoderModel, resolveExchangeRate, fetchExchangeRate, TOOLS, type PriceEntry } from '@aiusage/core'
-import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig, loadCredential } from '../config.js'
+import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig } from '../config.js'
+import { isTrustedApiRequest } from './trust.js'
+import { credentialStatus, publicSyncConfig, setSyncCredentials } from './credential-settings.js'
 import type { Config, SyncConfig } from '../config.js'
 import { setSyncConsent } from '../init.js'
 import { generateConsentFingerprint } from '../sync/consent.js'
@@ -528,11 +530,13 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
   }
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
-
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    if (!isTrustedApiRequest(req, dashboardPassword)) {
+      json(res, { error: { code: 'FORBIDDEN', message: 'Untrusted API origin or host' } }, 403)
+      return
+    }
+    const url = new URL(req.url ?? '/', 'http://localhost')
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
@@ -572,13 +576,13 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       return
     }
 
-    if (url.pathname === '/api/cli/sync/status' && req.method === 'GET') {
-      await proxyCloudSyncStatus(res)
+    if (dashboardPassword && shouldProtectApiPath(url.pathname) && !isAuthenticated(dashboardPassword, req.headers.cookie)) {
+      json(res, { error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }, 401)
       return
     }
 
-    if (dashboardPassword && shouldProtectApiPath(url.pathname) && !isAuthenticated(dashboardPassword, req.headers.cookie)) {
-      json(res, { error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }, 401)
+    if (url.pathname === '/api/cli/sync/status' && req.method === 'GET') {
+      await proxyCloudSyncStatus(res)
       return
     }
 
@@ -1490,6 +1494,11 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
       // ── /api/refresh ────────────────────────────────────────────────
       if (url.pathname === '/api/refresh') {
+        if (req.method !== 'POST') {
+          res.setHeader('Allow', 'POST')
+          json(res, { error: { code: 'METHOD_NOT_ALLOWED', message: 'Use POST to refresh' } }, 405)
+          return
+        }
         if (!options?.onRefresh) {
           json(res, { error: { code: 'NOT_AVAILABLE', message: 'Refresh not available' } }, 501)
           return
@@ -1757,21 +1766,13 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
         return
       }
 
-      // ── /api/config/credential ──────────────────────────────────────
-      if (url.pathname === '/api/config/credential' && req.method === 'GET') {
-        const ref = url.searchParams.get('ref')?.trim()
-        if (!ref) {
-          json(res, { error: { code: 'MISSING_CREDENTIAL_REF', message: 'credential ref is required' } }, 400)
-          return
-        }
-
-        const value = loadCredential(ref)
-        if (!value) {
-          json(res, { error: { code: 'CREDENTIAL_NOT_FOUND', message: 'Credential not found' } }, 404)
-          return
-        }
-
-        json(res, { value })
+      // Only configured state for a sync target is exposed, never keys or values.
+      if (url.pathname === '/api/config/credentials/status' && req.method === 'GET') {
+        const backend = url.searchParams.get('backend')
+        const sync = backend === 'github' || backend === 's3'
+          ? { backend, repo: url.searchParams.get('repo') ?? '', bucket: url.searchParams.get('bucket') ?? '' } as SyncConfig
+          : undefined
+        json(res, sync ? credentialStatus(loadConfig() ?? {}, sync) : {})
         return
       }
 
@@ -1788,14 +1789,14 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
             retentionDays: rest.retentionDays ?? null,
             leaderboardAutoUpload: rest.leaderboardAutoUpload ?? false,
             leaderboardUploadInterval: rest.leaderboardUploadInterval ?? null,
-            sync: rest.sync ?? null,
+            sync: publicSyncConfig(rest.sync),
             syncInterval: rest.syncInterval ?? null,
             loggedIn: hasCredentials(),
             displayCurrency: rest.displayCurrency ?? 'USD',
             exchangeRate: rest.exchangeRate ?? null,
             exchangeRateCache: rest.exchangeRateCache ?? null,
             siteUrl: getSiteUrl(),
-            credentialKeys: credentials ? Object.keys(credentials) : [],
+            credentialStatus: credentialStatus(currentCfg),
             hostname: hostname(),
             platform: osPlatform,
           })
@@ -1911,6 +1912,10 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
               }
               if (Object.keys(c).length) existing.credentials = c
               else delete existing.credentials
+            }
+
+            if (update.syncCredentials && typeof update.syncCredentials === 'object') {
+              setSyncCredentials(existing, update.syncCredentials as Record<string, unknown>)
             }
 
             saveConfig(existing)

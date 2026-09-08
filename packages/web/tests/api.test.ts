@@ -95,4 +95,12 @@ describe('API Client', () => {
       })
     )
   })
+
+  it('fetches only configured state for a sync target', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ githubToken: true }) })
+    const api = await import('../src/lib/api.js')
+    expect(await api.fetchCredentialStatus({ backend: 'github', repo: 'owner/repo' })).toEqual({ githubToken: true })
+    expect(mockFetch).toHaveBeenCalledWith('/api/config/credentials/status?backend=github&repo=owner%2Frepo')
+    expect(api).not.toHaveProperty('fetchCredential')
+  })
 })

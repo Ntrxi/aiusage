@@ -326,8 +326,8 @@ export async function refreshExchangeRate() {
   return response.json()
 }
 
-export async function fetchCredential(ref) {
-  return apiFetch(buildUrl('/api/config/credential', { ref }))
+export async function fetchCredentialStatus({ backend, repo, bucket }) {
+  return apiFetch(buildUrl('/api/config/credentials/status', { backend, repo, bucket }))
 }
 
 export const SETTINGS_UPDATED_EVENT = 'aiusage:settings-updated'

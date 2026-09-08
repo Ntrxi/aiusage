@@ -387,8 +387,8 @@
     <section id="dashboard-password">
       <h3>{zh ? '仪表盘密码' : 'Dashboard Password'}</h3>
       <p>{zh
-        ? '本地仪表盘默认不需要登录。设置 AIUSAGE_DASHBOARD_PASSWORD 后，除首页、静态资源和公开 summary / quotas API 外，其他 API 会要求先输入密码。密码仅用于本地 dashboard cookie，不会写入数据库。'
-        : 'The local dashboard does not require sign-in by default. Set AIUSAGE_DASHBOARD_PASSWORD to protect dashboard APIs except the home page, static assets, and public summary / quotas endpoints. The password is used only for the local dashboard cookie and is not stored in the database.'
+        ? '本地仪表盘默认只监听 127.0.0.1，不需要登录。IPv6 回环可用 --host ::1。其他地址（例如 --host 0.0.0.0）及 Docker 必须设置非空 AIUSAGE_DASHBOARD_PASSWORD。API 仅接受同源浏览器请求；凭据只能设置或替换，不能读取已有密钥。设置 AIUSAGE_DASHBOARD_PASSWORD 后，除首页、静态资源和公开 summary API 外，其他 API 会要求先输入密码。密码仅用于本地 dashboard cookie，不会写入数据库。'
+        : 'The dashboard binds to 127.0.0.1 without sign-in by default; use --host ::1 for IPv6 loopback. Other addresses (such as --host 0.0.0.0) and Docker require a non-empty AIUSAGE_DASHBOARD_PASSWORD. Browser API requests must be same-origin. Stored credentials can be replaced but never retrieved. Set AIUSAGE_DASHBOARD_PASSWORD to protect dashboard APIs except the home page, static assets, and the public summary endpoint. The password is used only for the local dashboard cookie and is not stored in the database.'
       }</p>
       <DocsTable
         headers={zh ? ['系统 / Shell', '一次性启动命令'] : ['System / Shell', 'One-time start command']}

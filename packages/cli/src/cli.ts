@@ -326,9 +326,10 @@ program
   .command('serve')
   .description('Start web dashboard')
   .option('-p, --port <port>', 'Port number', '3847')
+  .option('--host <host>', 'Bind address (non-loopback requires AIUSAGE_DASHBOARD_PASSWORD)', '127.0.0.1')
   .action((options) => {
     const db = createDatabase(DB_PATH)
-    serve({ port: parseInt(options.port), db })
+    serve({ port: parseInt(options.port), host: options.host, db })
   })
 
 // init command

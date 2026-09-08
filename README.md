@@ -45,7 +45,7 @@ npm install -g @juliantanx/aiusage
 aiusage serve
 ```
 
-Open `http://localhost:3847` to use the dashboard. `serve` parses once on startup and then serves the local web UI.
+Open `http://127.0.0.1:3847` to use the dashboard. `serve` parses once on startup and then serves the local web UI.
 
 Prefer pnpm:
 
@@ -97,13 +97,17 @@ Default paths and environment variable overrides are documented in [Data Sources
 
 ## Dashboard Password
 
-The local dashboard is open on localhost by default. Set `AIUSAGE_DASHBOARD_PASSWORD` to protect dashboard APIs.
+The dashboard binds to `127.0.0.1` by default. Use `aiusage serve --host ::1` for IPv6 loopback. Local access can remain passwordless; set `AIUSAGE_DASHBOARD_PASSWORD` to require authentication for detailed APIs, including quotas and settings. The home summary remains public.
 
 | Shell | Command |
 |---|---|
 | macOS / Linux | `AIUSAGE_DASHBOARD_PASSWORD="change-me" aiusage serve` |
 | Windows PowerShell | `$env:AIUSAGE_DASHBOARD_PASSWORD="change-me"; aiusage serve` |
 | Windows CMD | `set AIUSAGE_DASHBOARD_PASSWORD=change-me && aiusage serve` |
+
+To allow network access, explicitly use `aiusage serve --host 0.0.0.0` (or `--host ::` for IPv6) and set a non-empty `AIUSAGE_DASHBOARD_PASSWORD`; startup is refused without it. Docker uses this explicit network binding and now requires the password too. For remote access, use HTTPS through a reverse proxy that preserves the browser-facing Host header.
+
+The API accepts same-origin browser requests only; cross-origin integrations are no longer supported. Native local clients can omit Origin. Credential settings show configured state and accept replacements; existing secret values and credential references are never returned. Blank credential fields keep the saved value. See [local API security and compatibility](docs/dashboard-security.md).
 
 For PM2 background services, pass the same variable when starting `aiusage pm2-start`, and use `pm2 restart aiusage-server --update-env` after changing it. Details: [Dashboard Password](https://aiusage.jtanx.com/docs#dashboard-password) and [PM2](https://aiusage.jtanx.com/docs#pm2).
 

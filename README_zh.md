@@ -45,7 +45,7 @@ npm install -g @juliantanx/aiusage
 aiusage serve
 ```
 
-打开 `http://localhost:3847` 即可使用仪表盘。`serve` 会在启动时解析一次本地日志，然后启动本地 Web UI。
+打开 `http://127.0.0.1:3847` 即可使用仪表盘。`serve` 会在启动时解析一次本地日志，然后启动本地 Web UI。
 
 使用 pnpm：
 
@@ -97,13 +97,17 @@ Docker 示例中的 `~/.aiusage` 挂载只会持久化 AIUsage 自己的数据�
 
 ## 仪表盘密码
 
-本地仪表盘默认在 localhost 上开放。设置 `AIUSAGE_DASHBOARD_PASSWORD` 后，可以保护仪表盘 API。
+仪表盘默认只监听 `127.0.0.1`。IPv6 回环地址可使用 `aiusage serve --host ::1`。本地访问可以不设置密码；设置 `AIUSAGE_DASHBOARD_PASSWORD` 后，配额、设置等详细 API 均需要登录，首页汇总仍保持公开。
 
 | Shell | 命令 |
 |---|---|
 | macOS / Linux | `AIUSAGE_DASHBOARD_PASSWORD="change-me" aiusage serve` |
 | Windows PowerShell | `$env:AIUSAGE_DASHBOARD_PASSWORD="change-me"; aiusage serve` |
 | Windows CMD | `set AIUSAGE_DASHBOARD_PASSWORD=change-me && aiusage serve` |
+
+如需网络访问，请显式使用 `aiusage serve --host 0.0.0.0`（IPv6 使用 `--host ::`），并设置非空 `AIUSAGE_DASHBOARD_PASSWORD`，否则启动会被拒绝。Docker 同样使用显式网络监听，因此也必须设置密码。远程访问建议通过保留浏览器 Host 请求头的 HTTPS 反向代理。
+
+API 仅接受同源浏览器请求，不再支持跨源集成。本地非浏览器客户端可以省略 Origin。凭据设置只显示是否已配置并允许替换，不返回已有密钥或凭据引用；输入留空会保留原值。详见[本地 API 安全与兼容性说明](docs/dashboard-security.md)。
 
 PM2 后台运行时，也可以在启动 `aiusage pm2-start` 时传入同名变量；修改密码后使用 `pm2 restart aiusage-server --update-env` 更新环境变量。详见 [仪表盘密码](https://aiusage.jtanx.com/docs#dashboard-password) 和 [PM2](https://aiusage.jtanx.com/docs#pm2)。
 

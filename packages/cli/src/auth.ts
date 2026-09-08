@@ -39,11 +39,10 @@ export function isPublicPath(pathname: string): boolean {
 
 export function shouldProtectApiPath(pathname: string): boolean {
   if (!pathname.startsWith('/api/')) return false
-  if (isPublicPath(pathname)) return false
+  if (['/api/auth/status', '/api/auth/login', '/api/auth/logout'].includes(pathname)) return false
 
-  // The public home page depends on summary and quota display data.
+  // The home summary is deliberately public; all detailed APIs require auth.
   if (pathname === '/api/summary') return false
-  if (pathname === '/api/quotas') return false
   return true
 }
 

@@ -38,6 +38,8 @@ describe('dashboard auth helpers', () => {
     expect(shouldProtectApiPath('/api/tokens')).toBe(true)
     expect(shouldProtectApiPath('/api/config')).toBe(true)
     expect(shouldProtectApiPath('/api/sync')).toBe(true)
+    expect(shouldProtectApiPath('/api/quotas')).toBe(true)
+    expect(shouldProtectApiPath('/api/sessions/session.json')).toBe(true)
   })
 
   it('recognizes the generated auth cookie', () => {
