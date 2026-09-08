@@ -530,7 +530,9 @@ function probeAntigravity(ctx: ProbeContext): string | null {
     join(home, 'antigravity'),
     join(home, 'antigravity-cli'),
     join(home, 'antigravity-ide'),
+    join(home, 'antigravity-backup'),
     join(home, 'tmp', 'antigravity'),
+    join(ctx.home, '.config', 'antigravity'),
   ]
   return roots.find((dir) => existsSync(dir)) ?? null
 }
@@ -542,7 +544,9 @@ function antigravityRoots(ctx: ProbeContext, primaryPath: string): string[] {
     join(home, 'antigravity'),
     join(home, 'antigravity-cli'),
     join(home, 'antigravity-ide'),
+    join(home, 'antigravity-backup'),
     join(home, 'tmp', 'antigravity'),
+    join(ctx.home, '.config', 'antigravity'),
   ].filter((dir) => existsSync(dir)))
 }
 

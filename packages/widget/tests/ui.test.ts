@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { join } from 'node:path'
 import {
   getTrayIconNativeImage,
   getWidgetNativeBindingPath,
@@ -53,7 +54,7 @@ describe('widget UI helpers', () => {
   })
 
   it('resolves the widget-specific native sqlite binding path', () => {
-    expect(getWidgetNativeBindingPath('/app/dist')).toBe('/app/dist/native/better_sqlite3.node')
+    expect(getWidgetNativeBindingPath('/app/dist')).toBe(join('/app/dist', 'native', 'better_sqlite3.node'))
   })
 
   it('provides a visible tray icon asset', () => {

@@ -863,7 +863,7 @@
         <li><strong>CodeBuddy</strong> — <code>~/.codebuddy/projects</code></li>
         <li><strong>Kiro</strong> — {zh ? 'IDE SQLite + CLI JSON/JSONL 会话文件' : 'IDE SQLite + CLI JSON/JSONL session files'}</li>
         <li><strong>Grok Build</strong> — <code>~/.grok/sessions</code></li>
-        <li><strong>Antigravity</strong> — <code>~/.gemini/tmp/antigravity</code></li>
+        <li><strong>Antigravity</strong> — <code>~/.gemini/antigravity/conversations/*.db</code>, <code>~/.gemini/antigravity-cli/conversations/*.db</code>, <code>~/.gemini/antigravity-ide/conversations/*.db</code>, <code>~/.gemini/antigravity-backup/conversations/*.db</code> + <code>~/.config/antigravity/conversations/*.db</code></li>
         <li><strong>Roo Code</strong> — {zh ? 'IDE 扩展' : 'IDE extension'} <code>ui_messages.json</code></li>
         <li><strong>Zed</strong> — {zh ? '平台相关的' : 'platform-specific'} <code>threads.db</code></li>
         <li><strong>Goose</strong> — {zh ? '平台相关的' : 'platform-specific'} <code>sessions.db</code></li>
@@ -874,6 +874,12 @@
         <li><strong>ZCode</strong> — <code>~/.zcode/cli/db/db.sqlite</code></li>
         <li><strong>CodeFuse</strong> — <code>~/.codefuse</code> {zh ? '（原生 projects、内嵌 engine/cc/projects 与 engine/codex/sessions 日志，及 ant_cc_*.json 快照）' : '(native projects, embedded engine/cc/projects and engine/codex/sessions logs, plus ant_cc_*.json snapshots)'}</li>
       </ul>
+      <Callout type="info">
+        {zh
+          ? 'Antigravity 用量来自每个会话 SQLite 数据库的 gen_metadata 表，并在 steps 表存在时合并步骤和重试用量；重叠副本会按消息与响应标识去重。'
+          : 'Antigravity usage comes from each conversation SQLite database\'s gen_metadata table, augmented with step and retry usage when the optional steps table exists. Overlapping copies are deduplicated by message and response identifiers.'
+        }
+      </Callout>
       <Callout type="info">
         {zh
           ? 'Copilot CLI（v1.0.4+）支持通过 OpenTelemetry 导出用量数据。在 shell profile 中添加以下环境变量即可启用：'

@@ -20,36 +20,81 @@ function field(number: number, value: number | Buffer | string): Buffer {
   return Buffer.concat([varint(number * 8 + 2), varint(data.length), data])
 }
 
-function message(...fields: Buffer[]): Buffer {
-  return Buffer.concat(fields)
+function message(...fields: Array<Buffer | undefined>): Buffer {
+  return Buffer.concat(fields.filter((value): value is Buffer => value != null))
+}
+
+interface UsageOptions {
+  modelId?: number
+  input: number
+  totalOutput: number
+  cacheWrite?: number
+  cacheRead?: number
+  thinking?: number
+  responseOutput?: number
+  messageId?: string
+  responseId?: string
+  providerMessageId?: string
+}
+
+function usage(options: UsageOptions): Buffer {
+  return message(
+    options.modelId ? field(1, options.modelId) : undefined,
+    field(2, options.input),
+    field(3, options.totalOutput),
+    field(4, options.cacheWrite ?? 0),
+    field(5, options.cacheRead ?? 0),
+    options.messageId ? field(7, options.messageId) : undefined,
+    field(9, options.thinking ?? 0),
+    field(10, options.responseOutput ?? Math.max(0, options.totalOutput - (options.thinking ?? 0))),
+    options.responseId ? field(11, options.responseId) : undefined,
+    options.providerMessageId ? field(12, options.providerMessageId) : undefined,
+  )
+}
+
+function retry(value: Buffer): Buffer {
+  return message(field(2, value))
 }
 
 function generationMetadata(options: {
-  model: string
-  input: number
-  totalOutput: number
-  cacheWrite: number
-  cacheRead: number
-  thinking: number
-  responseOutput: number
-  stepIndices: number[]
+  model?: string
+  modelId?: number
+  usage?: Buffer
+  retries?: Buffer[]
+  stepIndices?: number[]
 }): Buffer {
-  const usage = message(
-    field(2, options.input),
-    field(3, options.totalOutput),
-    field(4, options.cacheWrite),
-    field(5, options.cacheRead),
-    field(9, options.thinking),
-    field(10, options.responseOutput),
+  const chatModel = message(
+    options.modelId ? field(3, options.modelId) : undefined,
+    options.usage ? field(4, options.usage) : undefined,
+    ...(options.retries ?? []).map((value) => field(17, retry(value))),
+    options.model ? field(19, options.model) : undefined,
   )
-  const chatModel = message(field(4, usage), field(22, options.model))
-  return message(field(1, chatModel), field(2, Buffer.concat(options.stepIndices.map(varint))))
+  const stepIndices = options.stepIndices ?? []
+  return message(
+    field(1, chatModel),
+    stepIndices.length > 0 ? field(2, Buffer.concat(stepIndices.map(varint))) : undefined,
+  )
 }
 
-function stepMetadata(ts: number): Buffer {
-  const seconds = Math.floor(ts / 1000)
-  const nanos = (ts % 1000) * 1_000_000
-  return message(field(1, message(field(1, seconds), field(2, nanos))))
+function timestamp(ts: number): Buffer {
+  return message(
+    field(1, Math.floor(ts / 1000)),
+    field(2, (ts % 1000) * 1_000_000),
+  )
+}
+
+function stepMetadata(options: {
+  ts: number
+  usage?: Buffer
+  retries?: Buffer[]
+  modelId?: number
+}): Buffer {
+  return message(
+    field(1, timestamp(options.ts)),
+    options.usage ? field(9, options.usage) : undefined,
+    ...(options.retries ?? []).map((value) => field(28, retry(value))),
+    options.modelId ? field(24, message(field(1, options.modelId))) : undefined,
+  )
 }
 
 describe('parse-antigravity', () => {
@@ -65,28 +110,34 @@ describe('parse-antigravity', () => {
 
   afterEach(() => db.close())
 
-  it('imports exact usage from Antigravity generation metadata', () => {
-    const createdAt = Date.UTC(2026, 8, 6, 14, 19, 29, 321)
-    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(7, stepMetadata(createdAt))
-    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
-      model: 'gemini-3.8-flash',
-      input: 12_727,
-      totalOutput: 278,
-      cacheWrite: 3,
-      cacheRead: 8_151,
-      thinking: 201,
-      responseOutput: 77,
-      stepIndices: [7, 8],
-    }), 1)
-
-    const result = runParseAntigravity(db, {
+  function parse(startIndex = 0) {
+    return runParseAntigravity(db, {
       dbPath: '/home/test/.gemini/antigravity/conversations/session-1.db',
       device: 'laptop',
       deviceInstanceId: 'device-123',
       now: Date.UTC(2026, 8, 7),
       fallbackTs: Date.UTC(2026, 8, 7),
-      startIndex: 0,
+      startIndex,
     })
+  }
+
+  it('imports exact usage from generation metadata', () => {
+    const createdAt = Date.UTC(2026, 8, 6, 14, 19, 29, 321)
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(7, stepMetadata({ ts: createdAt }))
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'gemini-3.8-flash',
+      usage: usage({
+        input: 12_727,
+        totalOutput: 278,
+        cacheWrite: 3,
+        cacheRead: 8_151,
+        thinking: 201,
+        responseOutput: 77,
+      }),
+      stepIndices: [7, 8],
+    }), 1)
+
+    const result = parse()
 
     expect(result.errors).toEqual([])
     expect(result.nextIndex).toBe(1)
@@ -102,48 +153,114 @@ describe('parse-antigravity', () => {
       cacheReadTokens: 8_151,
       thinkingTokens: 201,
       sessionId: 'session-1',
-      lineOffset: 0,
+    })
+  })
+
+  it('collects retries and deduplicates overlapping generation and step usage', () => {
+    const shared = usage({
+      input: 100,
+      totalOutput: 50,
+      cacheRead: 7,
+      thinking: 10,
+      messageId: 'message-1',
+      responseId: 'response-1',
+      providerMessageId: 'provider-1',
+    })
+    const duplicateRetry = usage({
+      input: 80,
+      totalOutput: 30,
+      thinking: 5,
+      messageId: 'message-1',
+      responseId: 'retry-response',
+      providerMessageId: 'provider-1',
+    })
+    const distinctRetry = usage({
+      input: 11,
+      totalOutput: 22,
+      thinking: 2,
+      responseId: 'distinct-retry',
+    })
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(1, stepMetadata({
+      ts: 2_000,
+      usage: shared,
+      retries: [distinctRetry],
+    }))
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'gemini-2.5-pro',
+      usage: shared,
+      retries: [duplicateRetry],
+      stepIndices: [1],
+    }), 1)
+
+    const result = parse()
+
+    expect(result.errors).toEqual([])
+    expect(result.records).toHaveLength(2)
+    expect(result.records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([11, 100])
+    expect(result.records.reduce((sum, record) => sum + record.inputTokens, 0)).toBe(111)
+  })
+
+  it('imports usage available only from steps', () => {
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(4, stepMetadata({
+      ts: 2_000,
+      usage: usage({ input: 42, totalOutput: 9 }),
+      modelId: 312,
+    }))
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      stepIndices: [4],
+    }), 1)
+
+    const result = parse()
+
+    expect(result.errors).toEqual([])
+    expect(result.nextIndex).toBe(1)
+    expect(result.records).toHaveLength(1)
+    expect(result.records[0]).toMatchObject({ model: 'gemini-2.5-flash', inputTokens: 42, outputTokens: 9 })
+  })
+
+  it('parses gen_metadata when the optional steps table is absent', () => {
+    db.exec('DROP TABLE steps')
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      model: 'gemini-2.5-flash',
+      usage: usage({ input: 20, totalOutput: 5 }),
+    }), 1)
+
+    const result = parse()
+
+    expect(result.errors).toEqual([])
+    expect(result.records).toHaveLength(1)
+    expect(result.nextIndex).toBe(1)
+  })
+
+  it('falls back to numeric model IDs when names are unavailable', () => {
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({
+      usage: usage({ modelId: 246, input: 20, totalOutput: 5 }),
+    }), 1)
+
+    expect(parse().records[0]).toMatchObject({
+      model: 'gemini-2.5-pro',
+      provider: 'google',
     })
   })
 
   it('resumes from the generation metadata index', () => {
     const data = generationMetadata({
-      model: 'gemini-3.8-flash',
-      input: 100,
-      totalOutput: 25,
-      cacheWrite: 0,
-      cacheRead: 50,
-      thinking: 5,
-      responseOutput: 20,
-      stepIndices: [],
+      model: 'gemini-2.5-flash',
+      usage: usage({ input: 100, totalOutput: 25, thinking: 5 }),
     })
     db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, data, data.length)
     db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(1, data, data.length)
 
-    const result = runParseAntigravity(db, {
-      dbPath: '/tmp/session-1.db',
-      device: 'laptop',
-      deviceInstanceId: 'device-123',
-      now: 2_000,
-      fallbackTs: 1_000,
-      startIndex: 1,
-    })
+    const result = parse(1)
 
     expect(result.records.map((record) => record.lineOffset)).toEqual([1])
     expect(result.nextIndex).toBe(2)
   })
 
   it('leaves an unfinished metadata row for a later parse', () => {
-    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, message(field(1, message())), 0)
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(0, generationMetadata({}), 0)
 
-    const result = runParseAntigravity(db, {
-      dbPath: '/tmp/session-1.db',
-      device: 'laptop',
-      deviceInstanceId: 'device-123',
-      now: 2_000,
-      fallbackTs: 1_000,
-      startIndex: 0,
-    })
+    const result = parse()
 
     expect(result.records).toEqual([])
     expect(result.nextIndex).toBe(0)
