@@ -44,7 +44,7 @@ Stored credential values are write-only through HTTP. `GET /api/config/credentia
 has been removed and returns 404 (401 before login when authentication is enabled).
 `GET /api/config` no longer includes `credentialKeys` or `sync.credentialRef`.
 Instead, `credentialStatus` contains boolean fields for the active sync target:
-`githubToken`, or `s3AccessKeyId` and `s3SecretAccessKey`.
+`githubApp` and `githubToken`, or `s3AccessKeyId` and `s3SecretAccessKey`.
 
 To check another target, use
 `GET /api/config/credentials/status?backend=github&repo=owner%2Frepo` or
@@ -52,6 +52,11 @@ To check another target, use
 These return only the corresponding boolean fields, never storage references.
 
 Set or replace credentials with `PUT /api/config`:
+
+GitHub setup now prefers **Connect GitHub**, which uses the local device-flow
+API. New App credentials and PAT replacements use secure storage outside
+`config.json`; existing PAT configs remain compatible. See
+[GitHub sync authentication](github-sync.md) for setup and migration.
 
 ```json
 {
@@ -64,7 +69,7 @@ For S3, use `s3AccessKeyId` and `s3SecretAccessKey`. Empty or omitted fields ret
 the saved values. Responses contain only `{ "ok": true }`. The settings form
 starts with blank secret inputs, clears replacements after saving, and only
 allows showing values just entered by the user. Existing storage keys and the
-legacy `credentials` write payload remain supported; on-disk credentials are
+legacy `credentials` write payload remain supported; legacy PATs are
 unchanged. The UI no longer infers a sync target by enumerating stored keys.
 
 ## Compatibility

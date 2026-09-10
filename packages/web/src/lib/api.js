@@ -7,6 +7,15 @@ function buildUrl(base, params) {
   return query ? `${base}?${query}` : base
 }
 
+export async function githubConnection(action, body = {}) {
+  const response = await fetch(`/api/github/${action}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+  const result = await response.json()
+  if (!response.ok) throw new Error(result.error?.message || 'GitHub connection failed')
+  return result
+}
+
 // Stale-while-revalidate cache (§11.4)
 const swrCache = new Map()
 const inflightRequests = new Map()

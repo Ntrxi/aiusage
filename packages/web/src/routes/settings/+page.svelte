@@ -4,6 +4,7 @@
   import { fetchConfig, saveConfig, fetchCredentialStatus, fetchDetectedTools, importKelivoBackup, notifySettingsUpdated, refreshExchangeRate, fetchSyncStatus, triggerSync, fetchCloudSyncStatus } from '$lib/api.js'
   import { displayCurrency, exchangeRate } from '$lib/stores.js'
   import { splitSettingsSources } from '$lib/settings-sources.js'
+  import { githubConnection } from '$lib/api.js'
 
   let loading = true
   let loadError = null
@@ -58,6 +59,63 @@
   let ghToken = ''
   let ghTokenVisible = false
   let ghTokenIsSet = false
+  let ghAppIsSet = false
+  let ghConnection = null
+  let ghRepositories = []
+  let ghBusy = false
+  let ghTimer = null
+
+  async function connectGitHub() {
+    ghBusy = true; syncError = ''
+    try {
+      await cancelGitHub()
+      ghConnection = await githubConnection('start')
+      ghTimer = setTimeout(pollGitHub, 5000)
+    } catch (e) { syncError = e.message }
+    finally { ghBusy = false }
+  }
+
+  async function pollGitHub() {
+    const connection = ghConnection
+    if (!connection) return
+    try {
+      const result = await githubConnection('poll', { sessionId: connection.sessionId })
+      if (ghConnection !== connection) return
+      if (result.status === 'pending') ghTimer = setTimeout(pollGitHub, 5000)
+      else {
+        ghConnection = { ...connection, login: result.login }
+        await refreshGitHubRepositories()
+      }
+    } catch (e) { syncError = e.message; await cancelGitHub() }
+  }
+
+  async function refreshGitHubRepositories() {
+    ghBusy = true
+    try {
+      const result = await githubConnection('repositories', { sessionId: ghConnection.sessionId })
+      ghRepositories = result.repositories
+    } catch (e) { syncError = e.message }
+    finally { ghBusy = false }
+  }
+
+  async function selectGitHubRepository(repo) {
+    ghBusy = true; syncError = ''
+    try {
+      await githubConnection('connect', { sessionId: ghConnection.sessionId, repo })
+      syncData.repo = repo; ghAppIsSet = true; ghToken = ''; ghTokenIsSet = false
+      ghConnection = null; ghRepositories = []
+      notifySettingsUpdated()
+    } catch (e) { syncError = e.message }
+    finally { ghBusy = false }
+  }
+
+  async function cancelGitHub() {
+    clearTimeout(ghTimer)
+    const connection = ghConnection
+    ghConnection = null; ghRepositories = []
+    if (connection) await githubConnection('cancel', { sessionId: connection.sessionId }).catch(() => {})
+  }
+  onDestroy(() => { void cancelGitHub() })
 
   // S3 credential state — two separate credentials required by sync.ts
   let s3AkidValue = ''
@@ -111,7 +169,7 @@
 
   async function loadCredentialStatus() {
     const target = { ...syncData }
-    ghTokenIsSet = false; s3AkidIsSet = false; s3SakIsSet = false
+    ghAppIsSet = false; ghTokenIsSet = false; s3AkidIsSet = false; s3SakIsSet = false
     try {
       const status = await fetchCredentialStatus(target)
       if (target.backend !== syncData.backend || target.repo !== syncData.repo || target.bucket !== syncData.bucket) return
@@ -122,6 +180,7 @@
   }
 
   function applyCredentialStatus(status) {
+    ghAppIsSet = Boolean(status.githubApp)
     ghTokenIsSet = Boolean(status.githubToken)
     s3AkidIsSet = Boolean(status.s3AccessKeyId)
     s3SakIsSet = Boolean(status.s3SecretAccessKey)
@@ -326,7 +385,7 @@
       if (syncData.backend === 'github') {
         if (!syncData.repo) throw new Error($t('settings.syncRepoRequired'))
         if (!/^[^/\s]+\/[^/\s]+$/.test(syncData.repo)) throw new Error($t('settings.syncRepoInvalid'))
-        if (!ghToken && !ghTokenIsSet) throw new Error($t('settings.syncGithubTokenRequired'))
+        if (!ghToken && !ghTokenIsSet && !ghAppIsSet) throw new Error($t('settings.syncGithubTokenRequired'))
       } else if (syncData.backend === 's3') {
         if (!syncData.bucket) throw new Error($t('settings.syncBucketRequired'))
         if (!s3AkidValue && !s3AkidIsSet) throw new Error($t('settings.syncS3AccessKeyRequired'))
@@ -374,6 +433,7 @@
       // Update isSet flags and clear entered values (don't expose creds in memory longer than needed)
       if (syncData.backend === 'github') {
         if (ghToken) {
+          ghAppIsSet = false
           ghTokenIsSet = true; ghToken = ''; ghTokenVisible = false
         }
       } else if (syncData.backend === 's3') {
@@ -727,13 +787,31 @@
         {/if}
 
         {#if syncData.backend === 'github'}
+          <div class="field full">
+            <button type="button" class="btn-ghost" on:click={connectGitHub} disabled={ghBusy || !!ghConnection}>{$t('settings.connectGitHub')}</button>
+            {#if ghAppIsSet}<p class="field-hint">{$t('settings.githubConnected')}</p>{/if}
+            {#if ghConnection}
+              {#if !ghConnection.login}
+                <p><a href={ghConnection.verificationUrl} target="_blank" rel="noopener noreferrer">{$t('settings.githubVerify')}</a>: <strong>{ghConnection.userCode}</strong></p>
+              {:else}
+                <p>{ghConnection.login}</p>
+                <a href={ghConnection.installUrl} target="_blank" rel="noopener noreferrer">{$t('settings.githubInstall')}</a>
+                <button type="button" class="btn-ghost" on:click={refreshGitHubRepositories} disabled={ghBusy}>{$t('settings.githubRefresh')}</button>
+                {#each ghRepositories as repository}
+                  <button type="button" class="btn-ghost" on:click={() => selectGitHubRepository(repository.repo)} disabled={ghBusy}>{repository.repo}</button>
+                {/each}
+              {/if}
+              <button type="button" class="btn-ghost" on:click={cancelGitHub}>{$t('settings.githubCancel')}</button>
+            {/if}
+          </div>
           <div class="field">
             <label class="field-label" for="field-sync-repo">{$t('settings.syncRepo')}</label>
             <input id="field-sync-repo" type="text" bind:value={syncData.repo} class="field-input mono"
               placeholder="owner/repo" on:input={onRepoChange} />
           </div>
-          <div class="field full">
-            <label class="field-label" for="field-gh-token">GitHub Token</label>
+          <details class="field full">
+            <summary>{$t('settings.githubPatFallback')}</summary>
+            <label class="field-label" for="field-gh-token">Fine-grained Personal Access Token</label>
             <div class="credential-row">
               <input id="field-gh-token" type={ghTokenVisible ? 'text' : 'password'}
                 value={ghToken} on:input={e => ghToken = e.target.value}
@@ -744,7 +822,7 @@
                 {#if ghTokenVisible}{$t('settings.hideCredential')}{:else}{$t('settings.showCredential')}{/if}
               </button>
             </div>
-          </div>
+          </details>
         {/if}
 
         {#if syncData.backend === 's3'}

@@ -130,6 +130,7 @@ Security issues should be reported privately when possible. See [SECURITY.md](./
 Sync and leaderboard are independent optional features.
 
 - **Sync** keeps your own devices aligned through GitHub, S3, R2, or MinIO. Configure it with `aiusage init`, then run `aiusage sync`.
+  GitHub sync prefers `aiusage github login --repo OWNER/REPO` or **Connect GitHub** in local settings, using a least-privilege GitHub App without an AIUsage account. Fine-grained PATs remain an advanced fallback. See [GitHub App setup and migration](docs/github-sync.md).
 - If versions up to 1.5.13 caused duplicate cross-device records, use `aiusage sync --repair` to inspect them before applying cleanup. See the [sync repair guide](./docs/sync-repair.md).
 - **Leaderboard** is public ranking for users who explicitly upload aggregate totals. Authorize a device with `aiusage login`, then run `aiusage upload`.
 - Anonymous mode is available in [site settings](https://aiusage.jtanx.com/settings) for leaderboard participation.

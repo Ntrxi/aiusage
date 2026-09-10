@@ -8,6 +8,8 @@ import { calculateCostForPrice, removePriceOverride, inferProvider, normalizeQod
 import { AIUSAGE_DIR, buildConsentConfig, loadConfig, saveConfig } from '../config.js'
 import { browserProtocol, isTrustedApiRequest } from './trust.js'
 import { credentialStatus, publicSyncConfig, setSyncCredentials } from './credential-settings.js'
+import { createGitHubDeviceSessions } from '../github/device-sessions.js'
+import { safeGitHubError, validateRepo } from '../github/auth.js'
 import type { Config, SyncConfig } from '../config.js'
 import { setSyncConsent } from '../init.js'
 import { generateConsentFingerprint } from '../sync/consent.js'
@@ -566,6 +568,7 @@ function summaryTotalsPayload(totals: SummaryTotals): SummaryTotals {
 }
 
 export function createApiServer(db: Database.Database, options?: ApiServerOptions): http.Server {
+  const githubDeviceAction = createGitHubDeviceSessions()
   const cfg = loadConfig()
   let weekStart: 0 | 1 = (cfg?.weekStart ?? 1) as 0 | 1
   const dashboardPassword = getDashboardPassword()
@@ -1822,6 +1825,23 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
       }
 
       // Only configured state for a sync target is exposed, never keys or values.
+      if (url.pathname.startsWith('/api/github/') && req.method === 'POST') {
+        try {
+          let body = ''
+          for await (const chunk of req) {
+            body += chunk
+            if (body.length > 4096) throw new Error('Body too large')
+          }
+          const action = url.pathname.slice('/api/github/'.length)
+          const result = await githubDeviceAction(action, JSON.parse(body || '{}'))
+          if (action === 'connect' && result.ok) options?.onConfigUpdated?.()
+          json(res, result)
+        } catch (error) {
+          json(res, { error: { code: 'GITHUB_AUTH_FAILED', message: safeGitHubError(error) } }, 400)
+        }
+        return
+      }
+
       if (url.pathname === '/api/config/credentials/status' && req.method === 'GET') {
         const backend = url.searchParams.get('backend')
         const sync = backend === 'github' || backend === 's3'
@@ -1945,6 +1965,12 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
                 for (const f of ['repo', 'bucket', 'prefix', 'endpoint', 'region', 'credentialRef'] as const) {
                   if (syncUpdate[f] != null && syncUpdate[f] !== '') (newSync as any)[f] = String(syncUpdate[f])
                 }
+                if (newSync.repo !== existing.sync?.repo) {
+                  delete newSync.githubAuth
+                  delete newSync.branch
+                  delete newSync.credentialRef
+                }
+                if (newSync.backend === 'github' && newSync.repo) validateRepo(newSync.repo)
                 if (newSync.backend === 'github' && !newSync.repo) {
                   json(res, { error: { code: 'INVALID_SYNC_CONFIG', message: 'sync.repo is required for GitHub sync' } }, 400)
                   return
