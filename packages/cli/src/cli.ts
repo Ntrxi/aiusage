@@ -3,6 +3,8 @@ import { writeFileSync } from 'node:fs'
 import { execSync } from 'node:child_process'
 import { serve } from './commands/serve.js'
 import { runInit } from './commands/init.js'
+import { runGitHubLogin } from './commands/github-login.js'
+import { safeGitHubError } from './github/auth.js'
 import { runSync, runSyncRepair, formatRepairReport } from './commands/sync.js'
 import { generateSummary } from './commands/summary.js'
 import { generateStatus } from './commands/status.js'
@@ -338,7 +340,7 @@ program
   .description('Configure cloud sync')
   .option('--backend <backend>', 'Sync backend (cloud|github|s3|skip)')
   .option('--repo <repo>', 'GitHub repository (format: username/repo-name)')
-  .option('--token <token>', 'GitHub Personal Access Token')
+  .option('--token <token>', 'Advanced PAT fallback (prefer AIUSAGE_GITHUB_TOKEN to avoid shell history)')
   .option('--bucket <bucket>', 'S3 bucket name')
   .option('--prefix <prefix>', 'S3 object prefix', 'aiusage/')
   .option('--endpoint <endpoint>', 'S3 endpoint URL')
@@ -346,8 +348,17 @@ program
   .option('--access-key-id <id>', 'S3 access key ID')
   .option('--secret-access-key <key>', 'S3 secret access key')
   .option('--device <alias>', 'Device alias')
-  .action((options) => {
-    const result = runInit(options)
+  .action(async (options) => {
+    if (options.backend === 'github' && !options.token && !process.env.AIUSAGE_GITHUB_TOKEN) {
+      try {
+        const existing = runInit(options)
+        if (existing.success) { console.log(existing.message); return }
+        await runGitHubLogin(options)
+      } catch (error) { console.error(safeGitHubError(error)); process.exitCode = 1 }
+      return
+    }
+    let result
+    try { result = runInit(options) } catch { console.error('Cannot securely save credentials. Check the OS keychain.'); process.exitCode = 1; return }
     if (result.success) {
       console.log(`✓ ${result.message}`)
     } else {
@@ -357,6 +368,14 @@ program
   })
 
 // sync command
+program.command('github').description('Manage local GitHub sync authentication')
+  .command('login').description('Connect a GitHub App using device authorization')
+  .option('--repo <owner/repo>', 'Select the sync repository (required in headless mode)')
+  .action(async (options) => {
+    try { await runGitHubLogin(options) }
+    catch (error) { console.error(safeGitHubError(error)); process.exitCode = 1 }
+  })
+
 program
   .command('sync')
   .description('Sync data with cloud storage')

@@ -5,6 +5,14 @@ import { compile } from 'svelte/compiler'
 const source = readFileSync(new URL('../src/routes/settings/+page.svelte', import.meta.url), 'utf8')
 
 describe('write-only credential settings', () => {
+  it('prefers device connection and keeps PAT input in an advanced disclosure', () => {
+    expect(source).toContain("githubConnection('start')")
+    expect(source).toContain("githubConnection('connect'")
+    expect(source).toContain("$t('settings.connectGitHub')")
+    expect(source).toContain('<details class="field full">')
+    expect(source).toContain("$t('settings.githubPatFallback')")
+    expect(source).not.toMatch(/access_token|refresh_token|device_code/)
+  })
   it('keeps stored secrets out of the form and submits replacements by field name', () => {
     expect(() => compile(source, { generate: false })).not.toThrow()
     expect(source).not.toMatch(/fetchCredential\(|credentialKeys|credentialRef|data\.value/)

@@ -79,7 +79,7 @@ describe('local API trust boundary', () => {
 
   it.each(['https://evil.example', 'null', 'http://localhost:9999'])('rejects origin %s before reads, writes, login, or preflight', async (origin) => {
     await start()
-    for (const [method, route] of [['GET', '/api/config'], ['POST', '/api/refresh'], ['POST', '/api/auth/login'], ['OPTIONS', '/api/config']]) {
+    for (const [method, route] of [['GET', '/api/config'], ['POST', '/api/refresh'], ['POST', '/api/auth/login'], ['POST', '/api/github/start'], ['POST', '/api/github/connect'], ['OPTIONS', '/api/config']]) {
       const response = await fetch(`${base}${route}`, { method, headers: { Origin: origin } })
       expect(response.status).toBe(403)
       expect(response.headers.get('access-control-allow-origin')).toBeNull()
@@ -110,6 +110,8 @@ describe('local API trust boundary', () => {
 
   it('requires authentication for quotas and adjacent APIs, including session IDs ending in asset extensions', async () => {
     await start('secret')
+    expect((await fetch(`${base}/api/github/start`, { method: 'POST' })).status).toBe(401)
+    expect((await fetch(`${base}/api/github/connect`, { method: 'POST' })).status).toBe(401)
     for (const route of ['/api/quotas', '/api/config', '/api/config/credentials/status', '/api/config/credential?ref=token', '/api/cli/sync/status', '/api/sessions/session.json', '/api/detected-tools']) {
       expect((await fetch(`${base}${route}`)).status).toBe(401)
     }

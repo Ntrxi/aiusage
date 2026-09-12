@@ -3,6 +3,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'node:http'
 import Database from 'better-sqlite3'
 import { initializeDatabase } from '../../src/db/index.js'
+vi.mock('../../src/github/credentials.js', () => ({
+  saveGitHubCredentials: vi.fn(() => '11111111-1111-1111-1111-111111111111'),
+  loadGitHubCredentials: vi.fn(),
+}))
 
 vi.mock('../../src/config.js', async (importOriginal) => {
   const actual = await importOriginal() as Record<string, unknown>
@@ -78,6 +82,19 @@ describe('GET /api/config', () => {
     expect(data.credentialStatus).toEqual({})
     expect(data).not.toHaveProperty('sources')
     expect(data.sync).toBeNull()
+  })
+
+  it('exposes only the GitHub App method and account, never stored credentials or references', async () => {
+    vi.mocked(loadConfig).mockReturnValue({ sync: {
+      backend: 'github', repo: 'owner/data', credentialRef: 'old-private-reference',
+      githubAuth: { method: 'github-app', login: 'owner', clientId: 'Iv1.test', installationId: 1,
+        credentialId: 'private-keychain-reference', accessToken: 'ghu_private', refreshToken: 'ghr_private' } as any,
+    }, credentials: { legacy: 'secret' } })
+    const response = await fetch(baseUrl + '/api/config')
+    const data = await response.json()
+    expect(data.sync.githubAuth).toEqual({ method: 'github-app', login: 'owner' })
+    expect(data.credentialStatus).toEqual({ githubApp: true, githubToken: false })
+    expect(JSON.stringify(data)).not.toMatch(/private|ghu_|ghr_|secret|credentialId|credentialRef/)
   })
 
   it('returns config values and masks credential values', async () => {
@@ -379,7 +396,7 @@ describe('GET /api/config/credential', () => {
       }
     }
     const github = await fetch(baseUrl + '/api/config/credentials/status?backend=github&repo=user/repo')
-    expect(await github.json()).toEqual({ githubToken: true })
+    expect(await github.json()).toEqual({ githubToken: true, githubApp: false })
     const missing = await fetch(baseUrl + '/api/config/credentials/status?backend=s3&bucket=other')
     expect(await missing.json()).toEqual({ s3AccessKeyId: false, s3SecretAccessKey: false })
   })
@@ -394,13 +411,16 @@ describe('GET /api/config/credential', () => {
     expect(write.status).toBe(200)
     expect(await write.json()).toEqual({ ok: true })
     const saved = vi.mocked(saveConfig).mock.calls[0][0]
-    expect(saved.credentials).toEqual(expected)
+    if (sync.backend === 'github') {
+      expect(saved.sync?.githubAuth).toEqual({ method: 'pat', credentialId: '11111111-1111-1111-1111-111111111111' })
+      expect(saved.credentials).toBeUndefined()
+    } else expect(saved.credentials).toEqual(expected)
     vi.mocked(loadConfig).mockReturnValue(saved)
     const read = await fetch(baseUrl + '/api/config')
     const text = await read.text()
     for (const value of Object.values(expected)) expect(text).not.toContain(value)
     const blank = Object.fromEntries(Object.keys(syncCredentials).map(key => [key, '']))
     await fetch(baseUrl + '/api/config', { method: 'PUT', body: JSON.stringify({ syncCredentials: blank }) })
-    expect(vi.mocked(saveConfig).mock.lastCall?.[0].credentials).toEqual(expected)
+    expect(vi.mocked(saveConfig).mock.lastCall?.[0]).toEqual(saved)
   })
 })
