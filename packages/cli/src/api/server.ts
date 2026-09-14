@@ -173,13 +173,26 @@ async function recalcCosts(db: Database.Database, onProgress?: (status: Pick<Pri
   return updated
 }
 
+/** Parse a YYYY-MM-DD string as local midnight (falls back to Date parsing for other formats). */
+function parseLocalDate(value: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  const d = new Date(value)
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate())
+}
+
 function getDateRangeFilter(range: string | null, from: string | null, to: string | null, prefix = '', weekStart: 0 | 1 = 1): { where: string; params: Record<string, unknown> } {
   const ts = prefix ? `${prefix}.ts` : 'ts'
 
   if (from && to) {
-    const startMs = new Date(from).getTime()
-    const endMs = new Date(to + 'T23:59:59.999Z').getTime()
-    return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start: startMs, end: endMs } }
+    // Custom ranges come from a date picker as local calendar dates (YYYY-MM-DD).
+    // Preset ranges use local-time boundaries, so custom ranges must too: start at
+    // local midnight of `from`, end (exclusive) at local midnight of the day after `to`.
+    // Parsing date-only strings with `new Date(str)` would interpret them as UTC.
+    const startMs = parseLocalDate(from).getTime()
+    const endDate = parseLocalDate(to)
+    endDate.setDate(endDate.getDate() + 1)
+    return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start: startMs, end: endDate.getTime() } }
   }
 
   const now = new Date()
