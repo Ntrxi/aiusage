@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [1.5.16] - 2026-09-14
+
+### 新增
+- **本地同步支持 GitHub App 认证**（[#53](https://github.com/juliantanx/aiusage/pull/53)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 新增 `aiusage github-login` 设备授权、安全凭据存储及经过认证的 GitHub 同步，无需用户自行创建和粘贴个人访问令牌。
+
+### 变更
+- **强化本地仪表盘信任边界**（[#53](https://github.com/juliantanx/aiusage/pull/53)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 无密码服务默认仅监听回环地址，非回环地址及 Docker 访问必须设置密码；拒绝跨域和 DNS 重绑定请求，使存储的凭据只能通过 HTTP 写入，保护敏感数据接口，并仅通过公开的 home-summary 接口提供汇总总量。数据刷新改用 `POST`，认证 Cookie 也会正确识别 HTTPS 代理头。
+
+### 修复
+- **Antigravity 解析器会拒绝合法的 10 字节 varint**（[#54](https://github.com/juliantanx/aiusage/pull/54)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— protobuf varint 读取器此前在 8 字节后停止，导致包含 10 字节 varint 的 generation 或 step 元数据解析失败，并丢弃该行的全部用量记录。现在可接受 protobuf 规定的最多 10 字节，同时仍会拒绝更长的序列。
+
+---
+
 ## [1.5.15] - 2026-09-08
 
 ### 新增
@@ -453,6 +466,7 @@
 
 ---
 
+[1.5.16]: https://github.com/juliantanx/aiusage/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/juliantanx/aiusage/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13

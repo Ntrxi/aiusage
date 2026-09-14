@@ -5,10 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.16] - 2026-09-14
+
+### Added
+- **GitHub App authentication for local sync** ([#53](https://github.com/juliantanx/aiusage/pull/53) by [@Ntrxi](https://github.com/Ntrxi)) — add `aiusage github-login` device authorization, secure credential storage, and authenticated GitHub sync without requiring users to create and paste a personal access token.
+
+### Changed
+- **Hardened local dashboard trust boundary** ([#53](https://github.com/juliantanx/aiusage/pull/53) by [@Ntrxi](https://github.com/Ntrxi)) — bind passwordless servers to loopback by default, require a password for non-loopback and Docker access, reject cross-origin and DNS-rebinding requests, make stored credentials write-only over HTTP, protect sensitive data APIs, and expose only aggregate totals through the public home-summary endpoint. Refresh requests now use `POST`, and authentication cookies honor HTTPS proxy headers.
 
 ### Fixed
-- **Antigravity parser rejected valid 10-byte varints** — the protobuf varint reader stopped after 8 bytes, so any generation or step metadata row containing a 10-byte varint (for example an `int64` `-1` sentinel in an unrelated field) failed with `invalid protobuf varint` and every usage record in that row was dropped. The reader now accepts the full 10-byte protobuf maximum and still rejects longer sequences.
+- **Antigravity parser rejected valid 10-byte varints** ([#54](https://github.com/juliantanx/aiusage/pull/54) by [@Ntrxi](https://github.com/Ntrxi)) — the protobuf varint reader stopped after 8 bytes, so generation or step metadata containing a 10-byte varint could fail and drop every usage record in that row. The reader now accepts the full 10-byte protobuf maximum and still rejects longer sequences.
 
 ---
 
@@ -460,6 +466,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.16]: https://github.com/juliantanx/aiusage/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/juliantanx/aiusage/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
 [1.5.13]: https://github.com/juliantanx/aiusage/compare/v1.5.12...v1.5.13
