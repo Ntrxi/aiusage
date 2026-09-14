@@ -173,12 +173,40 @@ async function recalcCosts(db: Database.Database, onProgress?: (status: Pick<Pri
   return updated
 }
 
-/** Parse a YYYY-MM-DD string as local midnight (falls back to Date parsing for other formats). */
-function parseLocalDate(value: string): Date {
+/** Calendar components of a YYYY-MM-DD string (falls back to Date parsing for other formats). */
+function parseCalendarDate(value: string): { year: number; month: number; day: number } {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  if (m) return { year: Number(m[1]), month: Number(m[2]) - 1, day: Number(m[3]) }
   const d = new Date(value)
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  return { year: d.getFullYear(), month: d.getMonth(), day: d.getDate() }
+}
+
+/**
+ * Local midnight for a calendar date, expressed in ms since epoch. `dayOffset` is
+ * applied to the calendar day (the Date constructor normalises overflow), so the
+ * result is always the true start of that day even when DST skips midnight.
+ */
+function localMidnightMs(date: { year: number; month: number; day: number }, dayOffset = 0): number {
+  return new Date(date.year, date.month, date.day + dayOffset).getTime()
+}
+
+/** Format a ms timestamp as its local calendar date (YYYY-MM-DD). */
+function formatLocalDay(ts: number): string {
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/**
+ * Register `local_day(ts)` on the connection so SQL aggregations bucket timestamps by
+ * local calendar day, matching the local-midnight boundaries used by date-range filters.
+ * SQLite's own `strftime(..., 'unixepoch')` buckets by UTC date, and its `'localtime'`
+ * modifier relies on the C runtime's timezone rather than the one Node uses.
+ */
+function registerLocalDayFunction(db: Database.Database): void {
+  db.function('local_day', { deterministic: true }, (ts: unknown) => {
+    if (ts === null || ts === undefined) return null
+    return formatLocalDay(Number(ts))
+  })
 }
 
 function getDateRangeFilter(range: string | null, from: string | null, to: string | null, prefix = '', weekStart: 0 | 1 = 1): { where: string; params: Record<string, unknown> } {
@@ -189,10 +217,12 @@ function getDateRangeFilter(range: string | null, from: string | null, to: strin
     // Preset ranges use local-time boundaries, so custom ranges must too: start at
     // local midnight of `from`, end (exclusive) at local midnight of the day after `to`.
     // Parsing date-only strings with `new Date(str)` would interpret them as UTC.
-    const startMs = parseLocalDate(from).getTime()
-    const endDate = parseLocalDate(to)
-    endDate.setDate(endDate.getDate() + 1)
-    return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start: startMs, end: endDate.getTime() } }
+    // Both boundaries are built from calendar components rather than by mutating a parsed
+    // Date: where DST skips midnight (e.g. America/Santiago), the parsed start of `to` is
+    // 01:00, and adding a day to that would leak an hour of the following day into the range.
+    const startMs = localMidnightMs(parseCalendarDate(from))
+    const endMs = localMidnightMs(parseCalendarDate(to), 1)
+    return { where: `AND ${ts} >= @start AND ${ts} < @end`, params: { start: startMs, end: endMs } }
   }
 
   const now = new Date()
@@ -496,7 +526,7 @@ function querySummaryTotals(
         COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
         COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
         COALESCE(SUM(cost), 0) AS totalCost,
-        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT local_day(ts)) AS activeDays,
         COUNT(DISTINCT session_id) AS totalSessions
       FROM (${unionSql})
     `).get({ ...dr.params, ...df.params, ...tf.params }) as any
@@ -527,7 +557,7 @@ function querySummaryTotals(
         COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
         COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
         COALESCE(SUM(cost), 0) AS totalCost,
-        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT local_day(ts)) AS activeDays,
         COUNT(DISTINCT session_key) AS totalSessions
       FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
     `).get({ ...dr.params, ...df.params, ...tf.params }) as any
@@ -550,7 +580,7 @@ function querySummaryTotals(
         COALESCE(SUM(thinking_tokens), 0) AS thinkingTokens,
         COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens + thinking_tokens), 0) AS totalTokens,
         COALESCE(SUM(cost), 0) AS totalCost,
-        COUNT(DISTINCT strftime('%Y-%m-%d', ts/1000, 'unixepoch')) AS activeDays,
+        COUNT(DISTINCT local_day(ts)) AS activeDays,
         COUNT(DISTINCT session_id) AS totalSessions
       FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
     `).get({ ...dr.params, ...tf.params }) as any
@@ -581,6 +611,7 @@ function summaryTotalsPayload(totals: SummaryTotals): SummaryTotals {
 }
 
 export function createApiServer(db: Database.Database, options?: ApiServerOptions): http.Server {
+  registerLocalDayFunction(db)
   const githubDeviceAction = createGitHubDeviceSessions()
   const cfg = loadConfig()
   let weekStart: 0 | 1 = (cfg?.weekStart ?? 1) as 0 | 1
@@ -850,7 +881,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
         if (df.useUnion) {
           sql = `
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(input_tokens) AS inputTokens,
                    SUM(output_tokens) AS outputTokens,
                    SUM(cache_read_tokens) AS cacheReadTokens,
@@ -865,7 +896,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           params = { ...dr.params, currentDeviceId: df.params.currentDeviceId, ...tf.params }
         } else if (device && device !== options?.currentDeviceInstanceId) {
           sql = `
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(input_tokens) AS inputTokens,
                    SUM(output_tokens) AS outputTokens,
                    SUM(cache_read_tokens) AS cacheReadTokens,
@@ -876,7 +907,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           params = { ...df.params, ...dr.params, ...tf.params }
         } else {
           sql = `
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(input_tokens) AS inputTokens,
                    SUM(output_tokens) AS outputTokens,
                    SUM(cache_read_tokens) AS cacheReadTokens,
@@ -906,7 +937,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
 
         if (df.useUnion) {
           daily = db.prepare(`
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(cost) AS cost
             FROM (
               SELECT cost, ts FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
@@ -933,7 +964,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           `).all({ ...dr.params, currentDeviceId: df.params.currentDeviceId, ...tf.params }) as any[]
         } else if (device && device !== options?.currentDeviceInstanceId) {
           daily = db.prepare(`
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(cost) AS cost
             FROM synced_records WHERE 1=1 ${df.where} ${dr.where} ${tf.where}
             GROUP BY date ORDER BY date
@@ -952,7 +983,7 @@ export function createApiServer(db: Database.Database, options?: ApiServerOption
           `).all({ ...df.params, ...dr.params, ...tf.params }) as any[]
         } else {
           daily = db.prepare(`
-            SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS date,
+            SELECT local_day(ts) AS date,
                    SUM(cost) AS cost
             FROM records WHERE 1=1 ${dr.where} ${df.localOnly ? LOCAL_ONLY_FILTER : ''} ${tf.where}
             GROUP BY date ORDER BY date
