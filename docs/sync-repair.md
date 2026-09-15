@@ -56,9 +56,10 @@ Every rule is deterministic; none of them looks at `source_file`.
 | Remote namespace | A line whose `deviceInstanceId` is a concrete id different from the namespace owner. | Only the owning device writes to its namespace, and after the fix it writes only its own records. |
 | Remote or local | A line/row E is an *echo* when a session key K known anywhere in the system (any namespace, any local row) exists such that `sha256(E.device + "\0" + K)[0:24] === E.sessionKey`. | Re-uploading a merged row hashes its already-hashed session key. A genuine session key is the hash of a tool-generated session id, never of another session's 24-hex key. Usage fields are not compared because backfills may rewrite model, cost or timestamps on the origin device after the echo was taken. |
 | Local `synced_records` | A row stamped with this device's own id. | Pull never reads our own namespace, so our id can only appear there by bouncing through another device. The authoritative row is in `records`. |
-| **This device's** namespace | A *stale* line: its id is not produced by any record in the local database. | The namespace is a snapshot of this device's database (see [`sync-namespaces.md`](./sync-namespaces.md)). The record was deleted, the cache was rebuilt with different ids, or the record now travels under a different id (Antigravity/Trae since 1.5.17). Only the owning device can judge this, so other namespaces are never checked for staleness. |
+| **This device's** namespace | A *stale* line: its id is not produced by any record in the local database. | The namespace is a snapshot of this device's database (see [`sync-namespaces.md`](./sync-namespaces.md)). The record was deleted, the cache was rebuilt with different ids, or the record now travels under a different id (Antigravity/Trae, from the release following 1.5.17). Only the owning device can judge this, so other namespaces are never checked for staleness. |
 | Any namespace | A *duplicate* line: the same id appears more than once in one namespace (usually across day files after a record's timestamp changed). | Only the copy with the highest `updatedAt` is kept. |
 | Local `records` | A *wire-id collision*: two local records that map to the same sync id. | Reported, never deleted. The mapper is expected to make this impossible; a non-zero count is a bug worth reporting with the tool names involved. Until fixed, only the most recently updated record of each group is uploaded. |
+| Local `synced_records` | An *orphaned* pulled row: no sync target claims it (it was pulled before per-target claims existed) and its device has no namespace on the configured target. | Sync cannot tell whether an older target still carries the row, so it only prunes such rows by itself when this target is the only one the device ever used. Repair lists them per device; if the device does publish on another target, sync that target first and the rows stop being reported. |
 
 Lines with `deviceInstanceId = 'unknown'` are records parsed before
 `aiusage init` created `state.json`. On pull they are attributed to the
@@ -82,12 +83,15 @@ under `sha256(device, sourceFile, lineOffset)`; several usage events of one
 generation share that key, so on one machine 972 local records became 929
 remote ones. The same applied to Trae sessions (all at offset 0).
 
-Since 1.5.17 both are fixed structurally: every sync rewrites the device's
-namespace as a snapshot of its database and prunes peer rows that vanished
-remotely, and Antigravity/Trae publish under their parser-generated ids. The
-first sync after upgrading cleans up automatically on every device that runs
-it; `--repair` is only needed to inspect the state before that, or to clean
-namespaces of devices that will never sync again.
+From the release following 1.5.17 both are fixed structurally: every sync
+rewrites the device's namespace as a snapshot of its database (with a manifest
+peers verify before trusting it) and prunes peer rows that vanished remotely
+once no sync target claims them, and Antigravity/Trae publish under their
+parser-generated ids. The first sync after upgrading cleans up automatically on
+every device that runs it; `--repair` is only needed to inspect the state
+before that, to clean namespaces of devices that will never sync again, or to
+remove orphaned rows of a device whose namespace had already disappeared
+before the upgrade (see [`sync-namespaces.md`](./sync-namespaces.md)).
 
 ## Automatic migration (v13)
 

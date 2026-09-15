@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
 import {
@@ -11,19 +10,46 @@ import {
   UNKNOWN_DEVICE_INSTANCE_ID,
 } from '../db/records.js'
 import {
+  getUnclaimedSyncedRecords,
   insertSyncedRecord,
   mergeSyncedRecordsIntoRecords,
+  pruneUnclaimedSyncedRecordsOf,
   pruneUnclaimedUnknownSyncedRecords,
   reconcileSyncedNamespace,
 } from '../db/synced-records.js'
-import { clearRetiredWireIds, forgetNamespace, getSeenNamespaces, recordSeenNamespaces } from '../db/sync-namespaces.js'
+import { clearRetiredWireIds, getClaimedOwners } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
+import {
+  buildManifest,
+  canonicalDigest,
+  contentDigest,
+  isManifestPath,
+  manifestPath,
+  matchesCanonical,
+  parseManifest,
+  parseNdjsonLines,
+  serializeManifest,
+  serializeSnapshot,
+  type NamespaceManifest,
+} from './manifest.js'
 import { classifyPulledRecord, namespaceOwnerFromPath } from './ownership.js'
 import type { SyncProgress } from './runtime.js'
 
+export { contentDigest, parseSyncRecordLine, serializeSnapshot } from './manifest.js'
+
 export interface SyncBackend {
+  /**
+   * Content of `path`, or `null` only when the file is confirmed absent.
+   * Every other failure (permissions, I/O, corrupt cache) must throw: the
+   * orchestrator prunes local rows against what it reads, so a failure that
+   * looked like "not there" would be interpreted as a deletion.
+   */
   readFile(path: string): Promise<string | null>
   writeFile(path: string, content: string): Promise<void>
+  /**
+   * Every data file (`*.ndjson`) under the sync root. Must throw when the
+   * listing cannot be completed; an empty array means the target is empty.
+   */
   listFiles(): Promise<string[]>
   /** Optional: delete a single file from the backend */
   deleteFile?(path: string): Promise<void>
@@ -45,6 +71,14 @@ export interface SyncOptions {
   deviceInstanceId: string
   target: string
   consentVerified: boolean
+  /**
+   * True when `target` is the only sync target this device has ever used.
+   * Pulled rows that carry no claim (they were mirrored before claims
+   * existed) and whose device namespace is absent from the target can then
+   * only be stale, and are pruned; with several targets in play they are left
+   * for `aiusage sync --repair` to judge.
+   */
+  soleTarget?: boolean
   onProgress?: (progress: SyncProgress) => void
 }
 
@@ -68,8 +102,15 @@ export interface SyncResult {
   retiredCount?: number
   /** Local records that mapped to a wire id already taken by another local record (the newer one wins). */
   collisionCount?: number
-  /** Files written or deleted in this device's namespace. */
+  /** Files written or deleted in this device's namespace (manifest included). */
   writtenFiles?: number
+  /**
+   * Foreign namespaces that were read but not reconciled because they could
+   * not be trusted this time: a file listed but missing, a malformed line, a
+   * manifest whose digests do not match the files (the owner is rewriting it
+   * or was interrupted). Their rows were upserted but nothing was pruned.
+   */
+  skippedNamespaces?: number
   error?: string
 }
 
@@ -79,55 +120,11 @@ export function getSyncPath(ts: string | number, deviceInstanceId: string): stri
   return `${deviceInstanceId}/${date}.ndjson`
 }
 
-/** Parse a single ndjson line, normalising string timestamps. Returns null on bad input. */
-export function parseSyncRecordLine(line: string): SyncRecord | null {
-  try {
-    const record: SyncRecord = JSON.parse(line)
-    if (!record || typeof record !== 'object' || typeof record.id !== 'string') return null
-    if (typeof record.ts === 'string') {
-      (record as any).ts = new Date(record.ts).getTime()
-    }
-    if (typeof record.updatedAt === 'string') {
-      (record as any).updatedAt = new Date(record.updatedAt).getTime()
-    }
-    return record
-  } catch {
-    return null
-  }
-}
-
-/** Parse ndjson content into a Map<id, SyncRecord> */
+/** Parse ndjson content into a Map<id, SyncRecord> (later duplicates win). */
 export function parseNdjson(content: string): Map<string, SyncRecord> {
   const records = new Map<string, SyncRecord>()
-  for (const line of content.split('\n').filter(Boolean)) {
-    const record = parseSyncRecordLine(line)
-    if (record) records.set(record.id, record)
-  }
+  for (const record of parseNdjsonLines(content).records) records.set(record.id, record)
   return records
-}
-
-/**
- * Canonical file content for a set of wire records: one JSON line per record,
- * sorted by id. Deterministic so that unchanged snapshots hash identically
- * and no-op syncs never rewrite a file.
- */
-export function serializeSnapshot(records: SyncRecord[]): string {
-  const sorted = [...records].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-  return sorted.map(r => JSON.stringify(r)).join('\n') + '\n'
-}
-
-export function contentDigest(content: string): string {
-  return createHash('md5').update(content, 'utf8').digest('hex')
-}
-
-/** True when `existing` already holds exactly `records` (order-insensitive). */
-function sameSnapshot(existing: Map<string, SyncRecord>, records: SyncRecord[]): boolean {
-  if (existing.size !== records.length) return false
-  for (const record of records) {
-    const prev = existing.get(record.id)
-    if (!prev || JSON.stringify(prev) !== JSON.stringify(record)) return false
-  }
-  return true
 }
 
 export interface LocalSnapshot {
@@ -194,7 +191,7 @@ export class SyncOrchestrator {
       backfillUnknownDeviceInstanceId(this.db, this.options.deviceInstanceId)
       await this.backend.prepare?.()
       const listing = await this.backend.listFiles()
-      const { pulledCount, ignoredCount, prunedCount } = await this.pull(listing)
+      const { pulledCount, ignoredCount, prunedCount, skippedNamespaces } = await this.pull(listing)
       this.options.onProgress?.({ phase: 'merging', pulledCount })
       const mergedCount = mergeSyncedRecordsIntoRecords(this.db, this.options.deviceInstanceId)
       const upload = await this.upload(listing)
@@ -211,6 +208,7 @@ export class SyncOrchestrator {
         retiredCount: upload.retiredCount,
         collisionCount: upload.collisionCount,
         writtenFiles: upload.writtenFiles,
+        skippedNamespaces,
       }
     } catch (error) {
       return {
@@ -224,103 +222,146 @@ export class SyncOrchestrator {
   }
 
   /**
-   * Mirror every foreign namespace. Each namespace is read completely; the
-   * ids seen there are the authoritative set for that device, so local rows
-   * attributed to the device that are missing remotely are pruned. Namespaces
-   * seen on this target before but absent now were deleted remotely and are
-   * pruned entirely. Our own namespace is never read here.
+   * Mirror every foreign namespace.
+   *
+   * For each namespace the manifest (if any) is read first, then the day
+   * files it names â€” or, for a namespace written by a pre-manifest client,
+   * every day file listed under it. Lines are upserted as they are read. A
+   * namespace is *reconciled* (its ids become this target's claims and rows
+   * no target claims any more are pruned) only when it was read reliably:
+   * every file present, every line parsed, every digest matching. Namespaces
+   * claimed on this target before but absent from the listing now were
+   * deleted remotely and are reconciled against the empty set. Our own
+   * namespace is never read here; backend read failures propagate and abort
+   * the sync before anything is pruned.
    */
-  private async pull(allPaths: string[]): Promise<{ pulledCount: number; ignoredCount: number; prunedCount: number }> {
+  private async pull(allPaths: string[]): Promise<{ pulledCount: number; ignoredCount: number; prunedCount: number; skippedNamespaces: number }> {
     const own = this.options.deviceInstanceId
+    const target = this.options.target
     const localDevicePrefix = `${own}/`
-    const paths = allPaths.filter(p => !p.startsWith(localDevicePrefix))
+    const dataPaths = allPaths.filter(p => p.endsWith('.ndjson') && !isManifestPath(p) && !p.startsWith(localDevicePrefix))
 
-    this.options.onProgress?.({
-      phase: 'pulling',
-      completedFiles: 0,
-      totalFiles: paths.length,
-      pulledCount: 0,
-    })
+    const listedByOwner = new Map<string, string[]>()
+    for (const path of dataPaths) {
+      const owner = namespaceOwnerFromPath(path)
+      if (!listedByOwner.has(owner)) listedByOwner.set(owner, [])
+      listedByOwner.get(owner)!.push(path)
+    }
 
+    // Phase 1: manifests decide which files are authoritative for each namespace.
+    const plans = new Map<string, { manifest: NamespaceManifest | null; reliable: boolean; paths: string[]; ids: Set<string> }>()
+    for (const [owner, listed] of listedByOwner) {
+      const manifestContent = await this.backend.readFile(manifestPath(owner))
+      let manifest: NamespaceManifest | null = null
+      let reliable = true
+      let paths = listed
+      if (manifestContent !== null) {
+        manifest = parseManifest(manifestContent)
+        if (manifest) paths = Object.keys(manifest.files).sort().map(rel => `${owner}/${rel}`)
+        else reliable = false // unreadable manifest: upsert the listed files, prune nothing
+      }
+      plans.set(owner, { manifest, reliable, paths, ids: new Set() })
+    }
+
+    const totalFiles = [...plans.values()].reduce((n, p) => n + p.paths.length, 0)
+    this.options.onProgress?.({ phase: 'pulling', completedFiles: 0, totalFiles, pulledCount: 0 })
+
+    // Phase 2: read and upsert.
     let totalPulled = 0
     let totalIgnored = 0
-    const remoteIds = new Map<string, Set<string>>()
-    for (const path of paths) {
-      const owner = namespaceOwnerFromPath(path)
-      if (!remoteIds.has(owner)) remoteIds.set(owner, new Set())
-    }
-
-    for (const [index, path] of paths.entries()) {
-      this.options.onProgress?.({
-        phase: 'pulling',
-        currentPath: path,
-        completedFiles: index,
-        totalFiles: paths.length,
-        pulledCount: totalPulled,
-      })
-      const content = await this.backend.readFile(path)
-      if (!content) continue
-
-      const namespaceOwner = namespaceOwnerFromPath(path)
-      const ids = remoteIds.get(namespaceOwner)!
-      for (const line of content.split('\n').filter(Boolean)) {
-        const record = parseSyncRecordLine(line)
-        if (!record) continue
-        // Only records that belong to the namespace they were read from are
-        // trusted. Anything else is a pre-fix echo whose authoritative copy
-        // lives elsewhere (or is our own local row).
-        if (classifyPulledRecord(record, namespaceOwner, own)) {
-          totalIgnored++
+    let completed = 0
+    for (const [owner, plan] of plans) {
+      for (const path of plan.paths) {
+        this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
+        const content = await this.backend.readFile(path)
+        if (content === null) {
+          // Listed (or named by the manifest) a moment ago, gone now: the
+          // owner is rewriting the namespace. Never prune against it.
+          plan.reliable = false
+          completed++
           continue
         }
-        // Lines written before the origin device had an id belong to the
-        // namespace owner; storing them as 'unknown' would surface a phantom
-        // device.
-        if (!record.deviceInstanceId || record.deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID) {
-          record.deviceInstanceId = namespaceOwner
+
+        const { records, malformed } = parseNdjsonLines(content)
+        if (malformed > 0) plan.reliable = false
+        if (plan.manifest) {
+          const expected = plan.manifest.files[path.slice(owner.length + 1)]
+          if (!expected || expected.digest !== canonicalDigest(records)) plan.reliable = false
         }
-        ids.add(record.id)
-        try {
-          const changed = insertSyncedRecord(this.db, record)
-          if (changed) totalPulled++
-        } catch {}
+
+        for (const record of records) {
+          // Only records that belong to the namespace they were read from are
+          // trusted. Anything else is a pre-fix echo whose authoritative copy
+          // lives elsewhere (or is our own local row).
+          if (classifyPulledRecord(record, owner, own)) {
+            totalIgnored++
+            continue
+          }
+          // Lines written before the origin device had an id belong to the
+          // namespace owner; storing them as 'unknown' would surface a phantom
+          // device.
+          if (!record.deviceInstanceId || record.deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID) {
+            record.deviceInstanceId = owner
+          }
+          plan.ids.add(record.id)
+          try {
+            const changed = insertSyncedRecord(this.db, record)
+            if (changed) totalPulled++
+          } catch {}
+        }
+
+        completed++
+        this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
       }
-
-      this.options.onProgress?.({
-        phase: 'pulling',
-        currentPath: path,
-        completedFiles: index + 1,
-        totalFiles: paths.length,
-        pulledCount: totalPulled,
-      })
     }
 
-    // Reconcile: namespaces present now, plus namespaces previously seen on
-    // this target that have since disappeared.
+    // Phase 3: reconcile. Only namespaces read reliably replace this target's
+    // claims; namespaces claimed here before but no longer listed are gone.
     let prunedCount = 0
-    const target = this.options.target
-    const seenBefore = getSeenNamespaces(this.db, target)
-    const owners = new Set<string>([...remoteIds.keys(), ...seenBefore])
+    let skippedNamespaces = 0
+    const owners = new Set<string>([...plans.keys(), ...getClaimedOwners(this.db, target)])
     owners.delete(own)
-    const claimedIds = new Set<string>()
     for (const owner of owners) {
-      const ids = remoteIds.get(owner) ?? new Set<string>()
-      for (const id of ids) claimedIds.add(id)
-      prunedCount += reconcileSyncedNamespace(this.db, owner, ids)
-      if (!remoteIds.has(owner)) forgetNamespace(this.db, target, owner)
+      const plan = plans.get(owner)
+      if (!plan) {
+        prunedCount += reconcileSyncedNamespace(this.db, target, owner, [])
+      } else if (plan.reliable) {
+        prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids)
+      } else {
+        skippedNamespaces++
+      }
     }
-    prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db, claimedIds)
-    recordSeenNamespaces(this.db, target, remoteIds.keys())
+    prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
 
-    return { pulledCount: totalPulled, ignoredCount: totalIgnored, prunedCount }
+    // Rows without any claim whose device is not on this target at all can
+    // only be judged when this is the one target the device has ever used:
+    // then nothing else could still be carrying them.
+    if (this.options.soleTarget) {
+      const absentOwners = new Set<string>()
+      for (const owner of getUnclaimedSyncedRecords(this.db).keys()) {
+        if (owner !== own && owner !== UNKNOWN_DEVICE_INSTANCE_ID && owner !== '' && !plans.has(owner)) absentOwners.add(owner)
+      }
+      if (absentOwners.size > 0) prunedCount += pruneUnclaimedSyncedRecordsOf(this.db, absentOwners)
+    }
+
+    return { pulledCount: totalPulled, ignoredCount: totalIgnored, prunedCount, skippedNamespaces }
   }
 
   /**
    * Publish this device's namespace as an authoritative snapshot of its local
    * records. Every day file is compared with the remote copy (by digest when
-   * the backend can provide one, otherwise by content) and only written when
-   * it differs; files for days that no longer have any local record are
-   * removed. Nothing outside `<deviceInstanceId>/` is ever touched.
+   * the backend can provide one, otherwise by canonical content) and only
+   * written when it differs â€” a file holding the same records in another
+   * order is left alone, one with duplicated or malformed lines is rewritten.
+   * Then the manifest is written if it changed, and finally files for days
+   * that no longer have any local record are removed. Nothing outside
+   * `<deviceInstanceId>/` is ever touched.
+   *
+   * The order matters for backends that cannot replace the namespace
+   * atomically (S3): peers verify every file against the manifest, so a
+   * reader that overlaps with this sequence sees either the previous
+   * consistent snapshot or a mismatch â€” never a partial snapshot it would
+   * prune against.
    */
   private async upload(allPaths: string[]): Promise<{ uploadedCount: number; retiredCount: number; collisionCount: number; writtenFiles: number }> {
     const deviceInstanceId = this.options.deviceInstanceId
@@ -334,19 +375,20 @@ export class SyncOrchestrator {
       .filter(record => isUploadableLocalRecord(record, deviceInstanceId))
 
     const snapshot = buildLocalSnapshot(this.db, deviceInstanceId)
-    const byPath = new Map<string, SyncRecord[]>()
+    const byRel = new Map<string, SyncRecord[]>()
     for (const wire of snapshot.records.values()) {
       const path = getSyncPath(wire.ts, deviceInstanceId)
       if (!path.startsWith(prefix)) continue
-      if (!byPath.has(path)) byPath.set(path, [])
-      byPath.get(path)!.push(wire)
+      const rel = path.slice(prefix.length)
+      if (!byRel.has(rel)) byRel.set(rel, [])
+      byRel.get(rel)!.push(wire)
     }
 
-    const ownPaths = allPaths.filter(p => p.startsWith(prefix))
+    const ownPaths = allPaths.filter(p => p.startsWith(prefix) && p.endsWith('.ndjson') && !isManifestPath(p))
     const ownPathSet = new Set(ownPaths)
-    const stalePaths = ownPaths.filter(p => !byPath.has(p))
-    const uploads = Array.from(byPath.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    const totalFiles = uploads.length + stalePaths.length
+    const stalePaths = ownPaths.filter(p => !byRel.has(p.slice(prefix.length)))
+    const uploads = Array.from(byRel.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    const totalFiles = uploads.length + 1 + stalePaths.length
     const digests = await this.backend.listFileDigests?.()
 
     let retiredCount = 0
@@ -356,17 +398,19 @@ export class SyncOrchestrator {
 
     this.options.onProgress?.({ phase: 'uploading', completedFiles: 0, totalFiles, uploadedCount: 0 })
 
-    for (const [path, records] of uploads) {
+    for (const [rel, records] of uploads) {
+      const path = prefix + rel
       this.options.onProgress?.({ phase: 'uploading', currentPath: path, completedFiles: completed, totalFiles, uploadedCount })
       const content = serializeSnapshot(records)
       const digest = digests?.get(path)
       let unchanged = digest !== undefined && digest === contentDigest(content)
       if (!unchanged && ownPathSet.has(path)) {
         const existingContent = await this.backend.readFile(path)
-        const existing = existingContent ? parseNdjson(existingContent) : new Map<string, SyncRecord>()
-        unchanged = sameSnapshot(existing, records)
-        if (!unchanged) {
-          for (const id of existing.keys()) if (!snapshot.records.has(id)) retiredCount++
+        if (existingContent !== null) {
+          unchanged = matchesCanonical(existingContent, content)
+          if (!unchanged) {
+            for (const id of parseNdjson(existingContent).keys()) if (!snapshot.records.has(id)) retiredCount++
+          }
         }
       }
       if (!unchanged) {
@@ -378,12 +422,30 @@ export class SyncOrchestrator {
       this.options.onProgress?.({ phase: 'uploading', currentPath: path, completedFiles: completed, totalFiles, uploadedCount })
     }
 
-    // Deletions come last so an interrupted sync never leaves the namespace
-    // with fewer records than either the old or the new snapshot.
+    // The manifest goes after the day files it describes and before any
+    // deletion, so peers never validate a snapshot that is not fully there.
+    const manifestFile = manifestPath(deviceInstanceId)
+    const manifestContent = serializeManifest(buildManifest(byRel))
+    this.options.onProgress?.({ phase: 'uploading', currentPath: manifestFile, completedFiles: completed, totalFiles, uploadedCount })
+    const existingManifest = await this.backend.readFile(manifestFile)
+    if (byRel.size === 0) {
+      // Nothing to publish: a manifest naming files that are about to be
+      // deleted would make peers treat the namespace as half-written forever.
+      if (existingManifest !== null) {
+        if (this.backend.deleteFile) await this.backend.deleteFile(manifestFile)
+        else await this.backend.writeFile(manifestFile, manifestContent) // an empty manifest verifies as empty
+        writtenFiles++
+      }
+    } else if (existingManifest !== manifestContent) {
+      await this.backend.writeFile(manifestFile, manifestContent)
+      writtenFiles++
+    }
+    completed++
+
     for (const path of stalePaths) {
       this.options.onProgress?.({ phase: 'uploading', currentPath: path, completedFiles: completed, totalFiles, uploadedCount })
       const existingContent = await this.backend.readFile(path)
-      if (existingContent) retiredCount += parseNdjson(existingContent).size
+      if (existingContent !== null) retiredCount += parseNdjson(existingContent).size
       if (this.backend.deleteFile) await this.backend.deleteFile(path)
       else await this.backend.writeFile(path, '')
       writtenFiles++

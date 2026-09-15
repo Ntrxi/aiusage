@@ -4,12 +4,15 @@ import { generateSyncRecordId } from '@aiusage/core'
 /**
  * Authoritative sync namespaces.
  *
- * 1. `sync_namespaces` remembers, per sync target, which foreign device
- *    namespaces this device has pulled from. Pull reconciles `synced_records`
- *    against the namespaces that exist remotely *and* the ones previously seen
- *    on the same target, so a namespace that disappears from its target is
- *    pruned locally while rows that came from a different target are left
- *    alone.
+ * 1. `sync_record_claims` remembers, per sync target, which records of which
+ *    foreign device namespace this device has mirrored. Pull replaces a
+ *    target's claims for a namespace with what the namespace holds now and
+ *    deletes pulled rows only when no target claims them any more, so a
+ *    namespace that shrinks or disappears on one target never removes rows
+ *    another target still carries. Rows pulled before this migration have no
+ *    claim; they are adopted (or pruned) the first time their namespace is
+ *    reconciled on a target, and `aiusage sync --repair` reports the ones
+ *    whose namespace is absent from the configured target.
  *
  * 2. `sync_retired_wire_ids` holds wire ids this device has published under a
  *    target but will never publish again. Antigravity and Trae records used to
@@ -26,12 +29,13 @@ const REKEYED_TOOLS = ['antigravity', 'trae'] as const
 
 export function migrateV14(db: Database.Database): void {
   db.exec(`
-    CREATE TABLE IF NOT EXISTS sync_namespaces (
+    CREATE TABLE IF NOT EXISTS sync_record_claims (
       target             TEXT NOT NULL,
       device_instance_id TEXT NOT NULL,
-      last_seen_at       INTEGER NOT NULL,
-      PRIMARY KEY (target, device_instance_id)
+      record_id          TEXT NOT NULL,
+      PRIMARY KEY (target, device_instance_id, record_id)
     );
+    CREATE INDEX IF NOT EXISTS idx_sync_record_claims_record ON sync_record_claims(record_id);
 
     CREATE TABLE IF NOT EXISTS sync_retired_wire_ids (
       target  TEXT NOT NULL,

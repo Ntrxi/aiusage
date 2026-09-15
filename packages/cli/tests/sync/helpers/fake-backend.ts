@@ -19,8 +19,9 @@ export class FakeSyncBackend implements SyncBackend {
     this.writes.push({ path, content })
   }
 
+  /** Like GitHub/S3: only data files are listed; manifests are read directly. */
   async listFiles(): Promise<string[]> {
-    return Array.from(this.files.keys()).sort()
+    return Array.from(this.files.keys()).filter(p => p.endsWith('.ndjson')).sort()
   }
 
   async deleteFile(path: string): Promise<void> {
@@ -38,11 +39,16 @@ export class FakeSyncBackend implements SyncBackend {
     return [...this.writes.map(w => w.path), ...this.deletes]
   }
 
+  /** Data files (not manifests) touched by a write or a delete. */
+  get dataMutations(): string[] {
+    return this.mutations.filter(p => p.endsWith('.ndjson'))
+  }
+
   /** All parsed lines currently stored under a namespace. */
   linesUnder(deviceInstanceId: string): Array<Record<string, any>> {
     const out: Array<Record<string, any>> = []
     for (const [path, content] of this.files) {
-      if (!path.startsWith(`${deviceInstanceId}/`)) continue
+      if (!path.startsWith(`${deviceInstanceId}/`) || !path.endsWith('.ndjson')) continue
       for (const line of content.split('\n').filter(Boolean)) out.push(JSON.parse(line))
     }
     return out

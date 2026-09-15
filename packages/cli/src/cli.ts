@@ -411,6 +411,9 @@ program
         const pruned = 'prunedCount' in result && result.prunedCount ? `, pruned: ${result.prunedCount} removed remotely` : ''
         const retired = 'retiredCount' in result && result.retiredCount ? `, retired: ${result.retiredCount} stale remote` : ''
         console.log(`✓ Sync complete — pulled: ${result.pulledCount}, merged: ${result.mergedCount}, uploaded: ${result.uploadedCount}${pruned}${retired}${ignored}`)
+        if ('skippedNamespaces' in result && result.skippedNamespaces) {
+          console.log(`  Note: ${result.skippedNamespaces} device namespace(s) could not be verified this time (being rewritten, or unreadable) and were not reconciled. Their records were kept; the next sync will retry.`)
+        }
         if (ignored) {
           console.log('  Some remote lines belong to a different device than the namespace they are in. Run "aiusage sync --repair" for details.')
         }

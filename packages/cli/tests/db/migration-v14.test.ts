@@ -1,13 +1,26 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import Database from 'better-sqlite3'
 import { generateRecordId, generateSyncRecordId } from '@aiusage/core'
-import type { StatsRecord } from '@aiusage/core'
+import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord, markRecordsSynced, getUnsyncedRecords } from '../../src/db/records.js'
+import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
 import { migrateV14 } from '../../src/db/migrations/v14.js'
-import { getRetiredWireIds, getSeenNamespaces, recordSeenNamespaces, forgetNamespace, clearRetiredWireIds } from '../../src/db/sync-namespaces.js'
+import {
+  clearRetiredWireIds,
+  getClaimedOwners,
+  getClaimedRecordIds,
+  getClaimingTargets,
+  getRetiredWireIds,
+  releaseClaim,
+  replaceNamespaceClaims,
+} from '../../src/db/sync-claims.js'
+import { SyncOrchestrator } from '../../src/sync/index.js'
+import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
+import { repairSyncContamination } from '../../src/sync/repair.js'
+import { FakeSyncBackend } from '../sync/helpers/fake-backend.js'
 
-// v14 adds per-target namespace bookkeeping and records the wire ids that
+// v14 adds per-target record claims and records the wire ids that
 // Antigravity/Trae records were previously published under, so the cloud
 // backend can retract them once they travel under their parser ids.
 
@@ -47,10 +60,11 @@ describe('migration v14', () => {
     initializeDatabase(db)
   })
 
-  it('creates the namespace and retired-id tables', () => {
+  it('creates the claims and retired-id tables', () => {
     const tables = (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map(t => t.name)
-    expect(tables).toContain('sync_namespaces')
+    expect(tables).toContain('sync_record_claims')
     expect(tables).toContain('sync_retired_wire_ids')
+    expect(tables).not.toContain('sync_namespaces')
   })
 
   it('retires the old generated wire ids of already-synced Antigravity and Trae records and re-queues them', () => {
@@ -92,14 +106,26 @@ describe('migration v14', () => {
     expect(getRetiredWireIds(db, 'cloud')).toEqual([])
   })
 
-  it('tracks seen namespaces per target', () => {
-    recordSeenNamespaces(db, 't1', ['b', 'c'], 10)
-    recordSeenNamespaces(db, 't2', ['b'], 10)
-    expect(getSeenNamespaces(db, 't1').sort()).toEqual(['b', 'c'])
-    expect(getSeenNamespaces(db, 't2')).toEqual(['b'])
-    forgetNamespace(db, 't1', 'b')
-    expect(getSeenNamespaces(db, 't1')).toEqual(['c'])
-    expect(getSeenNamespaces(db, 't2')).toEqual(['b'])
+  it('tracks record claims per target and namespace', () => {
+    replaceNamespaceClaims(db, 't1', 'b', ['r1', 'r2'])
+    replaceNamespaceClaims(db, 't1', 'c', ['r3'])
+    replaceNamespaceClaims(db, 't2', 'b', ['r2'])
+    expect(getClaimedOwners(db, 't1').sort()).toEqual(['b', 'c'])
+    expect(getClaimedOwners(db, 't2')).toEqual(['b'])
+    expect([...getClaimedRecordIds(db, 't1', 'b')].sort()).toEqual(['r1', 'r2'])
+    expect(getClaimingTargets(db, 'r2').sort()).toEqual(['t1', 't2'])
+
+    // Replacing a namespace's claims on one target leaves the other target alone.
+    replaceNamespaceClaims(db, 't1', 'b', ['r1'])
+    expect(getClaimingTargets(db, 'r2')).toEqual(['t2'])
+    expect(releaseClaim(db, 't2', 'r2')).toBe(true)
+    expect(releaseClaim(db, 't1', 'r1')).toBe(true)
+    expect(releaseClaim(db, 't1', 'r3')).toBe(true)
+    expect(getClaimedOwners(db, 't1')).toEqual([])
+
+    replaceNamespaceClaims(db, 't1', 'b', ['r9'])
+    replaceNamespaceClaims(db, 't2', 'b', ['r9'])
+    expect(releaseClaim(db, 't1', 'r9')).toBe(false)
   })
 
   it('clears retired ids per target, in full or by id', () => {
@@ -109,5 +135,84 @@ describe('migration v14', () => {
     clearRetiredWireIds(db, 't1')
     expect(getRetiredWireIds(db, 't1')).toEqual([])
     expect(getRetiredWireIds(db, 't2')).toEqual(['x'])
+  })
+})
+
+describe('upgrade with rows whose namespace disappeared before v14', () => {
+  const OWN = 'device-me'
+  const GONE = 'device-gone'
+  const PRESENT = 'device-present'
+  const TARGET = 'github:u/r'
+  let db: Database.Database
+  let backend: FakeSyncBackend
+  let staleIds: string[]
+
+  /** A pre-v14 client: pulled rows exist, no claims for them. */
+  function seedPreV14(): void {
+    const stale: SyncRecord[] = [0, 1].map(n => mapStatsRecordToSyncRecord(record({
+      id: `gone-${n}`, deviceInstanceId: GONE, tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\\g.jsonl', lineOffset: n,
+    })))
+    const present = mapStatsRecordToSyncRecord(record({
+      id: 'present-0', deviceInstanceId: PRESENT, tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\\p.jsonl', lineOffset: 0,
+    }))
+    for (const r of [...stale, present]) insertSyncedRecord(db, r)
+    mergeSyncedRecordsIntoRecords(db, OWN)
+    staleIds = stale.map(r => r.id)
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM sync_record_claims`).get()).toEqual({ n: 0 })
+    // The present device still publishes its record; the gone device's namespace no longer exists.
+    backend.files.set(`${PRESENT}/1970/01/01.ndjson`, JSON.stringify(present) + '\n')
+  }
+
+  const rowsOf = (owner: string) =>
+    (db.prepare(`SELECT id FROM synced_records WHERE device_instance_id = ? ORDER BY id`).all(owner) as Array<{ id: string }>).map(r => r.id)
+  const mergedOf = (owner: string) =>
+    (db.prepare(`SELECT id FROM records WHERE origin = 'synced' AND device_instance_id = ?`).all(owner) as Array<{ id: string }>).map(r => r.id)
+
+  beforeEach(() => {
+    db = new Database(':memory:')
+    initializeDatabase(db)
+    backend = new FakeSyncBackend()
+    seedPreV14()
+  })
+
+  it('prunes the stale rows automatically when this is the only target the device has ever used', async () => {
+    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: true }).sync()
+    expect(result.status).toBe('ok')
+    expect(result.prunedCount).toBe(2)
+    expect(rowsOf(GONE)).toEqual([])
+    expect(mergedOf(GONE)).toEqual([])
+    // The present device's row is adopted by this target's claims.
+    expect(rowsOf(PRESENT)).toEqual(['present-0'].map(() => mapStatsRecordToSyncRecord(record({ id: 'present-0', deviceInstanceId: PRESENT, tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\\p.jsonl', lineOffset: 0 })).id))
+    expect(getClaimedOwners(db, TARGET)).toEqual([PRESENT])
+  })
+
+  it('keeps the stale rows when other targets exist, and lets sync --repair remove them deterministically', async () => {
+    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: false }).sync()
+    expect(result.status).toBe('ok')
+    expect(result.prunedCount ?? 0).toBe(0)
+    expect(rowsOf(GONE)).toEqual(staleIds.sort())
+
+    const dry = await repairSyncContamination(db, { deviceInstanceId: OWN, target: TARGET, backend })
+    expect(dry.local.orphanedDevices).toEqual([GONE])
+    expect(dry.local.orphanedSyncedIds.sort()).toEqual(staleIds.sort())
+    expect(rowsOf(GONE)).toHaveLength(2)
+
+    const applied = await repairSyncContamination(db, { deviceInstanceId: OWN, target: TARGET, backend, apply: true })
+    expect(applied.applied).toBe(true)
+    expect(rowsOf(GONE)).toEqual([])
+    expect(mergedOf(GONE)).toEqual([])
+    expect(rowsOf(PRESENT)).toHaveLength(1)
+
+    const again = await repairSyncContamination(db, { deviceInstanceId: OWN, target: TARGET, backend })
+    expect(again.local.orphanedSyncedIds).toEqual([])
+  })
+
+  it('does not report rows of a device that is present on the target, nor rows another target claims', async () => {
+    replaceNamespaceClaims(db, 'cloud', GONE, [staleIds[0]])
+    await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: true }).sync()
+    // The cloud-claimed row survives the sole-target prune; the other stale row does not.
+    expect(rowsOf(GONE)).toEqual([staleIds[0]])
+    const dry = await repairSyncContamination(db, { deviceInstanceId: OWN, target: TARGET, backend })
+    expect(dry.local.orphanedSyncedIds).toEqual([])
   })
 })

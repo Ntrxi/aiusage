@@ -63,7 +63,9 @@ export class S3SyncBackend {
 
   async listFiles(): Promise<string[]> {
     const files: string[] = []
-    for (const entry of await this.listEntries()) files.push(entry.path)
+    for (const entry of await this.listEntries()) {
+      if (entry.path.endsWith('.ndjson')) files.push(entry.path)
+    }
     return files.sort()
   }
 
@@ -76,12 +78,14 @@ export class S3SyncBackend {
   async listFileDigests(): Promise<Map<string, string>> {
     const digests = new Map<string, string>()
     for (const entry of await this.listEntries()) {
+      if (!entry.path.endsWith('.ndjson')) continue
       const etag = entry.etag?.replace(/^"|"$/g, '')
       if (etag && /^[0-9a-f]{32}$/i.test(etag)) digests.set(entry.path, etag.toLowerCase())
     }
     return digests
   }
 
+  /** Every object under the prefix (data files and namespace manifests alike). */
   private async listEntries(): Promise<Array<{ path: string; etag?: string }>> {
     const entries: Array<{ path: string; etag?: string }> = []
     let continuationToken: string | undefined
@@ -98,9 +102,7 @@ export class S3SyncBackend {
         for (const obj of response.Contents) {
           const key = obj.Key!
           const relPath = key.slice(this.prefix.length)
-          if (relPath.endsWith('.ndjson')) {
-            entries.push({ path: relPath, etag: obj.ETag })
-          }
+          if (relPath) entries.push({ path: relPath, etag: obj.ETag })
         }
       }
 
@@ -136,8 +138,10 @@ export class S3SyncBackend {
     await this.client.send(command)
   }
 
+  /** Remove every object under the prefix — day files and manifests. Returns the number of data files removed. */
   async deleteAllData(): Promise<number> {
-    const files = await this.listFiles()
+    const entries = await this.listEntries()
+    const files = entries.map(e => e.path)
     if (files.length === 0) return 0
 
     // Delete in batches of 1000 (S3 limit)
@@ -154,6 +158,6 @@ export class S3SyncBackend {
       await this.client.send(command)
     }
 
-    return files.length
+    return files.filter(f => f.endsWith('.ndjson')).length
   }
 }

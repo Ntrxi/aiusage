@@ -236,14 +236,15 @@ describe('authoritative device namespaces', () => {
     expect(generateSummary(dbB, { currentDeviceInstanceId: B }).recordCount).toBe(3)
   })
 
-  it('deletes the day file when every record of that day is gone', async () => {
+  it('deletes the day file (and the manifest) when every record of that day is gone', async () => {
     await sync(dbA, backend, A)
-    expect(backend.files.size).toBe(1)
+    expect([...backend.files.keys()].sort()).toEqual([`${A}/2026/09/06.ndjson`, `${A}/manifest.json`])
     dbA.prepare(`DELETE FROM records`).run()
     const a = await sync(dbA, backend, A)
     expect(a.status).toBe('ok')
     expect(backend.files.size).toBe(0)
-    expect(backend.deletes).toEqual([`${A}/2026/09/06.ndjson`])
+    // Manifest first, so a peer never finds a manifest naming a missing file.
+    expect(backend.deletes).toEqual([`${A}/manifest.json`, `${A}/2026/09/06.ndjson`])
   })
 
   it('is idempotent: a second sync without changes performs zero writes', async () => {
@@ -386,7 +387,7 @@ describe('authoritative device namespaces', () => {
     expect(dbA.prepare(`SELECT COUNT(*) AS n FROM records WHERE origin = 'local'`).get()).toEqual({ n: 4 })
   })
 
-  it('scopes pruning to namespaces seen on the same sync target', async () => {
+  it('keeps a record while any target still claims it, and prunes it once every claim is gone', async () => {
     await sync(dbA, backend, A)
     await sync(dbB, backend, B)
     expect(syncedIds(dbB, A)).toHaveLength(4)
@@ -398,14 +399,25 @@ describe('authoritative device namespaces', () => {
     expect(b.prunedCount ?? 0).toBe(0)
     expect(syncedIds(dbB, A)).toHaveLength(4)
 
-    // A appears on the other target too, then removes one record there: only
-    // that target's view of A is reconciled.
+    // A publishes on the other target too, then removes one record there.
     await sync(dbA, other, A, OTHER_TARGET)
     await sync(dbB, other, B, OTHER_TARGET)
+    const removed = mapStatsRecordToSyncRecord(recordsA[0]).id
     dbA.prepare(`DELETE FROM records WHERE id = ?`).run(recordsA[0].id)
     await sync(dbA, other, A, OTHER_TARGET)
+
+    // The first target still claims the record: reconciling the other must not delete it.
     const b2 = await sync(dbB, other, B, OTHER_TARGET)
-    expect(b2.prunedCount).toBe(1)
+    expect(b2.status).toBe('ok')
+    expect(b2.prunedCount ?? 0).toBe(0)
+    expect(syncedIds(dbB, A)).toContain(removed)
+    expect(mergedIds(dbB, A)).toContain(removed)
+
+    // Once A's namespace on the first target drops it as well, it goes.
+    await sync(dbA, backend, A)
+    const b3 = await sync(dbB, backend, B)
+    expect(b3.prunedCount).toBe(1)
     expect(syncedIds(dbB, A)).toHaveLength(3)
+    expect(mergedIds(dbB, A)).toHaveLength(3)
   })
 })

@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from './records.js'
+import { releaseClaim } from './sync-claims.js'
 
 export function insertSyncedRecord(db: Database.Database, record: SyncRecord): boolean {
   // Only replace if the incoming record is newer than what we already have.
@@ -68,36 +69,50 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 }
 
 /**
- * Remove a pulled record from both `synced_records` and its merged copy in
+ * Release `target`'s claim on a pulled record and, when no target claims it
+ * any more, remove it from both `synced_records` and its merged copy in
  * `records`. Locally parsed rows (`origin = 'local'`) are never touched.
  * Returns true when a `synced_records` row was removed.
  */
-export function deleteSyncedRecord(db: Database.Database, id: string): boolean {
-  const removed = db.prepare(`DELETE FROM synced_records WHERE id = ?`).run(id).changes > 0
-  db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`).run(id)
-  return removed
+export function deleteSyncedRecord(db: Database.Database, target: string, id: string): boolean {
+  return db.transaction(() => {
+    if (!releaseClaim(db, target, id)) return false
+    const removed = db.prepare(`DELETE FROM synced_records WHERE id = ?`).run(id).changes > 0
+    db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`).run(id)
+    return removed
+  })()
+}
+
+function fillRemoteIds(db: Database.Database, ids: Iterable<string>): void {
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_remote_ids (id TEXT PRIMARY KEY)`)
+  db.exec(`DELETE FROM sync_remote_ids`)
+  const insert = db.prepare(`INSERT OR IGNORE INTO sync_remote_ids (id) VALUES (?)`)
+  for (const id of ids) insert.run(id)
 }
 
 /**
- * Make the local mirror of `owner`'s namespace match `remoteIds` exactly.
+ * Make the local mirror of `owner`'s namespace, as seen from `target`, match
+ * `remoteIds` exactly.
  *
  *  - Legacy rows stamped `'unknown'` (or empty) whose id is present in the
  *    namespace are relabelled to `owner`: the namespace they sit in is the
  *    device that parsed them, and exposing `'unknown'` as a device of its own
  *    was a display bug.
- *  - Rows attributed to `owner` whose id is no longer in the namespace are
- *    removed from `synced_records`, together with their merged copies in
- *    `records` (`origin = 'synced'` only). Locally parsed rows are never
- *    deleted here.
+ *  - `target`'s claims for `owner` are replaced by `remoteIds`.
+ *  - Rows attributed to `owner` that no target claims any more are removed
+ *    from `synced_records`, together with their merged copies in `records`
+ *    (`origin = 'synced'` only). A row another target still claims survives,
+ *    and locally parsed rows are never deleted here.
+ *
+ * Callers must only invoke this with a `remoteIds` set they read completely
+ * and reliably; a namespace whose files could not all be read or parsed must
+ * be skipped, never reconciled against a partial set.
  *
  * Returns the number of `synced_records` rows removed.
  */
-export function reconcileSyncedNamespace(db: Database.Database, owner: string, remoteIds: Iterable<string>): number {
+export function reconcileSyncedNamespace(db: Database.Database, target: string, owner: string, remoteIds: Iterable<string>): number {
   return db.transaction(() => {
-    db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_remote_ids (id TEXT PRIMARY KEY)`)
-    db.exec(`DELETE FROM sync_remote_ids`)
-    const insert = db.prepare(`INSERT OR IGNORE INTO sync_remote_ids (id) VALUES (?)`)
-    for (const id of remoteIds) insert.run(id)
+    fillRemoteIds(db, remoteIds)
 
     db.prepare(`
       UPDATE synced_records SET device_instance_id = @owner
@@ -111,16 +126,22 @@ export function reconcileSyncedNamespace(db: Database.Database, owner: string, r
         AND id IN (SELECT id FROM sync_remote_ids)
     `).run({ owner })
 
+    db.prepare(`DELETE FROM sync_record_claims WHERE target = @target AND device_instance_id = @owner`).run({ target, owner })
+    db.prepare(`
+      INSERT OR IGNORE INTO sync_record_claims (target, device_instance_id, record_id)
+      SELECT @target, @owner, id FROM sync_remote_ids
+    `).run({ target, owner })
+
     const pruned = db.prepare(`
       DELETE FROM synced_records
       WHERE device_instance_id = @owner
-        AND id NOT IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
     `).run({ owner }).changes
     db.prepare(`
       DELETE FROM records
       WHERE origin = 'synced'
         AND device_instance_id = @owner
-        AND id NOT IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
     `).run({ owner })
 
     db.exec(`DELETE FROM sync_remote_ids`)
@@ -129,28 +150,69 @@ export function reconcileSyncedNamespace(db: Database.Database, owner: string, r
 }
 
 /**
- * Drop legacy pulled rows still stamped `'unknown'` that no namespace read in
- * this sync claims. Such rows can only be left over from an old client whose
- * device has since re-published its namespace under its real id (the records
- * arrive again under that id and the old copies would otherwise show up as a
- * phantom third device). Returns the number of `synced_records` rows removed.
+ * Drop legacy pulled rows still stamped `'unknown'` that no target claims.
+ * Such rows can only be left over from an old client whose device has since
+ * re-published its namespace under its real id (the records arrive again
+ * under that id and the old copies would otherwise show up as a phantom third
+ * device). Returns the number of `synced_records` rows removed.
  */
-export function pruneUnclaimedUnknownSyncedRecords(db: Database.Database, claimedIds: Iterable<string>): number {
+export function pruneUnclaimedUnknownSyncedRecords(db: Database.Database): number {
   return db.transaction(() => {
-    db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_remote_ids (id TEXT PRIMARY KEY)`)
-    db.exec(`DELETE FROM sync_remote_ids`)
-    const insert = db.prepare(`INSERT OR IGNORE INTO sync_remote_ids (id) VALUES (?)`)
-    for (const id of claimedIds) insert.run(id)
     const pruned = db.prepare(`
       DELETE FROM synced_records
       WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id NOT IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
     `).run().changes
     db.prepare(`
       DELETE FROM records
       WHERE origin = 'synced'
         AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id NOT IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
+    `).run()
+    return pruned
+  })()
+}
+
+/**
+ * Pulled rows that no target claims, grouped by the device they are
+ * attributed to. These predate migration v14 (claims did not exist yet) or
+ * arrived through a namespace that has not been reconciled since; only the
+ * caller can tell whether their device still publishes anywhere.
+ */
+export function getUnclaimedSyncedRecords(db: Database.Database): Map<string, string[]> {
+  const rows = db.prepare(`
+    SELECT id, device_instance_id FROM synced_records
+    WHERE id NOT IN (SELECT record_id FROM sync_record_claims)
+    ORDER BY device_instance_id, id
+  `).all() as Array<{ id: string; device_instance_id: string }>
+  const byOwner = new Map<string, string[]>()
+  for (const row of rows) {
+    const list = byOwner.get(row.device_instance_id) ?? []
+    list.push(row.id)
+    byOwner.set(row.device_instance_id, list)
+  }
+  return byOwner
+}
+
+/**
+ * Remove unclaimed pulled rows attributed to any device in `owners`, with
+ * their merged copies. Used when the caller has established that those
+ * devices publish nowhere this client can still reach. Returns the number of
+ * `synced_records` rows removed.
+ */
+export function pruneUnclaimedSyncedRecordsOf(db: Database.Database, owners: Iterable<string>): number {
+  return db.transaction(() => {
+    fillRemoteIds(db, owners)
+    const pruned = db.prepare(`
+      DELETE FROM synced_records
+      WHERE device_instance_id IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
+    `).run().changes
+    db.prepare(`
+      DELETE FROM records
+      WHERE origin = 'synced'
+        AND device_instance_id IN (SELECT id FROM sync_remote_ids)
+        AND id NOT IN (SELECT record_id FROM sync_record_claims)
     `).run()
     db.exec(`DELETE FROM sync_remote_ids`)
     return pruned

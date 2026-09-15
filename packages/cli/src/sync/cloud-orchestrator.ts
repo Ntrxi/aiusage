@@ -8,7 +8,7 @@ import {
   repairRecordProvenance,
 } from '../db/records.js'
 import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
-import { clearRetiredWireIds, getRetiredWireIds } from '../db/sync-namespaces.js'
+import { clearRetiredWireIds, getRetiredWireIds, replaceNamespaceClaims } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import { cloudPush, cloudPull, CloudSyncError, type CloudPulledTombstone } from './cloud.js'
 import type { SyncProgress } from './runtime.js'
@@ -64,20 +64,33 @@ export class CloudSyncOrchestrator {
       // local id differs from the wire id (e.g. Claude Code message ids) they
       // would otherwise be merged back as fresh "local" rows and re-pushed.
       let insertedCount = 0
+      const claimed = new Map<string, Set<string>>()
       for (const record of pullResult.records) {
         if (record.deviceInstanceId === this.options.deviceInstanceId) continue
         try {
           insertSyncedRecord(this.db, record)
           insertedCount++
         } catch {}
+        const owner = record.deviceInstanceId || ''
+        if (!claimed.has(owner)) claimed.set(owner, new Set())
+        claimed.get(owner)!.add(record.id)
       }
 
+      // Step 2a: The pull is complete (every page was read), so what the
+      // server returned is exactly what this target claims per device. A
+      // file-based target reconciling later must not delete rows that the
+      // cloud still carries, and vice versa.
+      this.db.transaction(() => {
+        for (const [owner, ids] of claimed) replaceNamespaceClaims(this.db, this.target, owner, ids)
+      })()
+
       // Step 2b: Apply tombstones — records their origin device retracted.
+      // The row itself only goes once no other target claims it.
       let prunedCount = 0
       for (const tombstone of pullResult.tombstones) {
         if (!tombstone.id || tombstone.device_instance_id === this.options.deviceInstanceId) continue
         try {
-          if (deleteSyncedRecord(this.db, tombstone.id)) prunedCount++
+          if (deleteSyncedRecord(this.db, this.target, tombstone.id)) prunedCount++
         } catch {}
       }
 

@@ -13,6 +13,21 @@ import { getSyncTarget } from '../sync/target.js'
 import { repairSyncContamination, type RepairReport } from '../sync/repair.js'
 import { githubToken } from '../github/auth.js'
 
+/**
+ * True when `target` is the only sync target recorded in state — no other
+ * repository, bucket or the cloud has ever been synced from this device.
+ */
+export function isSoleSyncTarget(state: import('../init.js').State | null, target: string): boolean {
+  if (!state) return true
+  const known = new Set<string>([
+    ...Object.keys(state.syncConsents ?? {}),
+    ...Object.keys(state.syncTargets ?? {}),
+  ])
+  if (state.lastSyncTarget) known.add(state.lastSyncTarget)
+  known.delete(target)
+  return known.size === 0
+}
+
 export function createBackend(config: import('../config.js').Config): SyncBackend | null {
   const sync = config.sync
   if (!sync) return null
@@ -126,6 +141,7 @@ export async function runSync(
     deviceInstanceId: state!.deviceInstanceId,
     target,
     consentVerified: true,
+    soleTarget: isSoleSyncTarget(state, target),
     onProgress: options?.onProgress,
   })
 
@@ -198,6 +214,7 @@ export async function runSyncRepair(
   try {
     const report = await repairSyncContamination(db, {
       deviceInstanceId: state.deviceInstanceId,
+      target,
       backend,
       allNamespaces: options.allNamespaces,
       apply: options.apply,
@@ -220,6 +237,10 @@ export function formatRepairReport(report: RepairReport): string {
   lines.push(`  ${verb} ${report.local.echoSyncedIds.length} echoed row(s) from synced_records (copies of records that bounced through another device)`)
   lines.push(`  ${verb} ${report.local.echoMergedIds.length} merged copy(ies) of those echoes from records`)
   lines.push(`  ${verb} ${report.local.staleSyncStateCount} stale sync bookkeeping row(s)`)
+  if (report.local.orphanedSyncedIds.length > 0) {
+    const devices = report.local.orphanedDevices.length
+    lines.push(`  ${verb} ${report.local.orphanedSyncedIds.length} pulled row(s) from ${devices} device(s) that no longer publish on this target and are not tracked by any other target (pulled before this version; if another sync target still carries them, sync it first)`)
+  }
   if (report.local.wireIdCollisions.length > 0) {
     const affected = report.local.wireIdCollisions.reduce((n, c) => n + c.recordIds.length, 0)
     lines.push(`  WARNING: ${report.local.wireIdCollisions.length} wire id(s) shared by ${affected} extra local record(s) — those records cannot be synced; please report this with the tool names involved`)

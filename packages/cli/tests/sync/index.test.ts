@@ -52,7 +52,7 @@ describe('SyncOrchestrator', () => {
     }
 
     mockBackend.listFiles.mockResolvedValueOnce(['device-456/2026/05/13.ndjson'])
-    mockBackend.readFile.mockResolvedValueOnce(JSON.stringify(remoteRecord) + '\n')
+    mockBackend.readFile.mockImplementation(async path => path === 'device-456/2026/05/13.ndjson' ? JSON.stringify(remoteRecord) + '\n' : null)
 
     const orchestrator = new SyncOrchestrator(db, mockBackend as any, {
       deviceInstanceId: 'device-123',
@@ -111,8 +111,11 @@ describe('SyncOrchestrator', () => {
 
     const result = await orchestrator.sync()
     expect(result.uploadedCount).toBe(2)
-    expect(mockBackend.writeFile).toHaveBeenCalledTimes(1)
-    expect(mockBackend.writeFile.mock.calls[0][0]).toBe('di1/2026/05/13.ndjson')
+    const dataWrites = mockBackend.writeFile.mock.calls.filter(c => c[0].endsWith('.ndjson'))
+    expect(dataWrites).toHaveLength(1)
+    expect(dataWrites[0][0]).toBe('di1/2026/05/13.ndjson')
+    // The namespace manifest follows the day files it describes.
+    expect(mockBackend.writeFile.mock.calls.map(c => c[0])).toEqual(['di1/2026/05/13.ndjson', 'di1/manifest.json'])
   })
 
   it('replaces its own namespace file with the local snapshot, dropping lines that no longer exist locally', async () => {
@@ -140,7 +143,7 @@ describe('SyncOrchestrator', () => {
     }
 
     mockBackend.listFiles.mockResolvedValue(['di1/1970/01/01.ndjson'])
-    mockBackend.readFile.mockResolvedValue(JSON.stringify(previousRecord) + '\n')
+    mockBackend.readFile.mockImplementation(async path => path === 'di1/1970/01/01.ndjson' ? JSON.stringify(previousRecord) + '\n' : null)
     mockBackend.writeFile.mockResolvedValue(undefined)
 
     const orchestrator = new SyncOrchestrator(db, mockBackend as any, {
@@ -153,8 +156,9 @@ describe('SyncOrchestrator', () => {
     expect(result.uploadedCount).toBe(1)
     expect(result.retiredCount).toBe(1)
 
-    expect(mockBackend.writeFile).toHaveBeenCalledTimes(1)
-    const written = mockBackend.writeFile.mock.calls[0][1] as string
+    const dataWrites = mockBackend.writeFile.mock.calls.filter(c => c[0].endsWith('.ndjson'))
+    expect(dataWrites).toHaveLength(1)
+    const written = dataWrites[0][1] as string
     const records = written.trim().split('\n').map((l: string) => JSON.parse(l))
     expect(records).toHaveLength(1)
     expect(records[0].id).toBe(generateSyncRecordId('di1', '/f1', 0))
@@ -233,7 +237,7 @@ describe('SyncOrchestrator', () => {
       'device-123/2026/05/13.ndjson',  // own device — should be skipped
       'device-456/2026/05/13.ndjson',  // other device — should be read
     ])
-    mockBackend.readFile.mockResolvedValueOnce(JSON.stringify(otherRecord) + '\n')
+    mockBackend.readFile.mockImplementation(async path => path === 'device-456/2026/05/13.ndjson' ? JSON.stringify(otherRecord) + '\n' : null)
     mockBackend.writeFile.mockResolvedValue(undefined)
 
     const orchestrator = new SyncOrchestrator(db, mockBackend as any, {
@@ -243,9 +247,11 @@ describe('SyncOrchestrator', () => {
     })
 
     const result = await orchestrator.sync()
-    // Pull reads only the other device's file; our own file is handled by the
-    // upload phase (compared against the local snapshot, then retired here).
-    expect(mockBackend.readFile.mock.calls[0][0]).toBe('device-456/2026/05/13.ndjson')
+    // Pull reads the other device's manifest and file only; our own file is
+    // handled by the upload phase (compared against the local snapshot, then
+    // retired here).
+    const readsBeforeUpload = mockBackend.readFile.mock.calls.map(c => c[0]).slice(0, 2)
+    expect(readsBeforeUpload).toEqual(['device-456/manifest.json', 'device-456/2026/05/13.ndjson'])
     expect(result.pulledCount).toBe(1)
     expect(db.prepare('SELECT COUNT(*) AS n FROM synced_records').get()).toEqual({ n: 1 })
   })

@@ -5,7 +5,7 @@ import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
-import { getRetiredWireIds } from '../../src/db/sync-namespaces.js'
+import { getRetiredWireIds } from '../../src/db/sync-claims.js'
 
 const pulled: { records: SyncRecord[]; tombstones: Array<Record<string, unknown>> } = { records: [], tombstones: [] }
 

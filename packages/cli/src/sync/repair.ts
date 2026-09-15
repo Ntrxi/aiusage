@@ -2,8 +2,10 @@ import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
 import { generateSessionKey } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from '../db/records.js'
+import { getUnclaimedSyncedRecords } from '../db/synced-records.js'
 import type { SyncBackend } from './index.js'
-import { buildLocalSnapshot, parseSyncRecordLine } from './index.js'
+import { buildLocalSnapshot } from './index.js'
+import { buildManifest, isManifestPath, manifestPath, parseNdjsonLines, parseSyncRecordLine, serializeManifest } from './manifest.js'
 import { namespaceOwnerFromPath } from './ownership.js'
 
 /**
@@ -52,6 +54,13 @@ import { namespaceOwnerFromPath } from './ownership.js'
  *  - **wire-id collision** (report only): two local records that map to the
  *    same wire id. The mapper is expected to make this impossible; a non-zero
  *    count is a parser or mapper bug worth reporting.
+ *  - **orphaned pulled row**: a `synced_records` row that no sync target
+ *    claims (it was pulled before per-target claims existed, migration v14)
+ *    and whose device has no namespace on the configured target. Sync cannot
+ *    tell whether another, older target still carries it, so it leaves such
+ *    rows alone unless this is the only target the device ever used; repair
+ *    reports them and removes them on request. If the device does publish
+ *    elsewhere, syncing that target first re-establishes its claims.
  *
  * Deleting an echo never loses usage: by construction the parent it was
  * derived from still exists (or is itself an echo whose parent exists).
@@ -113,6 +122,10 @@ export interface LocalRepairPlan {
   staleSyncStateCount: number
   /** Local records sharing a wire id (report only; the mapper should make this impossible). */
   wireIdCollisions: Array<{ wireId: string; recordIds: string[] }>
+  /** Unclaimed pulled rows whose device is absent from the configured target. */
+  orphanedSyncedIds: string[]
+  /** The devices those rows are attributed to. */
+  orphanedDevices: string[]
 }
 
 interface SyncedRow {
@@ -145,6 +158,8 @@ export function planLocalRepair(
   db: Database.Database,
   deviceInstanceId: string,
   remoteLines?: Iterable<SyncRecord>,
+  /** Namespace owners present on the configured target; omit when unknown (cloud). */
+  presentOwners?: Set<string>,
 ): LocalRepairPlan {
   // 1. Provenance: local-flagged rows that are provably pulled copies.
   const reflagRows = db.prepare(`
@@ -191,12 +206,27 @@ export function planLocalRepair(
   // 5. Wire-id collisions among this device's own records.
   const { collisions } = buildLocalSnapshot(db, deviceInstanceId)
 
+  // 6. Orphaned pulled rows: unclaimed, and their device is not on the target.
+  const orphanedSyncedIds: string[] = []
+  const orphanedDevices: string[] = []
+  if (presentOwners) {
+    for (const [owner, ids] of getUnclaimedSyncedRecords(db)) {
+      if (owner === deviceInstanceId || owner === UNKNOWN_DEVICE_INSTANCE_ID || owner === '' || presentOwners.has(owner)) continue
+      const fresh = ids.filter(id => !echoSet.has(id))
+      if (fresh.length === 0) continue
+      orphanedDevices.push(owner)
+      orphanedSyncedIds.push(...fresh)
+    }
+  }
+
   return {
     reflagRecordIds,
     echoSyncedIds,
     echoMergedIds,
     staleSyncStateCount: stale.n + reflagRecordIds.length,
     wireIdCollisions: collisions,
+    orphanedSyncedIds,
+    orphanedDevices,
   }
 }
 
@@ -208,6 +238,7 @@ export function applyLocalRepair(db: Database.Database, plan: LocalRepairPlan): 
     for (const id of plan.reflagRecordIds) reflag.run(id)
     for (const id of plan.echoMergedIds) delMerged.run(id)
     for (const id of plan.echoSyncedIds) delSynced.run(id)
+    for (const id of plan.orphanedSyncedIds) { delMerged.run(id); delSynced.run(id) }
     db.prepare(`
       DELETE FROM sync_record_state
       WHERE record_id IN (SELECT id FROM records WHERE origin = 'synced')
@@ -251,6 +282,16 @@ export interface RemoteRepairPlan {
   allRecords: SyncRecord[]
   files: RemoteFilePlan[]
   namespaces: RemoteNamespaceSummary[]
+  /** Namespace owners that have at least one data file on the target. */
+  presentOwners: Set<string>
+  /**
+   * Content of every namespace after the plan is applied, keyed by owner then
+   * by path relative to the namespace. Used to rewrite the manifest of a
+   * repaired namespace so peers keep verifying it.
+   */
+  finalFiles: Map<string, Map<string, SyncRecord[]>>
+  /** Owners whose namespace carried a manifest when scanned. */
+  ownersWithManifest: Set<string>
 }
 
 export interface RemoteRepairOptions {
@@ -268,15 +309,21 @@ export interface RemoteRepairOptions {
 }
 
 export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepairOptions): Promise<RemoteRepairPlan> {
-  const paths = (await backend.listFiles()).slice().sort()
+  const paths = (await backend.listFiles()).filter(p => p.endsWith('.ndjson') && !isManifestPath(p)).sort()
   const chain = options.sessionKeys ?? new SessionKeyChain()
   const parsed: Array<{ path: string; owner: string; lines: Array<{ raw: string; record: SyncRecord | null }> }> = []
   const allRecords: SyncRecord[] = []
+  const presentOwners = new Set<string>()
+  const ownersWithManifest = new Set<string>()
 
   for (const path of paths) {
+    const owner = namespaceOwnerFromPath(path)
+    if (!presentOwners.has(owner)) {
+      presentOwners.add(owner)
+      if ((await backend.readFile(manifestPath(owner))) !== null) ownersWithManifest.add(owner)
+    }
     const content = await backend.readFile(path)
     if (!content) continue
-    const owner = namespaceOwnerFromPath(path)
     const lines = content.split('\n').filter(Boolean).map(raw => {
       const record = parseSyncRecordLine(raw)
       if (record) {
@@ -303,6 +350,7 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
 
   const files: RemoteFilePlan[] = []
   const perNamespace = new Map<string, RemoteNamespaceSummary>()
+  const finalFiles = new Map<string, Map<string, SyncRecord[]>>()
 
   for (const file of parsed) {
     const isOwn = file.owner === options.deviceInstanceId
@@ -336,8 +384,17 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
     ns.echoLines += echoLines
     ns.staleLines += staleLines
     ns.duplicateLines += duplicateLines
-    if (repairable && (foreignLines > 0 || echoLines > 0 || staleLines > 0 || duplicateLines > 0)) {
+    const changed = repairable && (foreignLines > 0 || echoLines > 0 || staleLines > 0 || duplicateLines > 0)
+    if (changed) {
       files.push({ path: file.path, owner: file.owner, totalLines: file.lines.length, foreignLines, echoLines, staleLines, duplicateLines, keptLines })
+    }
+    const finalRecords = changed
+      ? parseNdjsonLines(keptLines.join('\n')).records
+      : file.lines.flatMap(l => (l.record ? [l.record] : []))
+    if (finalRecords.length > 0) {
+      let perOwner = finalFiles.get(file.owner)
+      if (!perOwner) finalFiles.set(file.owner, perOwner = new Map())
+      perOwner.set(file.path.slice(file.owner.length + 1), finalRecords)
     }
   }
 
@@ -347,19 +404,45 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
     allRecords,
     files,
     namespaces: Array.from(perNamespace.values()).sort((a, b) => a.owner.localeCompare(b.owner)),
+    presentOwners,
+    finalFiles,
+    ownersWithManifest,
   }
 }
 
-export async function applyRemoteRepair(backend: SyncBackend, plan: RemoteRepairPlan): Promise<{ rewritten: number; deleted: number }> {
+/**
+ * Rewrite the planned files. Files are written before any deletion, and the
+ * manifest of every namespace that changed is refreshed afterwards so peers
+ * keep verifying it — for this device's own namespace always, for other
+ * namespaces only when they already carried one (a namespace still written by
+ * a pre-manifest client must not acquire a manifest that client would never
+ * maintain).
+ */
+export async function applyRemoteRepair(backend: SyncBackend, plan: RemoteRepairPlan, deviceInstanceId?: string): Promise<{ rewritten: number; deleted: number }> {
   let rewritten = 0
   let deleted = 0
+  const touchedOwners = new Set<string>()
   for (const file of plan.files) {
-    if (file.keptLines.length === 0 && backend.deleteFile) {
-      await backend.deleteFile(file.path)
-      deleted++
-    } else {
-      await backend.writeFile(file.path, file.keptLines.length ? file.keptLines.join('\n') + '\n' : '')
+    if (file.keptLines.length > 0) {
+      await backend.writeFile(file.path, file.keptLines.join('\n') + '\n')
       rewritten++
+      touchedOwners.add(file.owner)
+    }
+  }
+  for (const owner of touchedOwners) {
+    if (owner !== deviceInstanceId && !plan.ownersWithManifest.has(owner)) continue
+    const files = plan.finalFiles.get(owner) ?? new Map<string, SyncRecord[]>()
+    await backend.writeFile(manifestPath(owner), serializeManifest(buildManifest(files)))
+  }
+  for (const file of plan.files) {
+    if (file.keptLines.length > 0) continue
+    if (backend.deleteFile) await backend.deleteFile(file.path)
+    else await backend.writeFile(file.path, '')
+    deleted++
+    if ((file.owner === deviceInstanceId || plan.ownersWithManifest.has(file.owner)) && !touchedOwners.has(file.owner)) {
+      touchedOwners.add(file.owner)
+      const files = plan.finalFiles.get(file.owner) ?? new Map<string, SyncRecord[]>()
+      await backend.writeFile(manifestPath(file.owner), serializeManifest(buildManifest(files)))
     }
   }
   return { rewritten, deleted }
@@ -379,6 +462,8 @@ export interface RepairReport {
 
 export interface RepairOptions {
   deviceInstanceId: string
+  /** The configured sync target (informational; orphan detection uses the backend listing). */
+  target?: string
   /** File-based backend; omit for cloud (local repair only). */
   backend?: SyncBackend
   allNamespaces?: boolean
@@ -402,14 +487,14 @@ export async function repairSyncContamination(db: Database.Database, options: Re
     remote = await planRemoteRepair(backend, { deviceInstanceId, allNamespaces: options.allNamespaces, sessionKeys, ownWireIds })
   }
 
-  const local = planLocalRepair(db, deviceInstanceId, remote?.allRecords)
+  const local = planLocalRepair(db, deviceInstanceId, remote?.allRecords, remote?.presentOwners)
   const report: RepairReport = { deviceInstanceId, local, remote, applied: false }
 
   if (!options.apply) return report
 
   applyLocalRepair(db, local)
   if (backend && remote) {
-    const result = await applyRemoteRepair(backend, remote)
+    const result = await applyRemoteRepair(backend, remote, deviceInstanceId)
     const flushed = remote.files.length > 0 ? (await backend.flush?.()) ?? false : false
     report.remoteResult = { ...result, flushed }
   }
