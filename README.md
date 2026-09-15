@@ -45,7 +45,7 @@ npm install -g @juliantanx/aiusage
 aiusage serve
 ```
 
-Open `http://127.0.0.1:3847` to use the dashboard. `serve` parses once on startup and then serves the local web UI.
+Open `http://127.0.0.1:3847` to use the dashboard. `serve` starts the local web UI immediately and parses local logs in the background during startup.
 
 Prefer pnpm:
 
@@ -75,6 +75,7 @@ The container binds to `0.0.0.0` so it is reachable from outside Docker, and sta
 | `aiusage status` | Show data source and local database status |
 | `aiusage export --range month` | Export usage data |
 | `aiusage init` | Configure optional sync |
+| `aiusage github login --repo OWNER/REPO` | Connect GitHub sync with the GitHub App |
 | `aiusage sync` | Sync with the configured backend |
 | `aiusage sync --repair` | Inspect and repair cross-device sync contamination (dry run by default) |
 | `aiusage widget` | Launch the desktop tray widget |
@@ -93,6 +94,7 @@ Full CLI reference: [aiusage.jtanx.com/docs#cli-reference](https://aiusage.jtanx
 | `Gemini CLI` | `Kimi Code` | `CodeBuddy` | `Kiro` | `Grok Build` |
 | `Antigravity` | `Roo Code` | `Zed` | `Goose` | `oh-my-pi` |
 | `pi` | `Craft` | `Droid` | `ZCode` | `CodeFuse` |
+| `Trae` | | | | |
 
 Default paths and environment variable overrides are documented in [Data Sources](https://aiusage.jtanx.com/docs#settings-sources) and [Source Env Vars](https://aiusage.jtanx.com/docs#settings-env).
 
@@ -131,6 +133,7 @@ Sync and leaderboard are independent optional features.
 
 - **Sync** keeps your own devices aligned through GitHub, S3, R2, or MinIO. Configure it with `aiusage init`, then run `aiusage sync`.
   GitHub sync prefers `aiusage github login --repo OWNER/REPO` or **Connect GitHub** in local settings, using a least-privilege GitHub App without an AIUsage account. Fine-grained PATs remain an advanced fallback. See [GitHub App setup and migration](docs/github-sync.md).
+- **AIUsage Cloud sync** is available after device authorization: run `aiusage login`, then `aiusage init --backend cloud` and `aiusage sync`.
 - If versions up to 1.5.13 caused duplicate cross-device records, use `aiusage sync --repair` to inspect them before applying cleanup. See the [sync repair guide](./docs/sync-repair.md).
 - **Leaderboard** is public ranking for users who explicitly upload aggregate totals. Authorize a device with `aiusage login`, then run `aiusage upload`.
 - Anonymous mode is available in [site settings](https://aiusage.jtanx.com/settings) for leaderboard participation.
@@ -158,6 +161,8 @@ pnpm build
 pnpm test
 pnpm dev
 ```
+
+`pnpm dev` builds the shared packages and starts only the local dashboard at `http://127.0.0.1:3847`. To develop account, authorization, or cloud-sync flows against the local official site, run `pnpm dev:site` separately on port `4000` and set `SITE_URL=http://localhost:4000` in `packages/cli/.env`. Without that override, the CLI uses `https://aiusage.jtanx.com`.
 
 Project layout:
 

@@ -323,8 +323,8 @@
       </div>
       <h1 class="hero-title">{zh ? '文档' : 'Documentation'}</h1>
       <p class="hero-sub">{zh
-        ? 'AIUsage 是一款 AI 工具用量统计平台，支持 Claude Code、Codex、OpenClaw、OpenCode、Hermes、Qoder、Cursor、Copilot、KiloCode、Kelivo、Gemini CLI、Kimi Code、CodeBuddy、Kiro、Grok Build、Antigravity、Roo Code、Zed、Goose、oh-my-pi、pi、Craft、Droid、ZCode、CodeFuse 共 20+ 种 AI 工具的 Token 和费用追踪。'
-        : 'AIUsage is a local-first usage analytics platform for AI tools — tracking tokens, costs, sessions and more across 20+ tools: Claude Code, Codex, OpenClaw, OpenCode, Hermes, Qoder, Cursor, Copilot, KiloCode, Kelivo, Gemini CLI, Kimi Code, CodeBuddy, Kiro, Grok Build, Antigravity, Roo Code, Zed, Goose, oh-my-pi, pi, Craft, Droid, ZCode, and CodeFuse.'
+        ? 'AIUsage 是一款 AI 工具用量统计平台，支持 Claude Code、Codex、OpenClaw、OpenCode、Hermes、Qoder、Cursor、Copilot、KiloCode、Kelivo、Gemini CLI、Kimi Code、CodeBuddy、Kiro、Grok Build、Antigravity、Roo Code、Zed、Goose、oh-my-pi、pi、Craft、Droid、ZCode、CodeFuse、Trae 共 20+ 种 AI 工具的 Token 和费用追踪。'
+        : 'AIUsage is a local-first usage analytics platform for AI tools — tracking tokens, costs, sessions and more across 20+ tools: Claude Code, Codex, OpenClaw, OpenCode, Hermes, Qoder, Cursor, Copilot, KiloCode, Kelivo, Gemini CLI, Kimi Code, CodeBuddy, Kiro, Grok Build, Antigravity, Roo Code, Zed, Goose, oh-my-pi, pi, Craft, Droid, ZCode, CodeFuse, and Trae.'
       }</p>
       <div class="hero-meta">
         <span class="meta-tag">{zh ? '开源' : 'Open Source'}</span>
@@ -852,7 +852,7 @@
         <li><strong>Kelivo</strong> — {zh ? '通过手动导入 Kelivo 备份文件（' : 'Manual import from Kelivo backup ( '}<code>chats.json</code> / <code>.zip</code>{zh ? '），详见下方「手动导入」' : ' ), see Manual Import below'}</li>
         <li><strong>Gemini CLI</strong> — <code>~/.gemini/tmp</code></li>
         <li><strong>Kimi Code</strong> — <code>~/.kimi-code/sessions</code></li>
-        <li><strong>CodeBuddy</strong> — <code>~/.codebuddy/projects</code></li>
+        <li><strong>CodeBuddy</strong> — <code>~/.codebuddy/projects</code> + {zh ? '平台相关的 CodeBuddy IDE 扩展数据目录' : 'platform-specific CodeBuddy IDE extension data directories'}</li>
         <li><strong>Kiro</strong> — {zh ? 'IDE SQLite + CLI JSON/JSONL 会话文件' : 'IDE SQLite + CLI JSON/JSONL session files'}</li>
         <li><strong>Grok Build</strong> — <code>~/.grok/sessions</code></li>
         <li><strong>Antigravity</strong> — <code>~/.gemini/antigravity/conversations/*.db</code>, <code>~/.gemini/antigravity-cli/conversations/*.db</code>, <code>~/.gemini/antigravity-ide/conversations/*.db</code>, <code>~/.gemini/antigravity-backup/conversations/*.db</code> + <code>~/.config/antigravity/conversations/*.db</code></li>
@@ -865,6 +865,7 @@
         <li><strong>Droid</strong> — <code>~/.droid/sessions</code></li>
         <li><strong>ZCode</strong> — <code>~/.zcode/cli/db/db.sqlite</code></li>
         <li><strong>CodeFuse</strong> — <code>~/.codefuse</code> {zh ? '（原生 projects、内嵌 engine/cc/projects 与 engine/codex/sessions 日志，及 ant_cc_*.json 快照）' : '(native projects, embedded engine/cc/projects and engine/codex/sessions logs, plus ant_cc_*.json snapshots)'}</li>
+        <li><strong>Trae</strong> — {zh ? '平台相关的 Trae CN、TRAE SOLO CN 或 Trae' : 'platform-specific Trae CN, TRAE SOLO CN, or Trae'} <code>User/globalStorage/state.vscdb</code></li>
       </ul>
       <Callout type="info">
         {zh
@@ -950,7 +951,7 @@
           ['Copilot', '<code>AIUSAGE_COPILOT_PATH</code>'],
           ['Gemini CLI', '<code>AIUSAGE_GEMINI_PATH</code>'],
           ['Kimi Code', '<code>AIUSAGE_KIMI_PATH</code>'],
-          ['CodeBuddy', '<code>AIUSAGE_CODEBUDDY_PATH</code>'],
+          ['CodeBuddy CLI / IDE', '<code>AIUSAGE_CODEBUDDY_PATH</code> / <code>AIUSAGE_CODEBUDDY_IDE_PATH</code>'],
           ['Kiro', '<code>AIUSAGE_KIRO_PATH</code>'],
           ['Grok Build', '<code>AIUSAGE_GROK_PATH</code>'],
           ['Antigravity', '<code>AIUSAGE_ANTIGRAVITY_PATH</code>'],
@@ -960,6 +961,7 @@
           ['ZCode', '<code>AIUSAGE_ZCODE_PATH</code>'],
           ['oh-my-pi / pi / Craft / Droid', '<code>AIUSAGE_OMP_PATH</code> / <code>AIUSAGE_PI_PATH</code> / <code>AIUSAGE_CRAFT_PATH</code> / <code>AIUSAGE_DROID_PATH</code>'],
           ['CodeFuse', '<code>AIUSAGE_CODEFUSE_PATH</code>'],
+          ['Trae', '<code>AIUSAGE_TRAE_PATH</code>'],
         ]}
       />
       <p>{zh ? '跨平台示例：' : 'Cross-platform examples:'}</p>
@@ -998,21 +1000,30 @@
         : 'Sync uploads this device\'s data, pulls data from other devices, and merges the results. You can trigger it from the sidebar Sync button after configuring the backend via init or the Settings page.'
       }</p>
       <ul>
-        <li><strong>GitHub</strong> — {zh ? '推送到 GitHub 仓库' : 'Push to a GitHub repository'}</li>
+        <li><strong>AIUsage Cloud</strong> — {zh ? '授权设备后使用官方云服务同步' : 'Sync through the official cloud service after authorizing the device'}</li>
+        <li><strong>GitHub App</strong> — {zh ? '通过最小权限设备授权连接 GitHub 仓库' : 'Connect a GitHub repository through least-privilege device authorization'}</li>
         <li><strong>S3 / {zh ? '兼容存储' : 'Compatible'}</strong> — {zh ? '推送到 Amazon S3 或任何 S3 兼容存储（Cloudflare R2、MinIO 等）' : 'Push to Amazon S3 or any S3-compatible storage (Cloudflare R2, MinIO, etc.)'}</li>
       </ul>
-      <CodeBlock lang="Terminal" copyText={'aiusage init --backend github --repo owner/repo --token ghp_xxx\naiusage sync'}>
+      <CodeBlock lang="Terminal" copyText={'aiusage github login --repo owner/repo\naiusage sync'}>
         <span slot="lines"><span>1</span><span>2</span></span>
-        <span class="tk-kw">aiusage</span> init --backend github --repo owner/repo --token ghp_xxx
+        <span class="tk-kw">aiusage</span> github login --repo owner/repo
 <span class="tk-kw">aiusage</span> sync  <span class="tk-cmt"># push/pull</span>
       </CodeBlock>
       <DocsTable
         headers={zh ? ['后端', '配置命令'] : ['Backend', 'Configuration command']}
         rows={[
-          ['GitHub', '<code>aiusage init --backend github --repo owner/repo --token ghp_xxx<br>aiusage sync</code>'],
+          ['AIUsage Cloud', '<code>aiusage login<br>aiusage init --backend cloud<br>aiusage sync</code>'],
+          ['GitHub App', '<code>aiusage github login --repo owner/repo<br>aiusage sync</code>'],
           ['S3 / R2 / MinIO', '<code>aiusage init --backend s3 --bucket my-bucket --prefix aiusage/ --endpoint https://example.r2.cloudflarestorage.com --access-key-id xxx --secret-access-key yyy<br>aiusage sync</code>'],
         ]}
       />
+      <Callout type="info">
+        {zh
+          ? 'GitHub 同步优先使用 GitHub App。细粒度 PAT 仅作为高级备用方案；如需迁移或配置，请查看 GitHub App 同步说明。'
+          : 'Prefer the GitHub App for GitHub sync. Fine-grained PATs remain an advanced fallback; see the GitHub App sync guide for setup and migration.'
+        }
+        {' '}<a href="https://github.com/juliantanx/aiusage/blob/main/docs/github-sync.md">{zh ? '查看 GitHub App 同步说明' : 'Read the GitHub App sync guide'}</a>.
+      </Callout>
       <Callout type="info">
         {zh
           ? '如果 1.5.13 及更早版本产生了跨设备重复记录，请先升级所有设备，再运行 aiusage sync --repair 预览清理范围；确认报告后使用 --apply 执行。'
@@ -1378,8 +1389,8 @@ aiusage upload-status
         <h2>{zh ? '服务与支持' : 'Support & Contact'}</h2>
       </div>
       <p>{zh
-        ? '仪表盘侧边栏的 Support 页面（/support）列出了所有可用的联系方式和社区渠道。'
-        : 'The dashboard sidebar Support page (/support) lists all available contact methods and community channels.'
+        ? '本地仪表盘的服务与支持页面（/support）列出了可用的联系方式和社区渠道。该页面不在侧边栏中展示，可通过地址直接访问。'
+        : 'The local dashboard Support page (/support) lists the available contact and community channels. It is not shown in the sidebar and remains available by direct URL.'
       }</p>
       <ul>
         <li><strong>{zh ? '微信' : 'WeChat'}</strong> — {zh ? '扫描 QR 码添加个人微信' : 'Scan QR code to add on WeChat'}</li>
@@ -1396,8 +1407,8 @@ aiusage upload-status
         <h2>{zh ? 'CLI 命令参考' : 'CLI Reference'}</h2>
       </div>
       <p>{zh
-        ? '所有 CLI 命令均通过 aiusage <command> 调用；不带子命令时会输出 summary。当前内置的主要命令包括 summary、status、parse、serve、export、clean、recalc、init、sync、widget、leaderboard、login、upload、upload-status、logout、menu、pm2-setup 和 pm2-start。'
-        : 'All CLI commands are invoked as aiusage <command>; running aiusage without a subcommand prints the summary. Main built-ins currently include summary, status, parse, serve, export, clean, recalc, init, sync, widget, leaderboard, login, upload, upload-status, logout, menu, pm2-setup, and pm2-start.'
+        ? '所有 CLI 命令均通过 aiusage <command> 调用；不带子命令时会输出 summary。当前内置的主要命令包括 summary、status、parse、serve、export、clean、recalc、init、github、sync、widget、leaderboard、login、upload、upload-status、logout、menu、pm2-setup 和 pm2-start。'
+        : 'All CLI commands are invoked as aiusage <command>; running aiusage without a subcommand prints the summary. Main built-ins currently include summary, status, parse, serve, export, clean, recalc, init, github, sync, widget, leaderboard, login, upload, upload-status, logout, menu, pm2-setup, and pm2-start.'
       }</p>
     </section>
 
@@ -1406,7 +1417,7 @@ aiusage upload-status
       <DocsTable
         headers={zh ? ['选项', '说明'] : ['Option', 'Description']}
         rows={[
-          ['<code>--tool &lt;tool&gt;</code>', zh ? '只解析指定工具；支持 claude-code、codex、openclaw、opencode、hermes、qoder、cursor、kilocode、copilot、kelivo、gemini、kimi、codebuddy、kiro、grok、antigravity、roocode、zed、goose、omp、pi、craft、droid、codefuse' : 'Only parse a specific tool: claude-code, codex, openclaw, opencode, hermes, qoder, cursor, kilocode, copilot, kelivo, gemini, kimi, codebuddy, kiro, grok, antigravity, roocode, zed, goose, omp, pi, craft, droid, codefuse'],
+          ['<code>--tool &lt;tool&gt;</code>', zh ? '只解析指定工具；支持 claude-code、codex、codefuse、openclaw、opencode、hermes、qoder、cursor、kilocode、kelivo、copilot、gemini、kimi、codebuddy、kiro、grok、antigravity、roocode、zed、zcode、goose、omp、pi、craft、droid、trae' : 'Only parse a specific tool: claude-code, codex, codefuse, openclaw, opencode, hermes, qoder, cursor, kilocode, kelivo, copilot, gemini, kimi, codebuddy, kiro, grok, antigravity, roocode, zed, zcode, goose, omp, pi, craft, droid, trae'],
           ['<code>--no-progress</code>', zh ? '隐藏实时进度输出' : 'Hide real-time progress output'],
         ]}
       />
@@ -1418,6 +1429,7 @@ aiusage upload-status
         headers={zh ? ['选项', '说明', '默认'] : ['Option', 'Description', 'Default']}
         rows={[
           ['<code>-p, --port &lt;port&gt;</code>', zh ? '端口号' : 'Port number', '<code>3847</code>'],
+          ['<code>--host &lt;host&gt;</code>', zh ? '监听地址；非回环地址必须设置 AIUSAGE_DASHBOARD_PASSWORD' : 'Bind address; non-loopback addresses require AIUSAGE_DASHBOARD_PASSWORD', '<code>127.0.0.1</code>'],
         ]}
       />
     </section>
@@ -1456,8 +1468,8 @@ aiusage upload-status
     <section id="cli-clean">
       <h3><code>clean</code> — {zh ? '清理数据' : 'Clean Data'}</h3>
       <p>{zh
-        ? '清理本地数据。配合 --all 可清空全部数据（等价于原 reset）。如果配置了云同步（GitHub、S3），默认会将删除传播到所有远端后端，并在执行前列出受影响的后端供确认。'
-        : 'Clean local data. Use --all to wipe everything (equivalent to the former reset command). If sync is configured (GitHub, S3), deletions are propagated to all remote backends by default, with affected backends listed for confirmation before execution.'
+        ? '清理本地数据。配合 --all 可清空全部数据（等价于原 reset）。如果配置了同步（AIUsage Cloud、GitHub 或 S3），默认会将删除传播到所有远端后端，并在执行前列出受影响的后端供确认。'
+        : 'Clean local data. Use --all to wipe everything (equivalent to the former reset command). If sync is configured (AIUsage Cloud, GitHub, or S3), deletions are propagated to all remote backends by default, with affected backends listed for confirmation before execution.'
       }</p>
       <DocsTable
         headers={zh ? ['选项', '说明', '默认'] : ['Option', 'Description', 'Default']}
@@ -1471,8 +1483,8 @@ aiusage upload-status
       />
       <Callout type="warn">
         {zh
-          ? '如果配置了云同步，clean 会将删除传播到所有远端后端。执行前会列出受影响的后端（如 GitHub、S3），需要输入 confirm 确认。使用 --local-only 可跳过远端传播。'
-          : 'If sync is configured, clean propagates deletions to all remote backends. Affected backends (e.g. GitHub, S3) are listed before execution and require typing confirm. Use --local-only to skip remote propagation.'
+          ? '如果配置了同步，clean 会将删除传播到所有远端后端。执行前会列出受影响的后端（AIUsage Cloud、GitHub、S3），需要输入 confirm 确认。使用 --local-only 可跳过远端传播。'
+          : 'If sync is configured, clean propagates deletions to all remote backends. Affected backends (AIUsage Cloud, GitHub, and S3) are listed before execution and require typing confirm. Use --local-only to skip remote propagation.'
         }
       </Callout>
     </section>
@@ -1515,10 +1527,11 @@ aiusage upload-status
           ['<code>menu</code>', zh ? '打开交互式管理菜单，覆盖仪表盘、数据、同步、排行榜和系统命令' : 'Open the interactive management menu for dashboard, data, sync, leaderboard, and system commands'],
           ['<code>login</code>', zh ? '授权当前设备（用于排行榜上传）' : 'Authorize this device (for leaderboard uploads)'],
           ['<code>logout</code>', zh ? '删除本地设备凭证' : 'Remove local device credentials'],
-          ['<code>sync</code>', zh ? '与远程后端执行推送 / 拉取 / 合并同步（支持 GitHub / S3）' : 'Push, pull, and merge data with the remote backend (GitHub / S3)'],
+          ['<code>github login --repo &lt;owner/repo&gt;</code>', zh ? '通过 GitHub App 设备授权连接同步仓库' : 'Connect a sync repository using GitHub App device authorization'],
+          ['<code>sync</code>', zh ? '与远程后端执行推送 / 拉取 / 合并同步（支持 AIUsage Cloud / GitHub / S3）' : 'Push, pull, and merge data with the remote backend (AIUsage Cloud / GitHub / S3)'],
           ['<code>sync --repair [--apply] [--all-namespaces]</code>', zh ? '预览或执行跨设备同步污染清理；默认仅检查当前设备命名空间和本地数据库' : 'Preview or apply cross-device sync cleanup; defaults to this device namespace and local database'],
           ['<code>recalc</code>', zh ? '按最新定价重新计算费用' : 'Recalculate costs with latest pricing'],
-          ['<code>init</code>', zh ? '初始化同步后端（支持 GitHub / S3）' : 'Initialize sync backend (GitHub / S3)'],
+          ['<code>init</code>', zh ? '初始化同步后端（支持 AIUsage Cloud / GitHub / S3）' : 'Initialize sync backend (AIUsage Cloud / GitHub / S3)'],
           ['<code>widget</code>', zh ? '启动桌面托盘 Widget' : 'Launch the desktop tray widget'],
           ['<code>pm2-setup [--server-only]</code>', zh ? '生成 PM2 ecosystem.config.cjs，可跳过 widget' : 'Generate PM2 ecosystem.config.cjs, optionally skipping the widget'],
           ['<code>pm2-start [--server-only]</code>', zh ? '生成配置并启动 PM2 后台服务，可跳过 widget' : 'Generate config and start PM2 background services, optionally skipping the widget'],
@@ -1527,10 +1540,10 @@ aiusage upload-status
       <DocsTable
         headers={zh ? ['init 选项', '说明'] : ['init option', 'Description']}
         rows={[
-          ['<code>--backend &lt;backend&gt;</code>', zh ? 'github、s3 或 skip' : 'github, s3, or skip'],
+          ['<code>--backend &lt;backend&gt;</code>', zh ? 'cloud、github、s3 或 skip' : 'cloud, github, s3, or skip'],
           ['<code>--device &lt;alias&gt;</code>', zh ? '设置当前设备别名' : 'Set this device alias'],
           ['<code>--repo &lt;owner/repo&gt;</code>', zh ? 'GitHub 同步仓库' : 'GitHub sync repository'],
-          ['<code>--token &lt;token&gt;</code>', zh ? 'GitHub Personal Access Token' : 'GitHub Personal Access Token'],
+          ['<code>--token &lt;token&gt;</code>', zh ? '高级备用 GitHub PAT；建议通过 AIUSAGE_GITHUB_TOKEN 传入以避免 shell 历史记录' : 'Advanced GitHub PAT fallback; prefer AIUSAGE_GITHUB_TOKEN to avoid shell history'],
           ['<code>--bucket &lt;bucket&gt;</code>', zh ? 'S3 / R2 bucket 名称' : 'S3 / R2 bucket name'],
           ['<code>--prefix &lt;prefix&gt;</code>', zh ? 'S3 object 前缀，默认 aiusage/' : 'S3 object prefix, defaults to aiusage/'],
           ['<code>--endpoint &lt;url&gt;</code>', zh ? 'S3 兼容 endpoint URL' : 'S3-compatible endpoint URL'],

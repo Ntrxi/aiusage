@@ -102,14 +102,6 @@ export function serve(options: ServeOptions): void {
   })
   runtimeSettings.start()
 
-  // Parse logs once on startup so the dashboard has data immediately
-  console.log('[serve] parsing logs...')
-  runDbWrite(() => runParse(options.db)).then((result) => {
-    console.log(`[serve] parsed ${result.parsedCount} records, ${result.toolCallCount} tool calls.`)
-  }).catch((err) => {
-    console.error('[serve] initial parse failed:', err)
-  })
-
   const apiServer = createApiServer(options.db, {
     currentDeviceInstanceId: getState(AIUSAGE_DIR)?.deviceInstanceId,
     onRefresh: () => runParse(options.db),
@@ -192,6 +184,17 @@ export function serve(options: ServeOptions): void {
     started = true
     writeFileSync(PORT_FILE, String(currentPort), 'utf-8')
     console.log(`aiusage serve listening on http://${host.includes(':') ? `[${host}]` : host}:${currentPort}`)
+
+    // Start the initial parse only after the HTTP server is accepting connections.
+    // Scheduling it on the next turn also lets the listening event finish first.
+    setImmediate(() => {
+      console.log('[serve] parsing logs...')
+      runDbWrite(() => runParse(options.db)).then((result) => {
+        console.log(`[serve] parsed ${result.parsedCount} records, ${result.toolCallCount} tool calls.`)
+      }).catch((err) => {
+        console.error('[serve] initial parse failed:', err)
+      })
+    })
   })
 
   server.on('error', (error: NodeJS.ErrnoException) => {

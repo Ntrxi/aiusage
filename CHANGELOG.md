@@ -5,10 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Local dashboard navigation** — hide the Service & Support item from the sidebar; the `/support` page remains available by direct URL.
+- **Responsive startup parsing** — start listening before the initial parse, yield during historical tool-call backfill, and cache pricing lookups so large local histories do not block the dashboard.
+
+### Fixed
+- **Local calendar ranges** ([#62](https://github.com/juliantanx/aiusage/pull/62)) — build custom range boundaries and daily aggregation buckets from local calendar dates instead of UTC dates.
+
+---
+
 ## [1.5.16] - 2026-09-14
 
 ### Added
-- **GitHub App authentication for local sync** ([#53](https://github.com/juliantanx/aiusage/pull/53) by [@Ntrxi](https://github.com/Ntrxi)) — add `aiusage github-login` device authorization, secure credential storage, and authenticated GitHub sync without requiring users to create and paste a personal access token.
+- **GitHub App authentication for local sync** ([#53](https://github.com/juliantanx/aiusage/pull/53) by [@Ntrxi](https://github.com/Ntrxi)) — add `aiusage github login` device authorization, secure credential storage, and authenticated GitHub sync without requiring users to create and paste a personal access token.
 
 ### Changed
 - **Hardened local dashboard trust boundary** ([#53](https://github.com/juliantanx/aiusage/pull/53) by [@Ntrxi](https://github.com/Ntrxi)) — bind passwordless servers to loopback by default, require a password for non-loopback and Docker access, reject cross-origin and DNS-rebinding requests, make stored credentials write-only over HTTP, protect sensitive data APIs, and expose only aggregate totals through the public home-summary endpoint. Refresh requests now use `POST`, and authentication cookies honor HTTPS proxy headers.

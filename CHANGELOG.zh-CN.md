@@ -5,10 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 变更
+- **本地仪表盘导航** — 隐藏侧边栏中的“服务与支持”入口；仍可通过 `/support` 直接访问该页面。
+- **启动解析响应性** — 初次解析改为在端口开始监听后执行，历史工具调用回填期间主动让出事件循环，并缓存定价查询，避免大量本地历史记录阻塞仪表盘。
+
+### 修复
+- **本地日历范围**（[#62](https://github.com/juliantanx/aiusage/pull/62)）— 自定义范围边界和按日聚合改用本地日历日期构建，不再错误使用 UTC 日期。
+
+---
+
 ## [1.5.16] - 2026-09-14
 
 ### 新增
-- **本地同步支持 GitHub App 认证**（[#53](https://github.com/juliantanx/aiusage/pull/53)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 新增 `aiusage github-login` 设备授权、安全凭据存储及经过认证的 GitHub 同步，无需用户自行创建和粘贴个人访问令牌。
+- **本地同步支持 GitHub App 认证**（[#53](https://github.com/juliantanx/aiusage/pull/53)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 新增 `aiusage github login` 设备授权、安全凭据存储及经过认证的 GitHub 同步，无需用户自行创建和粘贴个人访问令牌。
 
 ### 变更
 - **强化本地仪表盘信任边界**（[#53](https://github.com/juliantanx/aiusage/pull/53)，[@Ntrxi](https://github.com/Ntrxi) 贡献）— 无密码服务默认仅监听回环地址，非回环地址及 Docker 访问必须设置密码；拒绝跨域和 DNS 重绑定请求，使存储的凭据只能通过 HTTP 写入，保护敏感数据接口，并仅通过公开的 home-summary 接口提供汇总总量。数据刷新改用 `POST`，认证 Cookie 也会正确识别 HTTPS 代理头。
