@@ -23,6 +23,15 @@ const RECORD_ID_SYNC_TOOLS = new Set<Tool>([
   'trae',
 ])
 
+/**
+ * True for tools whose wire id is derived from `(deviceInstanceId, sourceFile,
+ * lineOffset)` rather than taken from the parser. Their wire id changes when
+ * the device id stamped on the row changes (see `backfillUnknownDeviceInstanceId`).
+ */
+export function usesGeneratedWireId(tool: Tool): boolean {
+  return !RECORD_ID_SYNC_TOOLS.has(tool)
+}
+
 export function mapStatsRecordToSyncRecord(record: StatsRecord): SyncRecord {
   // Records merged from synced_records already carry their wire-format id and
   // have lineOffset=0, so regenerating the id from (device, sourceFile, 0)

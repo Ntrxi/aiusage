@@ -126,6 +126,34 @@ describe('destructive reconciliation fails closed', () => {
     expect(backend.mutations.filter(p => p.startsWith(`${B}/`))).toEqual([])
   })
 
+  it('aborts the sync when the local database fails during the pull, before anything is reconciled', async () => {
+    // A drops one record and adds another; inserting the new one fails locally.
+    dbA.prepare(`DELETE FROM records WHERE id = ?`).run(local(A, 1).id)
+    insertRecord(dbA, local(A, 3))
+    await sync(dbA, backend, A)
+    const dropped = wiresA[1].id
+    const added = mapStatsRecordToSyncRecord(local(A, 3)).id
+    dbB.exec(`CREATE TRIGGER boom BEFORE INSERT ON synced_records WHEN NEW.id = '${added}' BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END`)
+
+    const failed = await sync(dbB, backend, B)
+    expect(failed.status).toBe('failed')
+    expect(failed.error).toContain('simulated disk failure')
+    expect(syncedIds(dbB, A)).toContain(dropped)
+    expect(syncedIds(dbB, A)).toHaveLength(3)
+    expect(mergedCount(dbB, A)).toBe(3)
+    expect(syncedIds(dbB, C)).toHaveLength(2)
+    expect(backend.mutations.filter(p => p.startsWith(`${B}/`))).toEqual([])
+
+    // Once the database works again the sync converges.
+    dbB.exec(`DROP TRIGGER boom`)
+    const recovered = await sync(dbB, backend, B)
+    expect(recovered.status).toBe('ok')
+    expect(recovered.prunedCount).toBe(1)
+    expect(syncedIds(dbB, A)).not.toContain(dropped)
+    expect(syncedIds(dbB, A)).toContain(added)
+    expect(syncedIds(dbB, A)).toHaveLength(3)
+  })
+
   it('aborts the sync when one file of a multi-file namespace cannot be read', async () => {
     // A now spans two day files; B has both mirrored.
     insertRecord(dbA, local(A, 9, { ts: DAY7 }))

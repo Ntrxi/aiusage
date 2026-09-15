@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import { generateSyncRecordId } from '@aiusage/core'
+import { retireWireIdsOfUnknownLocalRows } from '../records.js'
 
 /**
  * Authoritative sync namespaces.
@@ -24,6 +25,16 @@ import { generateSyncRecordId } from '@aiusage/core'
  *    there; the cloud backend is upsert-only, so the old ids are pushed as
  *    tombstones and then forgotten. The affected `sync_record_state` rows are
  *    dropped so the records are re-published under their new ids.
+ *
+ * 3. Local rows still stamped with the pre-init `'unknown'` device id that
+ *    were already published are in the same situation for every tool whose
+ *    wire id is generated from the device id (Claude Code, Codex, …): the
+ *    first sync adopts them under the real id, which changes their wire id.
+ *    Their old `sha256('unknown', sourceFile, lineOffset)` ids are retired
+ *    per target and their sync state cleared here, so the cloud copies are
+ *    retracted rather than left behind. (Rows the previous release had
+ *    already relabelled at parse time cannot be told apart any more; file
+ *    backends drop their stale lines with the next snapshot regardless.)
  */
 const REKEYED_TOOLS = ['antigravity', 'trae'] as const
 
@@ -66,6 +77,8 @@ export function migrateV14(db: Database.Database): void {
       WHERE origin = 'local' AND tool IN (${placeholders})
     `).run(...REKEYED_TOOLS)
   }
+
+  retireWireIdsOfUnknownLocalRows(db)
 
   db.prepare('INSERT INTO schema_version (version) VALUES (14)').run()
 }

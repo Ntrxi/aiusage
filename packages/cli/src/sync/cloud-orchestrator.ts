@@ -7,8 +7,8 @@ import {
   markRecordsSynced,
   repairRecordProvenance,
 } from '../db/records.js'
-import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
-import { clearRetiredWireIds, getRetiredWireIds, replaceNamespaceClaims } from '../db/sync-claims.js'
+import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords, reconcileSyncedNamespace } from '../db/synced-records.js'
+import { clearRetiredWireIds, getClaimedOwners, getRetiredWireIds } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import { cloudPush, cloudPull, CloudSyncError, type CloudPulledTombstone } from './cloud.js'
 import type { SyncProgress } from './runtime.js'
@@ -25,7 +25,11 @@ export interface CloudSyncResult {
   uploadedCount: number
   mergedCount: number
   syncGeneration: number
-  /** Pulled rows removed because their origin device retracted them (tombstones). */
+  /**
+   * Pulled rows removed because the cloud no longer carries them (a tombstone
+   * from their origin device, or absence from a complete pull after the
+   * server's data was cleared) and no other target claims them.
+   */
   prunedCount?: number
   /** Wire ids this device retracted from the server (see migration v14). */
   retiredCount?: number
@@ -63,35 +67,40 @@ export class CloudSyncOrchestrator {
       // rows already live in `records` (origin = local) — and for tools whose
       // local id differs from the wire id (e.g. Claude Code message ids) they
       // would otherwise be merged back as fresh "local" rows and re-pushed.
+      // A database failure here propagates: the sync fails before any claim
+      // is touched rather than reconciling against a partially applied pull.
       let insertedCount = 0
       const claimed = new Map<string, Set<string>>()
       for (const record of pullResult.records) {
         if (record.deviceInstanceId === this.options.deviceInstanceId) continue
-        try {
-          insertSyncedRecord(this.db, record)
-          insertedCount++
-        } catch {}
+        insertSyncedRecord(this.db, record)
+        insertedCount++
         const owner = record.deviceInstanceId || ''
         if (!claimed.has(owner)) claimed.set(owner, new Set())
         claimed.get(owner)!.add(record.id)
       }
 
-      // Step 2a: The pull is complete (every page was read), so what the
-      // server returned is exactly what this target claims per device. A
-      // file-based target reconciling later must not delete rows that the
-      // cloud still carries, and vice versa.
+      // Step 2a: The pull is complete (every page of the server's current
+      // generation was read), so it is authoritative for what the cloud
+      // target claims: every device the cloud claimed before is reconciled
+      // against what came back for it — nothing, when the server's data was
+      // cleared and a new generation started — and rows no target claims any
+      // more are removed. A file-based target reconciling later must not
+      // delete rows the cloud still carries, and vice versa.
+      let prunedCount = 0
       this.db.transaction(() => {
-        for (const [owner, ids] of claimed) replaceNamespaceClaims(this.db, this.target, owner, ids)
+        const owners = new Set<string>([...claimed.keys(), ...getClaimedOwners(this.db, this.target)])
+        owners.delete(this.options.deviceInstanceId)
+        for (const owner of owners) {
+          prunedCount += reconcileSyncedNamespace(this.db, this.target, owner, claimed.get(owner) ?? [])
+        }
       })()
 
       // Step 2b: Apply tombstones — records their origin device retracted.
       // The row itself only goes once no other target claims it.
-      let prunedCount = 0
       for (const tombstone of pullResult.tombstones) {
         if (!tombstone.id || tombstone.device_instance_id === this.options.deviceInstanceId) continue
-        try {
-          if (deleteSyncedRecord(this.db, this.target, tombstone.id)) prunedCount++
-        } catch {}
+        if (deleteSyncedRecord(this.db, this.target, tombstone.id)) prunedCount++
       }
 
       // Step 3: Merge synced_records into records
@@ -145,6 +154,7 @@ export class CloudSyncOrchestrator {
     const allTombstones: CloudPulledTombstone[] = []
     let cursor: string | undefined
     let hasMore = true
+    let generation = syncGeneration
 
     while (hasMore) {
       const result = await cloudPull(cursor, 1000)
@@ -152,9 +162,10 @@ export class CloudSyncOrchestrator {
       allTombstones.push(...(result.tombstones ?? []))
       cursor = result.nextCursor
       hasMore = result.hasMore
+      generation = result.syncGeneration
     }
 
-    return { records: allRecords, tombstones: allTombstones, syncGeneration }
+    return { records: allRecords, tombstones: allTombstones, syncGeneration: generation }
   }
 
   /**

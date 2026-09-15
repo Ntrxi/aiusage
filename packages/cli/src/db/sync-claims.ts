@@ -52,6 +52,16 @@ export function replaceNamespaceClaims(db: Database.Database, target: string, ow
   for (const id of recordIds) insert.run(target, owner, id)
 }
 
+/**
+ * Remove claims whose record no longer exists in `synced_records`. Every code
+ * path that deletes mirrored rows outside reconciliation (repair, retention
+ * clean-up) calls this so a claim can never outlive its row. Returns the
+ * number of claims removed.
+ */
+export function dropDanglingClaims(db: Database.Database): number {
+  return db.prepare(`DELETE FROM sync_record_claims WHERE record_id NOT IN (SELECT id FROM synced_records)`).run().changes
+}
+
 /** Drop a single claim. Returns true when no target claims the record any more. */
 export function releaseClaim(db: Database.Database, target: string, recordId: string): boolean {
   db.prepare(`DELETE FROM sync_record_claims WHERE target = ? AND record_id = ?`).run(target, recordId)

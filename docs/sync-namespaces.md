@@ -22,6 +22,40 @@ by the UTC day of the record timestamp. The manifest lists every day file of
 the namespace with the digest of its canonical content; peers use it to tell
 a complete snapshot from one that is being rewritten (see below).
 
+## Target identity
+
+Everything a device remembers about a remote store is keyed by a *sync
+target* string: consent and last-sync status in `state.json`, what was
+published there (`sync_record_state`), what was mirrored from there
+(`sync_record_claims`) and which wire ids were retired there
+(`sync_retired_wire_ids`). Two configurations therefore share a key only when
+they address the same physical store:
+
+| Configuration | Key |
+| --- | --- |
+| Cloud | `cloud` |
+| GitHub, branch `main` (the default) | `github:<owner>/<repo>` |
+| GitHub, any other branch | `github:<owner>/<repo>?branch=<branch>` |
+| S3, prefix `aiusage/` on the AWS endpoint (the default) | `s3:<bucket>` |
+| S3, other prefix and/or endpoint | `s3:<bucket>?prefix=<prefix>&endpoint=<endpoint>` (URL-encoded; only the non-default parts appear) |
+
+The prefix is normalised the way the S3 backend applies it (no leading slash,
+one trailing slash) and a trailing slash on the endpoint is ignored, so two
+spellings of the same store get the same key. The S3 region is not part of the
+key: it selects the signing region, not the store.
+
+Clients up to 1.5.17 keyed GitHub by repository and S3 by bucket alone. A
+configuration whose key changed (a non-default branch, prefix or endpoint)
+adopts what was recorded under its old key the first time it syncs: consent,
+last-sync status and the three bookkeeping tables are *copied* to the new key,
+once, and only when the new key has nothing yet. Nothing is moved, because the
+old key may also be the current key of another configuration (branch `main`
+next to branch `x` of the same repository). If two configurations had been
+sharing the old key, the copied claims can be broader than the store really
+holds; that only delays pruning until the first reliable read of each
+namespace on each target corrects them, it never deletes anything. For the
+sole-target rule below, the old key counts as an alias of the new one.
+
 ## Invariants
 
 1. **A namespace is a snapshot, not a log.** The contents of
@@ -174,14 +208,33 @@ Because reconciliation deletes local rows, the backends never mask errors:
 * A thrown listing or read error aborts the sync with `status: 'failed'`
   before any reconciliation. Lines already upserted stay (upserts are never
   destructive).
+* The local database is held to the same standard: a failure while upserting
+  a pulled line is never swallowed — it aborts the sync before the
+  reconciliation phase — and the reconciliation of all namespaces runs in one
+  transaction, so the mirror is either reconciled against a fully applied pull
+  or left exactly as it was. The same holds for the cloud backend.
 
 ## Bookkeeping tables
 
 | Table | Purpose |
 | --- | --- |
 | `sync_record_state` | Which local records have been published to which target, and when. Drives the `uploaded: N` count and the cloud push; the file backends always publish the full snapshot regardless. |
-| `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. |
+| `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. A claim never outlives its row: `sync --repair --apply` and `aiusage clean` drop the claims of the rows they delete. |
 | `sync_retired_wire_ids` (v14) | Wire ids this device used to publish and never will again. Cleared by the next file-backend sync (the snapshot no longer contains them) or pushed as tombstones to the cloud backend. |
+
+### The cloud backend
+
+The cloud store is upsert-only on the way up: `push` never deletes anything,
+and retired wire ids are retracted with tombstones. On the way down a pull
+reads every page of the server's current generation, so a completed pull is
+the authoritative list of what the cloud carries. It is reconciled exactly like
+a file-based target: every device the cloud claimed before is reconciled
+against what came back for it, and rows no target claims any more are removed.
+When the server's data is cleared (`aiusage clean --all` advances the server's
+`sync_generation`) the next pull returns neither records nor tombstones for the
+old devices; their cloud claims are released and their rows go unless another
+target still claims them. A tombstone from a device's own retraction likewise
+releases only the cloud's claim.
 
 ## Migration from 1.5.17 and earlier
 
@@ -197,7 +250,17 @@ Nothing needs to be run by hand. On the first sync after upgrading:
 * local rows still stamped `unknown` are adopted by the current device id and
   published under it; peers stop showing an `unknown` device once every
   legacy namespace line has been replaced (the origin device's next sync does
-  that) and their own next sync has pruned the old copies;
+  that) and their own next sync has pruned the old copies. For tools whose
+  wire id is generated from the device id (Claude Code, Codex, …) the adoption
+  changes the wire id, so rows that had already been published under
+  `sha256('unknown', sourceFile, lineOffset)` have that id retired on every
+  target that received it — the migration does this for rows synced before
+  the upgrade, the adoption itself for any synced later — and are published
+  again under the new id. The cloud copies are retracted with tombstones; file
+  backends drop them with the next snapshot. Rows the previous release had
+  already relabelled at parse time cannot be told apart any more, so a cloud
+  copy pushed under the sentinel by 1.5.17 or earlier and never retracted is
+  the one case this cannot clean up;
 * rows pulled before the upgrade carry no claim. The first reliable read of
   their namespace on any target adopts them (claims are created) and prunes
   the ones the namespace no longer holds.
@@ -227,9 +290,15 @@ not prune, and they never write manifests. Their namespaces are still read
 and reconciled (legacy mode). Upgrade every device for totals to converge.
 
 The cloud backend stores records per device as upserts. The migration records
-the retired Antigravity/Trae ids and the next cloud sync pushes them as
-tombstones, which other devices apply on pull. Cloud sync otherwise keeps its
-existing semantics (no snapshot replacement).
+the retired Antigravity/Trae ids (and the sentinel ids of legacy `unknown`
+rows) and the next cloud sync pushes them as tombstones, which other devices
+apply on pull. Pulls are reconciled as described under *The cloud backend*
+above; the push side keeps its existing semantics (no snapshot replacement).
+
+A configuration whose target key changed with this release (non-default
+branch, prefix or endpoint, see *Target identity*) adopts the consent,
+bookkeeping and claims recorded under its old key on its first sync, so it
+does not start from the pre-upgrade state described above.
 
 ## Diagnostics
 

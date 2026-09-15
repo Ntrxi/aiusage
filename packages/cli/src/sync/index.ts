@@ -232,8 +232,13 @@ export class SyncOrchestrator {
    * every file present, every line parsed, every digest matching. Namespaces
    * claimed on this target before but absent from the listing now were
    * deleted remotely and are reconciled against the empty set. Our own
-   * namespace is never read here; backend read failures propagate and abort
-   * the sync before anything is pruned.
+   * namespace is never read here.
+   *
+   * Nothing here is allowed to fail quietly: a backend read failure or a
+   * local database failure while upserting propagates and aborts the sync
+   * before the reconciliation phase, and the reconciliation itself runs in a
+   * single transaction, so the local mirror is either reconciled against a
+   * fully applied pull or left exactly as it was.
    */
   private async pull(allPaths: string[]): Promise<{ pulledCount: number; ignoredCount: number; prunedCount: number; skippedNamespaces: number }> {
     const own = this.options.deviceInstanceId
@@ -304,10 +309,7 @@ export class SyncOrchestrator {
             record.deviceInstanceId = owner
           }
           plan.ids.add(record.id)
-          try {
-            const changed = insertSyncedRecord(this.db, record)
-            if (changed) totalPulled++
-          } catch {}
+          if (insertSyncedRecord(this.db, record)) totalPulled++
         }
 
         completed++
@@ -317,32 +319,36 @@ export class SyncOrchestrator {
 
     // Phase 3: reconcile. Only namespaces read reliably replace this target's
     // claims; namespaces claimed here before but no longer listed are gone.
-    let prunedCount = 0
-    let skippedNamespaces = 0
-    const owners = new Set<string>([...plans.keys(), ...getClaimedOwners(this.db, target)])
-    owners.delete(own)
-    for (const owner of owners) {
-      const plan = plans.get(owner)
-      if (!plan) {
-        prunedCount += reconcileSyncedNamespace(this.db, target, owner, [])
-      } else if (plan.reliable) {
-        prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids)
-      } else {
-        skippedNamespaces++
+    // One transaction: a failure part-way leaves no namespace half-reconciled.
+    const { prunedCount, skippedNamespaces } = this.db.transaction(() => {
+      let prunedCount = 0
+      let skippedNamespaces = 0
+      const owners = new Set<string>([...plans.keys(), ...getClaimedOwners(this.db, target)])
+      owners.delete(own)
+      for (const owner of owners) {
+        const plan = plans.get(owner)
+        if (!plan) {
+          prunedCount += reconcileSyncedNamespace(this.db, target, owner, [])
+        } else if (plan.reliable) {
+          prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids)
+        } else {
+          skippedNamespaces++
+        }
       }
-    }
-    prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
+      prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
 
-    // Rows without any claim whose device is not on this target at all can
-    // only be judged when this is the one target the device has ever used:
-    // then nothing else could still be carrying them.
-    if (this.options.soleTarget) {
-      const absentOwners = new Set<string>()
-      for (const owner of getUnclaimedSyncedRecords(this.db).keys()) {
-        if (owner !== own && owner !== UNKNOWN_DEVICE_INSTANCE_ID && owner !== '' && !plans.has(owner)) absentOwners.add(owner)
+      // Rows without any claim whose device is not on this target at all can
+      // only be judged when this is the one target the device has ever used:
+      // then nothing else could still be carrying them.
+      if (this.options.soleTarget) {
+        const absentOwners = new Set<string>()
+        for (const owner of getUnclaimedSyncedRecords(this.db).keys()) {
+          if (owner !== own && owner !== UNKNOWN_DEVICE_INSTANCE_ID && owner !== '' && !plans.has(owner)) absentOwners.add(owner)
+        }
+        if (absentOwners.size > 0) prunedCount += pruneUnclaimedSyncedRecordsOf(this.db, absentOwners)
       }
-      if (absentOwners.size > 0) prunedCount += pruneUnclaimedSyncedRecordsOf(this.db, absentOwners)
-    }
+      return { prunedCount, skippedNamespaces }
+    })()
 
     return { pulledCount: totalPulled, ignoredCount: totalIgnored, prunedCount, skippedNamespaces }
   }

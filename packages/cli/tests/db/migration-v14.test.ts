@@ -3,7 +3,7 @@ import Database from 'better-sqlite3'
 import { generateRecordId, generateSyncRecordId } from '@aiusage/core'
 import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
-import { insertRecord, markRecordsSynced, getUnsyncedRecords } from '../../src/db/records.js'
+import { backfillUnknownDeviceInstanceId, insertRecord, markRecordsSynced, getUnsyncedRecords } from '../../src/db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
 import { migrateV14 } from '../../src/db/migrations/v14.js'
 import {
@@ -104,6 +104,48 @@ describe('migration v14', () => {
     db.prepare(`DELETE FROM schema_version WHERE version = 14`).run()
     migrateV14(db)
     expect(getRetiredWireIds(db, 'cloud')).toEqual([])
+  })
+
+  it('retires the generated wire ids of already-synced legacy unknown-device rows and re-queues them', () => {
+    // A Claude Code row parsed before `aiusage init` and pushed by an older
+    // client under sha256('unknown', file, offset); adopting it under the real
+    // device id changes that wire id.
+    const cc = record({ id: 'cc', tool: 'claude-code', model: 'claude-sonnet-4-6', provider: 'anthropic', sourceFile: 'C:\\s.jsonl', lineOffset: 42, deviceInstanceId: 'unknown' })
+    // A Cursor row in the same state publishes under its parser id, which does not depend on the device id.
+    const cursor = record({ id: 'cur', tool: 'cursor', model: 'm', provider: 'p', sourceFile: 'C:\\cursor.db', lineOffset: 0, deviceInstanceId: 'unknown' })
+    // A pulled copy stamped 'unknown' is never local and must stay out of it.
+    insertRecord(db, record({ id: 'pulled-unknown', tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\\o.jsonl', lineOffset: 7, deviceInstanceId: 'unknown', origin: 'synced' }))
+    for (const r of [cc, cursor]) insertRecord(db, r)
+    markRecordsSynced(db, [cc.id, cursor.id, 'pulled-unknown'], 5000, 'cloud')
+    markRecordsSynced(db, [cc.id, cursor.id], 5000, 'github:u/r')
+
+    db.prepare(`DELETE FROM schema_version WHERE version = 14`).run()
+    migrateV14(db)
+
+    const oldWireId = generateSyncRecordId('unknown', 'C:\\s.jsonl', 42)
+    expect(getRetiredWireIds(db, 'cloud')).toEqual([oldWireId])
+    expect(getRetiredWireIds(db, 'github:u/r')).toEqual([oldWireId])
+    expect(getUnsyncedRecords(db, 'cloud', DEVICE).map(r => r.id)).toEqual(['cc'])
+    expect(getUnsyncedRecords(db, 'github:u/r', DEVICE).map(r => r.id)).toEqual(['cc'])
+    expect(db.prepare(`SELECT synced_at FROM records WHERE id = 'cur'`).get()).toEqual({ synced_at: 5000 })
+
+    // The runtime adoption publishes the row under the real device id.
+    expect(backfillUnknownDeviceInstanceId(db, DEVICE)).toBe(2)
+    expect(mapStatsRecordToSyncRecord(getUnsyncedRecords(db, 'cloud', DEVICE)[0]).id).toBe(generateSyncRecordId(DEVICE, 'C:\\s.jsonl', 42))
+    expect(db.prepare(`SELECT device_instance_id FROM records WHERE id = 'pulled-unknown'`).get()).toEqual({ device_instance_id: 'unknown' })
+  })
+
+  it('retires wire ids at adoption time too, for rows synced under the sentinel after the migration', () => {
+    const cc = record({ id: 'late', tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\\late.jsonl', lineOffset: 9, deviceInstanceId: 'unknown' })
+    insertRecord(db, cc)
+    markRecordsSynced(db, [cc.id], 5000, 'cloud')
+    expect(backfillUnknownDeviceInstanceId(db, DEVICE, 'G14')).toBe(1)
+    expect(getRetiredWireIds(db, 'cloud')).toEqual([generateSyncRecordId('unknown', 'C:\\late.jsonl', 9)])
+    expect(getUnsyncedRecords(db, 'cloud', DEVICE).map(r => r.id)).toEqual(['late'])
+    expect(db.prepare(`SELECT device_instance_id, device FROM records WHERE id = 'late'`).get()).toEqual({ device_instance_id: DEVICE, device: 'G14' })
+    // Nothing left to do on a second pass.
+    expect(backfillUnknownDeviceInstanceId(db, DEVICE)).toBe(0)
+    expect(getRetiredWireIds(db, 'cloud')).toHaveLength(1)
   })
 
   it('tracks record claims per target and namespace', () => {

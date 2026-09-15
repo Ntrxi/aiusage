@@ -114,17 +114,19 @@ export function reconcileSyncedNamespace(db: Database.Database, target: string, 
   return db.transaction(() => {
     fillRemoteIds(db, remoteIds)
 
-    db.prepare(`
-      UPDATE synced_records SET device_instance_id = @owner
-      WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id IN (SELECT id FROM sync_remote_ids)
-    `).run({ owner })
-    db.prepare(`
-      UPDATE records SET device_instance_id = @owner
-      WHERE origin = 'synced'
-        AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id IN (SELECT id FROM sync_remote_ids)
-    `).run({ owner })
+    if (owner !== '' && owner !== UNKNOWN_DEVICE_INSTANCE_ID) {
+      db.prepare(`
+        UPDATE synced_records SET device_instance_id = @owner
+        WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+          AND id IN (SELECT id FROM sync_remote_ids)
+      `).run({ owner })
+      db.prepare(`
+        UPDATE records SET device_instance_id = @owner
+        WHERE origin = 'synced'
+          AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+          AND id IN (SELECT id FROM sync_remote_ids)
+      `).run({ owner })
+    }
 
     db.prepare(`DELETE FROM sync_record_claims WHERE target = @target AND device_instance_id = @owner`).run({ target, owner })
     db.prepare(`

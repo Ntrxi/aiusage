@@ -3,6 +3,7 @@ import type { SyncRecord } from '@aiusage/core'
 import { generateSessionKey } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from '../db/records.js'
 import { getUnclaimedSyncedRecords } from '../db/synced-records.js'
+import { dropDanglingClaims } from '../db/sync-claims.js'
 import type { SyncBackend } from './index.js'
 import { buildLocalSnapshot } from './index.js'
 import { buildManifest, isManifestPath, manifestPath, parseNdjsonLines, parseSyncRecordLine, serializeManifest } from './manifest.js'
@@ -244,6 +245,10 @@ export function applyLocalRepair(db: Database.Database, plan: LocalRepairPlan): 
       WHERE record_id IN (SELECT id FROM records WHERE origin = 'synced')
          OR record_id NOT IN (SELECT id FROM records)
     `).run()
+    // A claim describes a row that is mirrored; the rows removed above are
+    // not, so their claims go with them (a dangling claim would keep a later
+    // pull of the same id from ever being pruned).
+    dropDanglingClaims(db)
   })()
 }
 

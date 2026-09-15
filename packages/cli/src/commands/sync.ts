@@ -9,15 +9,17 @@ import { S3SyncBackend } from '../sync/s3.js'
 import { loadConfig, buildConsentConfig, loadCredential, AIUSAGE_DIR } from '../config.js'
 import { hasCredentials } from '../leaderboard/credentials.js'
 import type { SyncProgress } from '../sync/runtime.js'
-import { getSyncTarget } from '../sync/target.js'
+import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget } from '../sync/target.js'
 import { repairSyncContamination, type RepairReport } from '../sync/repair.js'
 import { githubToken } from '../github/auth.js'
 
 /**
  * True when `target` is the only sync target recorded in state — no other
  * repository, bucket or the cloud has ever been synced from this device.
+ * `aliases` are other keys that denote the same store (the key clients up to
+ * 1.5.17 used for this configuration, see `getLegacySyncTarget`).
  */
-export function isSoleSyncTarget(state: import('../init.js').State | null, target: string): boolean {
+export function isSoleSyncTarget(state: import('../init.js').State | null, target: string, aliases: Array<string | null> = []): boolean {
   if (!state) return true
   const known = new Set<string>([
     ...Object.keys(state.syncConsents ?? {}),
@@ -25,6 +27,7 @@ export function isSoleSyncTarget(state: import('../init.js').State | null, targe
   ])
   if (state.lastSyncTarget) known.add(state.lastSyncTarget)
   known.delete(target)
+  for (const alias of aliases) if (alias) known.delete(alias)
   return known.size === 0
 }
 
@@ -78,11 +81,14 @@ export async function runSync(
     return failedResult('Sync not configured. Run "aiusage init" first.')
   }
 
-  const state = getState(AIUSAGE_DIR)
   const target = getSyncTarget(config.sync)
   if (!target) {
     return failedResult('Invalid sync configuration.')
   }
+  // A configuration whose key changed (non-default branch/prefix/endpoint)
+  // takes over what was recorded under its old key before anything reads it.
+  adoptLegacySyncTarget(AIUSAGE_DIR, db, config.sync)
+  const state = getState(AIUSAGE_DIR)
 
   // Cloud sync doesn't use consent system — it uses device auth (HMAC)
   if (config.sync.backend === 'cloud') {
@@ -141,7 +147,7 @@ export async function runSync(
     deviceInstanceId: state!.deviceInstanceId,
     target,
     consentVerified: true,
-    soleTarget: isSoleSyncTarget(state, target),
+    soleTarget: isSoleSyncTarget(state, target, [getLegacySyncTarget(config.sync)]),
     onProgress: options?.onProgress,
   })
 
@@ -182,13 +188,14 @@ export async function runSyncRepair(
   if (!config?.sync) {
     return { status: 'failed', error: 'Sync not configured. Run "aiusage init" first.' }
   }
-  const state = getState(AIUSAGE_DIR)
-  if (!state?.deviceInstanceId) {
-    return { status: 'failed', error: 'Device identity not initialised. Run "aiusage init" first.' }
-  }
   const target = getSyncTarget(config.sync)
   if (!target) {
     return { status: 'failed', error: 'Invalid sync configuration.' }
+  }
+  adoptLegacySyncTarget(AIUSAGE_DIR, db, config.sync)
+  const state = getState(AIUSAGE_DIR)
+  if (!state?.deviceInstanceId) {
+    return { status: 'failed', error: 'Device identity not initialised. Run "aiusage init" first.' }
   }
 
   // Cloud backend has no per-device namespaces: local repair only.

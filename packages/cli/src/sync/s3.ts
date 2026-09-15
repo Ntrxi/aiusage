@@ -1,4 +1,5 @@
 import { S3Client, GetObjectCommand, PutObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3'
+import { normalizeS3Prefix } from './target.js'
 
 export interface S3Config {
   bucket: string
@@ -16,8 +17,9 @@ export class S3SyncBackend {
 
   constructor(config: S3Config) {
     this.bucket = config.bucket
-    // Ensure prefix ends with / and doesn't start with /
-    this.prefix = config.prefix.replace(/^\/+/, '').replace(/\/?$/, '/')
+    // Ensure prefix ends with / and doesn't start with / (the same
+    // normalisation the sync target key applies, so both name the same store).
+    this.prefix = normalizeS3Prefix(config.prefix)
     this.client = new S3Client({
       region: config.region ?? 'auto',
       ...(config.endpoint ? { endpoint: config.endpoint, forcePathStyle: true } : {}),

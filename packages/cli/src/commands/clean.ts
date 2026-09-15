@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { AIUSAGE_DIR, loadConfig } from '../config.js'
 import { cloudClear } from '../sync/cloud.js'
 import { createBackend } from './sync.js'
+import { dropDanglingClaims } from '../db/sync-claims.js'
 
 export interface CleanResult {
   deletedCount: number
@@ -37,6 +38,7 @@ export function cleanOldData(db: Database.Database, days: number): CleanResult {
 
   const syncedResult = db.prepare('DELETE FROM synced_records WHERE ts < ?').run(cutoff)
   const deletedSyncedCount = syncedResult.changes
+  dropDanglingClaims(db)
 
   const orphanResult = db.prepare('DELETE FROM tool_calls WHERE record_id IS NULL AND ts < ?').run(cutoff)
   const deletedOrphanToolCalls = orphanResult.changes
@@ -54,6 +56,7 @@ export function cleanAll(db: Database.Database): CleanAllResult {
   const syncedResult = db.prepare('DELETE FROM synced_records').run()
   const syncStateResult = db.prepare('DELETE FROM sync_record_state').run()
   const tombstonesResult = db.prepare('DELETE FROM sync_tombstones').run()
+  db.prepare('DELETE FROM sync_record_claims').run()
 
   const watermarkPath = join(AIUSAGE_DIR, 'watermark.json')
   let watermarkRemoved = false
