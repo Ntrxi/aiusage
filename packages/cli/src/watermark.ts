@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import type { Tool } from '@aiusage/core'
 
 const CURRENT_GROK_PARSER_VERSION = 1
+const CURRENT_CODEBUDDY_PARSER_VERSION = 1
 
 export interface WatermarkEntry {
   offset: number
@@ -48,6 +49,7 @@ export type FileWatermarkData = Record<Tool, Record<string, WatermarkEntry>>
 export interface WatermarkState {
   files: FileWatermarkData
   grokParserVersion?: number
+  codebuddyParserVersion?: number
   toolCallBackfillVersion?: number
   opencode?: OpenCodeCursor | null
   hermes?: HermesCursor | null
@@ -107,7 +109,7 @@ export class WatermarkManager {
 
   private load(): WatermarkState {
     if (!existsSync(this.path)) {
-      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION }
+      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION, codebuddyParserVersion: CURRENT_CODEBUDDY_PARSER_VERSION }
     }
     try {
       const content = readFileSync(this.path, 'utf-8')
@@ -120,6 +122,7 @@ export class WatermarkManager {
         state = {
           files: { ...defaultFileData(), ...(parsed.files ?? {}) },
           grokParserVersion: parsed.grokParserVersion,
+          codebuddyParserVersion: parsed.codebuddyParserVersion,
           toolCallBackfillVersion: parsed.toolCallBackfillVersion,
           opencode: parsed.opencode ?? null,
           hermes: parsed.hermes ?? null,
@@ -139,9 +142,15 @@ export class WatermarkManager {
         state.files.grok = {}
         state.grokParserVersion = CURRENT_GROK_PARSER_VERSION
       }
+      if ((state.codebuddyParserVersion ?? 0) < CURRENT_CODEBUDDY_PARSER_VERSION) {
+        // v1: codebuddy parser now counts usage on function_call lines; reset so
+        // historical files are re-parsed and previously dropped usage is backfilled.
+        state.files.codebuddy = {}
+        state.codebuddyParserVersion = CURRENT_CODEBUDDY_PARSER_VERSION
+      }
       return state
     } catch {
-      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION }
+      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION, codebuddyParserVersion: CURRENT_CODEBUDDY_PARSER_VERSION }
     }
   }
 

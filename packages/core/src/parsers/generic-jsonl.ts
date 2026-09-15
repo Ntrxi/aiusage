@@ -139,7 +139,16 @@ function shouldAccept(tool: Tool, parsed: any): boolean {
       || (parsed?.type === 'context.append_loop_event' && parsed?.event?.type === 'step.end')
   }
   if (tool === 'codebuddy') {
-    return parsed?.type === 'message' && parsed?.role === 'assistant'
+    if (parsed?.type === 'message' && parsed?.role === 'assistant') return true
+    // DeepSeek models attach each request's usage to the `function_call` line that
+    // triggered the next tool round; the final text-only reply is a separate
+    // `message` line with its own usage. Accept usage-bearing function_calls so
+    // tool-heavy turns are not undercounted (every usage line is one LLM request).
+    if (parsed?.type === 'function_call') {
+      const pd = parsed?.providerData
+      return Boolean(pd && typeof pd === 'object' && pd.rawUsage) || Boolean(parsed?.message?.usage)
+    }
+    return false
   }
   if (tool === 'omp' || tool === 'pi') {
     return parsed?.message?.role === 'assistant' || parsed?.role === 'assistant'
