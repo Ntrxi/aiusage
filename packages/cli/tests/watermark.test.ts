@@ -95,6 +95,16 @@ describe('WatermarkManager', () => {
     })
   })
 
+  it('persists the tool-call backfill version', () => {
+    const wm = new WatermarkManager(watermarkPath)
+    expect(wm.getToolCallBackfillVersion()).toBe(0)
+
+    wm.setToolCallBackfillVersion(1)
+    wm.save()
+
+    expect(new WatermarkManager(watermarkPath).getToolCallBackfillVersion()).toBe(1)
+  })
+
   it('migrates legacy flat watermark format to new envelope', () => {
     const legacyData = {
       'claude-code': { '/path/file.jsonl': { offset: 500, size: 500, mtime: 1000 } },

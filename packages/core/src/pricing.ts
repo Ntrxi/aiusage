@@ -12,6 +12,7 @@ export interface PriceEntry {
 // their pricing registry database instead of relying on package-bundled data.
 let basePriceTable: Record<string, PriceEntry> = {}
 let userOverrides: Record<string, PriceEntry> = {}
+const resolvedPriceCache = new Map<string, PriceEntry | undefined>()
 
 export const DEFAULT_PRICE_TABLE: Record<string, PriceEntry> = {}
 
@@ -24,12 +25,14 @@ export function getPriceTable(): Record<string, PriceEntry> {
 export function setBasePriceTable(table: Record<string, PriceEntry>): void {
   basePriceTable = { ...table }
   PRICE_TABLE = { ...basePriceTable, ...userOverrides }
+  resolvedPriceCache.clear()
 }
 
 export function setRuntimePriceTable(base: Record<string, PriceEntry>, overrides: Record<string, PriceEntry> = {}): void {
   basePriceTable = { ...base }
   userOverrides = { ...overrides }
   PRICE_TABLE = { ...basePriceTable, ...userOverrides }
+  resolvedPriceCache.clear()
 }
 
 export function getBasePriceTable(): Record<string, PriceEntry> {
@@ -39,12 +42,14 @@ export function getBasePriceTable(): Record<string, PriceEntry> {
 export function setPriceOverride(model: string, entry: PriceEntry): void {
   userOverrides = { ...userOverrides, [model]: entry }
   PRICE_TABLE = { ...basePriceTable, ...userOverrides }
+  resolvedPriceCache.clear()
 }
 
 export function removePriceOverride(model: string): void {
   const { [model]: _, ...rest } = userOverrides
   userOverrides = rest
   PRICE_TABLE = { ...basePriceTable, ...userOverrides }
+  resolvedPriceCache.clear()
 }
 
 export function getUserOverrides(): Record<string, PriceEntry> {
@@ -69,7 +74,10 @@ const PROVIDER_PREFIXES = [
  *      'z-ai/glm-5-20260211' matches 'glm-5'
  */
 export function resolvePrice(model: string): PriceEntry | undefined {
-  return resolvePriceFromTable(model, PRICE_TABLE)
+  if (resolvedPriceCache.has(model)) return resolvedPriceCache.get(model)
+  const price = resolvePriceFromTable(model, PRICE_TABLE)
+  resolvedPriceCache.set(model, price)
+  return price
 }
 
 export { resolvePriceFromTable }

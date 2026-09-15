@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { PRICE_TABLE, calculateCost, resolvePrice } from '../src/pricing.js'
+import { PRICE_TABLE, calculateCost, removePriceOverride, resolvePrice, setPriceOverride } from '../src/pricing.js'
 import { FALLBACK_RATE } from '../src/exchange-rate.js'
 import { TEST_PRICE_TABLE } from './setup.js'
 
@@ -181,5 +181,16 @@ describe('resolvePrice', () => {
     const entry = resolvePrice('kimi-k2-something-unknown')
     expect(entry).toBeDefined()
     expect(entry).toEqual(PRICE_TABLE['kimi-k2'])
+  })
+
+  it('invalidates cached misses when price overrides change', () => {
+    const model = 'cache-invalidation-test-model'
+    const entry = { input: 1, output: 2 } as const
+
+    expect(resolvePrice(model)).toBeUndefined()
+    setPriceOverride(model, entry)
+    expect(resolvePrice(model)).toEqual(entry)
+    removePriceOverride(model)
+    expect(resolvePrice(model)).toBeUndefined()
   })
 })

@@ -37,6 +37,8 @@ interface ToolPaths {
   paths: string[]
 }
 
+const CURRENT_TOOL_CALL_BACKFILL_VERSION = 1
+
 // Re-export for backward compatibility with other modules that import from here
 export { defaultOpenCodeDbPath, defaultHermesDbPath, defaultQoderDbPath, defaultCursorDbPath, defaultKiloDbPath, defaultGooseDbPath, defaultZedDbPath, defaultZcodeDbPath } from '../discovery.js'
 
@@ -1277,8 +1279,14 @@ export async function runParse(db: Database.Database, filterTool?: string, optio
   // turn_context line was before the watermark when they were parsed.
   backfillCodexModels(db)
 
-  // Backfill historical tool calls for parsers that previously missed newer event formats.
-  backfillMissingToolCalls(db, exchangeRate)
+  // Backfill historical tool calls once. Records that legitimately have no tool calls
+  // remain unmatched, so rerunning this scan on every refresh would repeatedly parse
+  // every historical source file and can block the dashboard for minutes.
+  if (wm.getToolCallBackfillVersion() < CURRENT_TOOL_CALL_BACKFILL_VERSION) {
+    await backfillMissingToolCalls(db, exchangeRate)
+    wm.setToolCallBackfillVersion(CURRENT_TOOL_CALL_BACKFILL_VERSION)
+    wm.save()
+  }
 
   return { parsedCount, toolCallCount, errors }
 }
@@ -1470,7 +1478,7 @@ function backfillCodexModels(db: Database.Database): void {
   }
 }
 
-function backfillMissingToolCalls(db: Database.Database, exchangeRate?: number): void {
+async function backfillMissingToolCalls(db: Database.Database, exchangeRate?: number): Promise<void> {
   const rows = db.prepare(`
     SELECT r.id, r.source_file, r.tool, r.line_offset, r.session_id
     FROM records r
@@ -1534,6 +1542,9 @@ function backfillMissingToolCalls(db: Database.Database, exchangeRate?: number):
     } catch {
       // File missing or unreadable — skip
     }
+    // The backfill can touch hundreds of files. Yield between them so an API server
+    // running in the same process can continue accepting requests during the one-time scan.
+    await new Promise<void>((resolve) => setImmediate(resolve))
   }
 }
 

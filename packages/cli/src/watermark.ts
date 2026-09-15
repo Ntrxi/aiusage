@@ -48,6 +48,7 @@ export type FileWatermarkData = Record<Tool, Record<string, WatermarkEntry>>
 export interface WatermarkState {
   files: FileWatermarkData
   grokParserVersion?: number
+  toolCallBackfillVersion?: number
   opencode?: OpenCodeCursor | null
   hermes?: HermesCursor | null
   qoder?: QoderCursor | null
@@ -119,6 +120,7 @@ export class WatermarkManager {
         state = {
           files: { ...defaultFileData(), ...(parsed.files ?? {}) },
           grokParserVersion: parsed.grokParserVersion,
+          toolCallBackfillVersion: parsed.toolCallBackfillVersion,
           opencode: parsed.opencode ?? null,
           hermes: parsed.hermes ?? null,
           qoder: parsed.qoder ?? null,
@@ -255,5 +257,13 @@ export class WatermarkManager {
 
   setCodeBuddyIdeCursor(ts: number): void {
     this.data.codebuddyIde = ts
+  }
+
+  getToolCallBackfillVersion(): number {
+    return this.data.toolCallBackfillVersion ?? 0
+  }
+
+  setToolCallBackfillVersion(version: number): void {
+    this.data.toolCallBackfillVersion = version
   }
 }
