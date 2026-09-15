@@ -17,12 +17,17 @@ pnpm build
 # Start in dev mode (builds core + web, then runs CLI dev server)
 pnpm dev
 
+# Optional: start the official site on port 4000 in another terminal
+pnpm dev:site
+
 # Run tests
 pnpm test
 
 # Lint
 pnpm lint
 ```
+
+`pnpm dev` serves the local dashboard at `http://127.0.0.1:3847`; it does not start the official site. For local account, device-authorization, or cloud-sync development, copy `packages/cli/.env.example` to `packages/cli/.env` so the CLI uses `SITE_URL=http://localhost:4000`, then keep `pnpm dev:site` running. Remove that override to use the production site.
 
 ## Project Structure
 

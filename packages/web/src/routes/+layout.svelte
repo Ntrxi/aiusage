@@ -9,7 +9,7 @@
   import {
     House, LayoutDashboard, Coins, DollarSign, Box,
     MessageSquare, FolderKanban, Wrench,
-    Gauge, Tag, Trophy, Settings, HelpCircle,
+    Gauge, Tag, Trophy, Settings,
     Sun, Moon, MonitorCog,
     Languages, PanelLeftClose, PanelLeftOpen, ExternalLink
   } from 'lucide-svelte'
@@ -45,7 +45,6 @@
         { path: '/pricing',    key: 'nav.pricing',   icon: Tag },
         { path: '/leaderboard', key: 'nav.leaderboard', icon: Trophy },
         { path: '/settings',   key: 'nav.settings',  icon: Settings },
-        { path: '/support',    key: 'nav.support',   icon: HelpCircle },
       ]
     }
   ]

@@ -45,7 +45,7 @@ npm install -g @juliantanx/aiusage
 aiusage serve
 ```
 
-打开 `http://127.0.0.1:3847` 即可使用仪表盘。`serve` 会在启动时解析一次本地日志，然后启动本地 Web UI。
+打开 `http://127.0.0.1:3847` 即可使用仪表盘。`serve` 会立即启动本地 Web UI，并在启动阶段于后台解析本地日志。
 
 使用 pnpm：
 
@@ -75,6 +75,7 @@ docker run -d \
 | `aiusage status` | 查看数据源和本地数据库状态 |
 | `aiusage export --range month` | 导出用量数据 |
 | `aiusage init` | 配置可选同步 |
+| `aiusage github login --repo OWNER/REPO` | 通过 GitHub App 连接 GitHub 同步 |
 | `aiusage sync` | 使用已配置的后端同步数据 |
 | `aiusage sync --repair` | 检查并修复跨设备同步污染（默认仅预览） |
 | `aiusage widget` | 启动桌面托盘小组件 |
@@ -93,6 +94,7 @@ docker run -d \
 | `Gemini CLI` | `Kimi Code` | `CodeBuddy` | `Kiro` | `Grok Build` |
 | `Antigravity` | `Roo Code` | `Zed` | `Goose` | `oh-my-pi` |
 | `pi` | `Craft` | `Droid` | `ZCode` | `CodeFuse` |
+| `Trae` | | | | |
 
 默认路径和环境变量覆盖方式见 [数据源](https://aiusage.jtanx.com/docs#settings-sources) 与 [数据源环境变量](https://aiusage.jtanx.com/docs#settings-env)。
 
@@ -131,6 +133,7 @@ AIUsage 采用本地优先设计。
 
 - **同步** 用于在自己的多台设备之间保持数据一致，支持 GitHub、S3、R2 或 MinIO。使用 `aiusage init` 配置，再运行 `aiusage sync`。
   GitHub 同步推荐使用 `aiusage github login --repo OWNER/REPO` 或本地设置中的 **连接 GitHub**，通过最小权限 GitHub App 授权，无需 AIUsage 账号。细粒度 PAT 仍作为高级备用方案。详见 [GitHub App 配置与迁移说明](docs/github-sync.md)。
+- **AIUsage Cloud 同步** 可在设备授权后使用：先运行 `aiusage login`，再运行 `aiusage init --backend cloud` 和 `aiusage sync`。
 - 如果 1.5.13 及更早版本产生了跨设备重复记录，可先用 `aiusage sync --repair` 检查，再决定是否执行清理。详见[同步修复指南](./docs/sync-repair.md)。
 - **排行榜** 面向明确选择分享聚合数据的用户。先用 `aiusage login` 授权设备，再运行 `aiusage upload`。
 - 参与排行榜时，可在 [站点设置](https://aiusage.jtanx.com/settings) 中开启匿名模式。
@@ -158,6 +161,8 @@ pnpm build
 pnpm test
 pnpm dev
 ```
+
+`pnpm dev` 会构建共享包，并只在 `http://127.0.0.1:3847` 启动本地仪表盘。若要让账号、授权或云同步流程连接本地官网，需要另行运行 `pnpm dev:site`（端口 `4000`），并在 `packages/cli/.env` 中设置 `SITE_URL=http://localhost:4000`。不设置该覆盖项时，CLI 使用 `https://aiusage.jtanx.com`。
 
 项目结构：
 
