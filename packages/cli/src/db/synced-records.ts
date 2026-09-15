@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
+import { UNKNOWN_DEVICE_INSTANCE_ID } from './records.js'
 
 export function insertSyncedRecord(db: Database.Database, record: SyncRecord): boolean {
   // Only replace if the incoming record is newer than what we already have.
@@ -67,8 +68,100 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 }
 
 /**
+ * Remove a pulled record from both `synced_records` and its merged copy in
+ * `records`. Locally parsed rows (`origin = 'local'`) are never touched.
+ * Returns true when a `synced_records` row was removed.
+ */
+export function deleteSyncedRecord(db: Database.Database, id: string): boolean {
+  const removed = db.prepare(`DELETE FROM synced_records WHERE id = ?`).run(id).changes > 0
+  db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`).run(id)
+  return removed
+}
+
+/**
+ * Make the local mirror of `owner`'s namespace match `remoteIds` exactly.
+ *
+ *  - Legacy rows stamped `'unknown'` (or empty) whose id is present in the
+ *    namespace are relabelled to `owner`: the namespace they sit in is the
+ *    device that parsed them, and exposing `'unknown'` as a device of its own
+ *    was a display bug.
+ *  - Rows attributed to `owner` whose id is no longer in the namespace are
+ *    removed from `synced_records`, together with their merged copies in
+ *    `records` (`origin = 'synced'` only). Locally parsed rows are never
+ *    deleted here.
+ *
+ * Returns the number of `synced_records` rows removed.
+ */
+export function reconcileSyncedNamespace(db: Database.Database, owner: string, remoteIds: Iterable<string>): number {
+  return db.transaction(() => {
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_remote_ids (id TEXT PRIMARY KEY)`)
+    db.exec(`DELETE FROM sync_remote_ids`)
+    const insert = db.prepare(`INSERT OR IGNORE INTO sync_remote_ids (id) VALUES (?)`)
+    for (const id of remoteIds) insert.run(id)
+
+    db.prepare(`
+      UPDATE synced_records SET device_instance_id = @owner
+      WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+        AND id IN (SELECT id FROM sync_remote_ids)
+    `).run({ owner })
+    db.prepare(`
+      UPDATE records SET device_instance_id = @owner
+      WHERE origin = 'synced'
+        AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+        AND id IN (SELECT id FROM sync_remote_ids)
+    `).run({ owner })
+
+    const pruned = db.prepare(`
+      DELETE FROM synced_records
+      WHERE device_instance_id = @owner
+        AND id NOT IN (SELECT id FROM sync_remote_ids)
+    `).run({ owner }).changes
+    db.prepare(`
+      DELETE FROM records
+      WHERE origin = 'synced'
+        AND device_instance_id = @owner
+        AND id NOT IN (SELECT id FROM sync_remote_ids)
+    `).run({ owner })
+
+    db.exec(`DELETE FROM sync_remote_ids`)
+    return pruned
+  })()
+}
+
+/**
+ * Drop legacy pulled rows still stamped `'unknown'` that no namespace read in
+ * this sync claims. Such rows can only be left over from an old client whose
+ * device has since re-published its namespace under its real id (the records
+ * arrive again under that id and the old copies would otherwise show up as a
+ * phantom third device). Returns the number of `synced_records` rows removed.
+ */
+export function pruneUnclaimedUnknownSyncedRecords(db: Database.Database, claimedIds: Iterable<string>): number {
+  return db.transaction(() => {
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_remote_ids (id TEXT PRIMARY KEY)`)
+    db.exec(`DELETE FROM sync_remote_ids`)
+    const insert = db.prepare(`INSERT OR IGNORE INTO sync_remote_ids (id) VALUES (?)`)
+    for (const id of claimedIds) insert.run(id)
+    const pruned = db.prepare(`
+      DELETE FROM synced_records
+      WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+        AND id NOT IN (SELECT id FROM sync_remote_ids)
+    `).run().changes
+    db.prepare(`
+      DELETE FROM records
+      WHERE origin = 'synced'
+        AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
+        AND id NOT IN (SELECT id FROM sync_remote_ids)
+    `).run()
+    db.exec(`DELETE FROM sync_remote_ids`)
+    return pruned
+  })()
+}
+
+/**
  * Merge synced_records into records table so API queries can see them.
- * Only inserts records that don't already exist in records.
+ * Inserts records that don't already exist in records and refreshes merged
+ * copies (`origin = 'synced'`) whose remote counterpart has been updated
+ * since, so both tables always describe the same remote state.
  *
  * Every row written here is stamped `origin = 'synced'` — that flag, not the
  * `source_file` value, is what marks it as pulled. `source_file` and `cwd`
@@ -84,11 +177,31 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 export function mergeSyncedRecordsIntoRecords(db: Database.Database, currentDeviceInstanceId?: string): number {
   const now = Date.now()
   const ownFilter = currentDeviceInstanceId !== undefined ? 'AND sr.device_instance_id != @currentDeviceInstanceId' : ''
+  const params = currentDeviceInstanceId !== undefined ? { currentDeviceInstanceId } : {}
+
+  // Refresh merged copies that fell behind their synced_records row.
+  db.prepare(`
+    UPDATE records SET
+      ts = sr.ts, updated_at = sr.updated_at, tool = sr.tool, model = sr.model, provider = sr.provider,
+      input_tokens = sr.input_tokens, output_tokens = sr.output_tokens,
+      cache_read_tokens = sr.cache_read_tokens, cache_write_tokens = sr.cache_write_tokens,
+      thinking_tokens = sr.thinking_tokens, cost = sr.cost, cost_source = sr.cost_source,
+      session_id = sr.session_key, device = sr.device, device_instance_id = sr.device_instance_id,
+      platform = sr.platform,
+      source_file = CASE WHEN sr.source_file != '' THEN sr.source_file ELSE records.source_file END,
+      cwd = sr.cwd
+    FROM synced_records sr
+    WHERE sr.id = records.id
+      AND records.origin = 'synced'
+      AND sr.updated_at > records.updated_at
+      ${ownFilter}
+  `).run(params)
+
   const newRows = db.prepare(`
     SELECT sr.* FROM synced_records sr
     LEFT JOIN records r ON sr.id = r.id
     WHERE r.id IS NULL ${ownFilter}
-  `).all(currentDeviceInstanceId !== undefined ? { currentDeviceInstanceId } : {}) as Record<string, unknown>[]
+  `).all(params) as Record<string, unknown>[]
 
   if (newRows.length === 0) return 0
 

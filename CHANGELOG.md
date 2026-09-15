@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Multi-device sync lost and duplicated records** — two machines sharing one GitHub or S3 sync target could report different totals, a phantom `unknown` device could appear, and ids retired by a local rebuild or by an id-generation change lived on remotely and on every peer. Root causes and fixes:
+  - *Antigravity (and Trae) wire-id collisions*: records were published under `sha256(device, sourceFile, lineOffset)`, but several Antigravity usage events share one generation index and every Trae session shares offset 0, so on one machine 972 local records became 929 remote ones. Both tools now publish under their parser-generated `record.id`.
+  - *Upsert-only namespaces*: upload merged into the remote day files and never removed anything, and pull never dropped rows that had vanished from a peer's namespace. Each device's namespace (`data/<deviceInstanceId>/`) is now an authoritative snapshot of its local database: upload rewrites only files whose content differs (S3/R2 ETags avoid even reading unchanged files), deletes day files with no local records left, and never touches another device's namespace; pull mirrors every foreign namespace exactly, removing `synced_records` rows and their merged copies that are no longer present remotely, scoped per sync target so switching repositories never prunes rows from the other one. Locally parsed records are never deleted by sync. A sync without changes writes nothing.
+  - *Legacy `unknown` device id*: local rows still stamped `unknown` are adopted by the current device before upload, and namespace lines stamped `unknown` are attributed to the namespace owner on pull, so `unknown` no longer shows up as a device.
+  - *Merged copies fell behind*: pulled rows updated remotely (e.g. after a cwd backfill on the origin device) are now refreshed in `records`, not only in `synced_records`.
+  - Migration v14 adds `sync_namespaces` and `sync_retired_wire_ids`; the old Antigravity/Trae ids already pushed to the cloud backend are retracted with tombstones, which other devices now honour on pull.
+  - `aiusage sync --repair` additionally reports and removes stale and duplicated lines in this device's namespace and reports wire-id collisions among local records. `aiusage sync` prints `pruned` and `retired` counts. See [`docs/sync-namespaces.md`](./docs/sync-namespaces.md) and [`docs/sync-repair.md`](./docs/sync-repair.md).
+
+---
+
 ## [1.5.17] - 2026-09-15
 
 ### Changed

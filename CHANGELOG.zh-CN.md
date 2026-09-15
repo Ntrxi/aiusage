@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 并遵循 [语义化版本控制](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+- **多设备同步丢失并重复记录** — 共用同一 GitHub 或 S3 同步目标的两台机器可能显示不同的总量，出现名为 `unknown` 的幽灵设备，而本地重建缓存或 ID 生成算法变更后作废的 ID 会永久残留在远端和所有对等设备上。原因与修复：
+  - *Antigravity（及 Trae）线路 ID 冲突*：记录此前以 `sha256(device, sourceFile, lineOffset)` 发布，但同一 generation 的多个用量事件共享同一索引，Trae 的所有会话共享偏移 0，导致某台机器上 972 条本地记录只剩 929 条远端记录。两者现在使用解析器生成的 `record.id` 发布。
+  - *只增不删的命名空间*：上传只会合并到远端日文件且从不删除，拉取也不会移除已从对等设备命名空间消失的行。现在每台设备的命名空间（`data/<deviceInstanceId>/`）是其本地数据库的权威快照：上传仅重写内容有变化的文件（S3/R2 ETag 可避免读取未变化的文件），删除已无本地记录的日文件，并且绝不触碰其他设备的命名空间；拉取精确镜像每个外部命名空间，移除远端已不存在的 `synced_records` 行及其合并副本，并按同步目标隔离，切换仓库不会误删来自另一目标的行。同步绝不删除本地解析的记录。无变化的同步不会写入任何内容。
+  - *历史 `unknown` 设备 ID*：仍标记为 `unknown` 的本地行在上传前会归属到当前设备；拉取时标记为 `unknown` 的行归属于命名空间所有者，`unknown` 不再显示为独立设备。
+  - *合并副本滞后*：远端更新过的已拉取行（例如源设备回填 cwd 之后）现在也会在 `records` 中刷新，而不只是 `synced_records`。
+  - 迁移 v14 新增 `sync_namespaces` 与 `sync_retired_wire_ids`；已推送到云端后端的旧 Antigravity/Trae ID 会以墓碑撤回，其他设备拉取时会应用墓碑。
+  - `aiusage sync --repair` 现在还会报告并清理本设备命名空间中的过期行和重复行，并报告本地记录间的线路 ID 冲突。`aiusage sync` 会输出 `pruned` 与 `retired` 计数。详见 [`docs/sync-namespaces.md`](./docs/sync-namespaces.md) 与 [`docs/sync-repair.md`](./docs/sync-repair.md)。
+
+---
+
 ## [1.5.17] - 2026-09-15
 
 ### 变更

@@ -63,6 +63,27 @@ export class S3SyncBackend {
 
   async listFiles(): Promise<string[]> {
     const files: string[] = []
+    for (const entry of await this.listEntries()) files.push(entry.path)
+    return files.sort()
+  }
+
+  /**
+   * Content digests from the listing: for single-part uploads (which is all
+   * this backend ever writes) the S3/R2 ETag is the hex MD5 of the object.
+   * Multipart ETags (containing '-') are not digests and are left out, so the
+   * orchestrator falls back to reading those files.
+   */
+  async listFileDigests(): Promise<Map<string, string>> {
+    const digests = new Map<string, string>()
+    for (const entry of await this.listEntries()) {
+      const etag = entry.etag?.replace(/^"|"$/g, '')
+      if (etag && /^[0-9a-f]{32}$/i.test(etag)) digests.set(entry.path, etag.toLowerCase())
+    }
+    return digests
+  }
+
+  private async listEntries(): Promise<Array<{ path: string; etag?: string }>> {
+    const entries: Array<{ path: string; etag?: string }> = []
     let continuationToken: string | undefined
 
     do {
@@ -78,7 +99,7 @@ export class S3SyncBackend {
           const key = obj.Key!
           const relPath = key.slice(this.prefix.length)
           if (relPath.endsWith('.ndjson')) {
-            files.push(relPath)
+            entries.push({ path: relPath, etag: obj.ETag })
           }
         }
       }
@@ -86,7 +107,7 @@ export class S3SyncBackend {
       continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined
     } while (continuationToken)
 
-    return files.sort()
+    return entries
   }
 
   async fileExists(path: string): Promise<boolean> {

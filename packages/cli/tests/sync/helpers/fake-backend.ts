@@ -7,6 +7,7 @@ import type { SyncBackend } from '../../../src/sync/index.js'
 export class FakeSyncBackend implements SyncBackend {
   readonly files = new Map<string, string>()
   readonly writes: Array<{ path: string; content: string }> = []
+  readonly deletes: string[] = []
   flushCount = 0
 
   async readFile(path: string): Promise<string | null> {
@@ -24,11 +25,17 @@ export class FakeSyncBackend implements SyncBackend {
 
   async deleteFile(path: string): Promise<void> {
     this.files.delete(path)
+    this.deletes.push(path)
   }
 
   async flush(): Promise<boolean> {
     this.flushCount++
     return true
+  }
+
+  /** Every path touched by a write or a delete, in order. */
+  get mutations(): string[] {
+    return [...this.writes.map(w => w.path), ...this.deletes]
   }
 
   /** All parsed lines currently stored under a namespace. */

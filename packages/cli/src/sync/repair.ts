@@ -3,11 +3,11 @@ import type { SyncRecord } from '@aiusage/core'
 import { generateSessionKey } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from '../db/records.js'
 import type { SyncBackend } from './index.js'
-import { parseSyncRecordLine } from './index.js'
+import { buildLocalSnapshot, parseSyncRecordLine } from './index.js'
 import { namespaceOwnerFromPath } from './ownership.js'
 
 /**
- * Opt-in cleanup of state left behind by the cross-device re-upload bug.
+ * Opt-in cleanup of state left behind by earlier sync bugs.
  *
  * Before `records.origin` existed, records pulled from device A were merged
  * into device B's `records` table and — because their `source_file` no longer
@@ -16,6 +16,12 @@ import { namespaceOwnerFromPath } from './ownership.js'
  * with a colliding id (`sha256(A, sourceFile, 0)`) and a session key that is
  * the hash of the original's session key. Echoes bounced back to A and to any
  * third device, double-counting usage everywhere.
+ *
+ * Before namespaces became authoritative snapshots, upload only ever merged
+ * into the remote files, so a record deleted or re-keyed locally (cache
+ * rebuild, id-algorithm change, Antigravity wire-id collision fix) left a
+ * *stale* line behind in the device's own namespace, and two local records
+ * mapping to the same wire id left one of them missing (*collision*).
  *
  * Nothing in this module runs automatically. `aiusage sync --repair` reports
  * what would change; `--apply` performs it. Every rule below is deterministic:
@@ -35,9 +41,22 @@ import { namespaceOwnerFromPath } from './ownership.js'
  *  - **own-device echo**: a `synced_records` row stamped with this device's own
  *    id. Pull never reads our own namespace, so our id can only appear there by
  *    bouncing through another device. The authoritative row is in `records`.
+ *  - **stale line**: a line in *this device's* namespace whose id is not
+ *    produced by any local record. The namespace is a snapshot of the local
+ *    database, so the line describes a record that no longer exists (or now
+ *    travels under a different id). Only this device can judge its own
+ *    namespace; other namespaces are never checked for staleness.
+ *  - **duplicate line**: the same wire id appearing more than once in one
+ *    namespace (across day files). Only the most recently updated copy is
+ *    kept.
+ *  - **wire-id collision** (report only): two local records that map to the
+ *    same wire id. The mapper is expected to make this impossible; a non-zero
+ *    count is a parser or mapper bug worth reporting.
  *
  * Deleting an echo never loses usage: by construction the parent it was
  * derived from still exists (or is itself an echo whose parent exists).
+ * Deleting a stale line never loses usage either: the local database is the
+ * source of truth for this device, and the next sync would drop it anyway.
  */
 
 /**
@@ -92,6 +111,8 @@ export interface LocalRepairPlan {
   echoMergedIds: string[]
   /** `sync_record_state` rows attached to non-local records. */
   staleSyncStateCount: number
+  /** Local records sharing a wire id (report only; the mapper should make this impossible). */
+  wireIdCollisions: Array<{ wireId: string; recordIds: string[] }>
 }
 
 interface SyncedRow {
@@ -167,7 +188,16 @@ export function planLocalRepair(
     WHERE record_id IN (SELECT id FROM records WHERE origin = 'synced')
   `).get() as { n: number }
 
-  return { reflagRecordIds, echoSyncedIds, echoMergedIds, staleSyncStateCount: stale.n + reflagRecordIds.length }
+  // 5. Wire-id collisions among this device's own records.
+  const { collisions } = buildLocalSnapshot(db, deviceInstanceId)
+
+  return {
+    reflagRecordIds,
+    echoSyncedIds,
+    echoMergedIds,
+    staleSyncStateCount: stale.n + reflagRecordIds.length,
+    wireIdCollisions: collisions,
+  }
 }
 
 export function applyLocalRepair(db: Database.Database, plan: LocalRepairPlan): void {
@@ -196,8 +226,22 @@ export interface RemoteFilePlan {
   totalLines: number
   foreignLines: number
   echoLines: number
+  /** Lines in this device's own namespace with no matching local record. */
+  staleLines: number
+  /** Older copies of an id that also appears elsewhere in the namespace. */
+  duplicateLines: number
   /** Lines that survive; the file is deleted when this is empty. */
   keptLines: string[]
+}
+
+export interface RemoteNamespaceSummary {
+  owner: string
+  files: number
+  lines: number
+  foreignLines: number
+  echoLines: number
+  staleLines: number
+  duplicateLines: number
 }
 
 export interface RemoteRepairPlan {
@@ -206,7 +250,7 @@ export interface RemoteRepairPlan {
   /** Every parsed line across all namespaces (used to seed the local parent index). */
   allRecords: SyncRecord[]
   files: RemoteFilePlan[]
-  namespaces: Array<{ owner: string; files: number; lines: number; foreignLines: number; echoLines: number }>
+  namespaces: RemoteNamespaceSummary[]
 }
 
 export interface RemoteRepairOptions {
@@ -215,10 +259,16 @@ export interface RemoteRepairOptions {
   allNamespaces?: boolean
   /** Extra known session keys (e.g. this device's local rows) to recognise echoes of. */
   sessionKeys?: SessionKeyChain
+  /**
+   * Wire ids this device currently publishes. When given, lines in the
+   * device's own namespace with any other id are stale. Other namespaces are
+   * never judged for staleness: only their owner knows their local state.
+   */
+  ownWireIds?: Set<string>
 }
 
 export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepairOptions): Promise<RemoteRepairPlan> {
-  const paths = await backend.listFiles()
+  const paths = (await backend.listFiles()).slice().sort()
   const chain = options.sessionKeys ?? new SessionKeyChain()
   const parsed: Array<{ path: string; owner: string; lines: Array<{ raw: string; record: SyncRecord | null }> }> = []
   const allRecords: SyncRecord[] = []
@@ -238,32 +288,56 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
     parsed.push({ path, owner, lines })
   }
 
+  // Duplicate detection: per namespace, the copy of an id with the highest
+  // updatedAt (ties: the first in path order) is the one to keep.
+  const best = new Map<string, Map<string, { path: string; index: number; updatedAt: number }>>()
+  for (const file of parsed) {
+    let perOwner = best.get(file.owner)
+    if (!perOwner) best.set(file.owner, perOwner = new Map())
+    file.lines.forEach(({ record }, index) => {
+      if (!record) return
+      const prev = perOwner!.get(record.id)
+      if (!prev || record.updatedAt > prev.updatedAt) perOwner!.set(record.id, { path: file.path, index, updatedAt: record.updatedAt })
+    })
+  }
+
   const files: RemoteFilePlan[] = []
-  const perNamespace = new Map<string, { owner: string; files: number; lines: number; foreignLines: number; echoLines: number }>()
+  const perNamespace = new Map<string, RemoteNamespaceSummary>()
 
   for (const file of parsed) {
-    const repairable = options.allNamespaces || file.owner === options.deviceInstanceId
-    const ns = perNamespace.get(file.owner) ?? { owner: file.owner, files: 0, lines: 0, foreignLines: 0, echoLines: 0 }
+    const isOwn = file.owner === options.deviceInstanceId
+    const repairable = options.allNamespaces || isOwn
+    const ns = perNamespace.get(file.owner) ?? { owner: file.owner, files: 0, lines: 0, foreignLines: 0, echoLines: 0, staleLines: 0, duplicateLines: 0 }
     ns.files++
     ns.lines += file.lines.length
     perNamespace.set(file.owner, ns)
+    const winners = best.get(file.owner)!
 
     let foreignLines = 0
     let echoLines = 0
+    let staleLines = 0
+    let duplicateLines = 0
     const keptLines: string[] = []
-    for (const { raw, record } of file.lines) {
-      if (!record) { keptLines.push(raw); continue }
+    file.lines.forEach(({ raw, record }, index) => {
+      if (!record) { keptLines.push(raw); return }
       const did = record.deviceInstanceId
       const foreign = !!did && did !== UNKNOWN_DEVICE_INSTANCE_ID && did !== file.owner
       const echo = !foreign && chain.isEcho(record)
+      const winner = winners.get(record.id)!
+      const duplicate = !foreign && !echo && !(winner.path === file.path && winner.index === index)
+      const stale = !foreign && !echo && !duplicate && isOwn && options.ownWireIds !== undefined && !options.ownWireIds.has(record.id)
       if (foreign) foreignLines++
       else if (echo) echoLines++
+      else if (duplicate) duplicateLines++
+      else if (stale) staleLines++
       else keptLines.push(raw)
-    }
+    })
     ns.foreignLines += foreignLines
     ns.echoLines += echoLines
-    if (repairable && (foreignLines > 0 || echoLines > 0)) {
-      files.push({ path: file.path, owner: file.owner, totalLines: file.lines.length, foreignLines, echoLines, keptLines })
+    ns.staleLines += staleLines
+    ns.duplicateLines += duplicateLines
+    if (repairable && (foreignLines > 0 || echoLines > 0 || staleLines > 0 || duplicateLines > 0)) {
+      files.push({ path: file.path, owner: file.owner, totalLines: file.lines.length, foreignLines, echoLines, staleLines, duplicateLines, keptLines })
     }
   }
 
@@ -324,7 +398,8 @@ export async function repairSyncContamination(db: Database.Database, options: Re
     // Seed the remote echo check with this device's local rows: an echo of a
     // record that was only ever uploaded from here still has its parent here.
     const sessionKeys = buildSessionKeyChain(db)
-    remote = await planRemoteRepair(backend, { deviceInstanceId, allNamespaces: options.allNamespaces, sessionKeys })
+    const ownWireIds = new Set(buildLocalSnapshot(db, deviceInstanceId).records.keys())
+    remote = await planRemoteRepair(backend, { deviceInstanceId, allNamespaces: options.allNamespaces, sessionKeys, ownWireIds })
   }
 
   const local = planLocalRepair(db, deviceInstanceId, remote?.allRecords)

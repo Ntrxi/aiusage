@@ -1,9 +1,16 @@
 import type Database from 'better-sqlite3'
-import type { SyncRecord, SyncTombstone } from '@aiusage/core'
-import { getUnsyncedRecords, isUploadableLocalRecord, markRecordsSynced, repairRecordProvenance } from '../db/records.js'
-import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
+import type { SyncRecord } from '@aiusage/core'
+import {
+  backfillUnknownDeviceInstanceId,
+  getUnsyncedRecords,
+  isUploadableLocalRecord,
+  markRecordsSynced,
+  repairRecordProvenance,
+} from '../db/records.js'
+import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../db/synced-records.js'
+import { clearRetiredWireIds, getRetiredWireIds } from '../db/sync-namespaces.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
-import { cloudPush, cloudPull, CloudSyncError } from './cloud.js'
+import { cloudPush, cloudPull, CloudSyncError, type CloudPulledTombstone } from './cloud.js'
 import type { SyncProgress } from './runtime.js'
 
 export interface CloudSyncOptions {
@@ -18,8 +25,14 @@ export interface CloudSyncResult {
   uploadedCount: number
   mergedCount: number
   syncGeneration: number
+  /** Pulled rows removed because their origin device retracted them (tombstones). */
+  prunedCount?: number
+  /** Wire ids this device retracted from the server (see migration v14). */
+  retiredCount?: number
   error?: string
 }
+
+const BATCH_SIZE = 500
 
 export class CloudSyncOrchestrator {
   private db: Database.Database
@@ -30,11 +43,16 @@ export class CloudSyncOrchestrator {
     this.options = options
   }
 
+  private get target(): string {
+    return this.options.target ?? 'cloud'
+  }
+
   async sync(syncGeneration: number = 1): Promise<CloudSyncResult> {
     try {
       // Step 0: provenance guard — rows stamped with another device's id are
-      // never local, whatever their source_file says.
+      // never local, whatever their source_file says — then adopt pre-init rows.
       repairRecordProvenance(this.db, this.options.deviceInstanceId)
+      backfillUnknownDeviceInstanceId(this.db, this.options.deviceInstanceId)
 
       // Step 1: Pull records from other devices
       this.options.onProgress?.({ phase: 'pulling', pulledCount: 0 })
@@ -54,19 +72,28 @@ export class CloudSyncOrchestrator {
         } catch {}
       }
 
+      // Step 2b: Apply tombstones — records their origin device retracted.
+      let prunedCount = 0
+      for (const tombstone of pullResult.tombstones) {
+        if (!tombstone.id || tombstone.device_instance_id === this.options.deviceInstanceId) continue
+        try {
+          if (deleteSyncedRecord(this.db, tombstone.id)) prunedCount++
+        } catch {}
+      }
+
       // Step 3: Merge synced_records into records
       this.options.onProgress?.({ phase: 'merging', pulledCount: insertedCount })
       const mergedCount = mergeSyncedRecordsIntoRecords(this.db, this.options.deviceInstanceId)
 
-      // Step 4: Push local records to cloud
+      // Step 4: Push local records to cloud, then retract retired wire ids.
       this.options.onProgress?.({ phase: 'uploading', pulledCount: insertedCount })
       const uploadedCount = await this.push(syncGeneration)
+      const retiredCount = await this.pushRetiredIds(syncGeneration)
 
       // Step 5: Mark local records as synced
-      const target = this.options.target ?? 'cloud'
-      const unsynced = this.getUploadableRecords(target)
+      const unsynced = this.getUploadableRecords(this.target)
       if (unsynced.length > 0) {
-        markRecordsSynced(this.db, unsynced.map(r => r.id), Date.now(), target)
+        markRecordsSynced(this.db, unsynced.map(r => r.id), Date.now(), this.target)
       }
 
       this.options.onProgress?.({
@@ -81,6 +108,8 @@ export class CloudSyncOrchestrator {
         uploadedCount,
         mergedCount,
         syncGeneration: pullResult.syncGeneration,
+        prunedCount,
+        retiredCount,
       }
     } catch (error) {
       const message = error instanceof CloudSyncError ? error.message
@@ -98,19 +127,21 @@ export class CloudSyncOrchestrator {
     }
   }
 
-  private async pullAll(syncGeneration: number): Promise<{ records: SyncRecord[]; syncGeneration: number }> {
+  private async pullAll(syncGeneration: number): Promise<{ records: SyncRecord[]; tombstones: CloudPulledTombstone[]; syncGeneration: number }> {
     const allRecords: SyncRecord[] = []
+    const allTombstones: CloudPulledTombstone[] = []
     let cursor: string | undefined
     let hasMore = true
 
     while (hasMore) {
       const result = await cloudPull(cursor, 1000)
       allRecords.push(...result.records)
+      allTombstones.push(...(result.tombstones ?? []))
       cursor = result.nextCursor
       hasMore = result.hasMore
     }
 
-    return { records: allRecords, syncGeneration }
+    return { records: allRecords, tombstones: allTombstones, syncGeneration }
   }
 
   /**
@@ -125,7 +156,7 @@ export class CloudSyncOrchestrator {
   }
 
   private async push(syncGeneration: number): Promise<number> {
-    const unsynced = this.getUploadableRecords(this.options.target ?? 'cloud')
+    const unsynced = this.getUploadableRecords(this.target)
     if (unsynced.length === 0) {
       return 0
     }
@@ -133,13 +164,29 @@ export class CloudSyncOrchestrator {
     // Convert to SyncRecord format
     const syncRecords = unsynced.map(mapStatsRecordToSyncRecord)
 
-    // Push in batches of 500
-    const BATCH_SIZE = 500
     for (let i = 0; i < syncRecords.length; i += BATCH_SIZE) {
       const batch = syncRecords.slice(i, i + BATCH_SIZE)
       await cloudPush(batch, [], this.options.deviceInstanceId, syncGeneration)
     }
 
     return unsynced.length
+  }
+
+  /**
+   * The cloud store is upsert-only, so wire ids this device will never publish
+   * again (migration v14: Antigravity/Trae records re-keyed to their parser
+   * ids) are retracted with tombstones. Each batch is forgotten locally only
+   * once the server accepted it, so an interrupted sync retries the rest.
+   */
+  private async pushRetiredIds(syncGeneration: number): Promise<number> {
+    const retired = getRetiredWireIds(this.db, this.target)
+    if (retired.length === 0) return 0
+    const now = Date.now()
+    for (let i = 0; i < retired.length; i += BATCH_SIZE) {
+      const batch = retired.slice(i, i + BATCH_SIZE)
+      await cloudPush([], batch.map(record_id => ({ record_id, updatedAt: now })), this.options.deviceInstanceId, syncGeneration)
+      clearRetiredWireIds(this.db, this.target, batch)
+    }
+    return retired.length
   }
 }
