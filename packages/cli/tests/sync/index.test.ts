@@ -115,9 +115,11 @@ describe('SyncOrchestrator', () => {
     expect(mockBackend.writeFile.mock.calls[0][0]).toBe('di1/2026/05/13.ndjson')
   })
 
-  it('merges with own previous upload data', async () => {
+  it('replaces its own namespace file with the local snapshot, dropping lines that no longer exist locally', async () => {
     db.prepare("INSERT INTO records (id, ts, ingested_at, updated_at, line_offset, tool, model, provider, session_id, source_file, device, device_instance_id) VALUES ('local-1', 2000, 2000, 2000, 0, 'claude-code', 'test', 'test', 's1', '/f1', 'd1', 'di1')").run()
 
+    // A line left behind by an earlier upload whose local record has since
+    // been deleted (or re-keyed). The namespace is authoritative, so it goes.
     const previousRecord: SyncRecord = {
       id: 'prev-1',
       ts: 1000,
@@ -137,7 +139,7 @@ describe('SyncOrchestrator', () => {
       updatedAt: 1000,
     }
 
-    mockBackend.listFiles.mockResolvedValue([])
+    mockBackend.listFiles.mockResolvedValue(['di1/1970/01/01.ndjson'])
     mockBackend.readFile.mockResolvedValue(JSON.stringify(previousRecord) + '\n')
     mockBackend.writeFile.mockResolvedValue(undefined)
 
@@ -149,11 +151,14 @@ describe('SyncOrchestrator', () => {
 
     const result = await orchestrator.sync()
     expect(result.uploadedCount).toBe(1)
+    expect(result.retiredCount).toBe(1)
 
+    expect(mockBackend.writeFile).toHaveBeenCalledTimes(1)
     const written = mockBackend.writeFile.mock.calls[0][1] as string
     const records = written.trim().split('\n').map((l: string) => JSON.parse(l))
-    expect(records).toHaveLength(2)
-    expect(records.some((r: any) => r.id === 'prev-1')).toBe(true)
+    expect(records).toHaveLength(1)
+    expect(records[0].id).toBe(generateSyncRecordId('di1', '/f1', 0))
+    expect(records.some((r: any) => r.id === 'prev-1')).toBe(false)
   })
 
   it('keeps newer record when local and remote have same sync id', async () => {
@@ -238,9 +243,11 @@ describe('SyncOrchestrator', () => {
     })
 
     const result = await orchestrator.sync()
-    // readFile called only for the other device's file
-    expect(mockBackend.readFile).toHaveBeenCalledTimes(1)
+    // Pull reads only the other device's file; our own file is handled by the
+    // upload phase (compared against the local snapshot, then retired here).
+    expect(mockBackend.readFile.mock.calls[0][0]).toBe('device-456/2026/05/13.ndjson')
     expect(result.pulledCount).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) AS n FROM synced_records').get()).toEqual({ n: 1 })
   })
 
   it('derives a daily device-partitioned sync path from timestamps', () => {

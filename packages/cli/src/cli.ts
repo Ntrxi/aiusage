@@ -408,9 +408,14 @@ program
       reporter.done()
       if (result.status === 'ok') {
         const ignored = 'ignoredCount' in result && result.ignoredCount ? `, ignored: ${result.ignoredCount} foreign` : ''
-        console.log(`✓ Sync complete — pulled: ${result.pulledCount}, merged: ${result.mergedCount}, uploaded: ${result.uploadedCount}${ignored}`)
+        const pruned = 'prunedCount' in result && result.prunedCount ? `, pruned: ${result.prunedCount} removed remotely` : ''
+        const retired = 'retiredCount' in result && result.retiredCount ? `, retired: ${result.retiredCount} stale remote` : ''
+        console.log(`✓ Sync complete — pulled: ${result.pulledCount}, merged: ${result.mergedCount}, uploaded: ${result.uploadedCount}${pruned}${retired}${ignored}`)
         if (ignored) {
           console.log('  Some remote lines belong to a different device than the namespace they are in. Run "aiusage sync --repair" for details.')
+        }
+        if ('collisionCount' in result && result.collisionCount) {
+          console.log(`  WARNING: ${result.collisionCount} local record(s) share a sync id with another record and were not uploaded. Run "aiusage sync --repair" for details.`)
         }
       } else if (result.status === 'blocked_pending_consent') {
         console.error(`✗ ${result.error}`)

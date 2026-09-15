@@ -220,15 +220,19 @@ export function formatRepairReport(report: RepairReport): string {
   lines.push(`  ${verb} ${report.local.echoSyncedIds.length} echoed row(s) from synced_records (copies of records that bounced through another device)`)
   lines.push(`  ${verb} ${report.local.echoMergedIds.length} merged copy(ies) of those echoes from records`)
   lines.push(`  ${verb} ${report.local.staleSyncStateCount} stale sync bookkeeping row(s)`)
+  if (report.local.wireIdCollisions.length > 0) {
+    const affected = report.local.wireIdCollisions.reduce((n, c) => n + c.recordIds.length, 0)
+    lines.push(`  WARNING: ${report.local.wireIdCollisions.length} wire id(s) shared by ${affected} extra local record(s) — those records cannot be synced; please report this with the tool names involved`)
+  }
   if (report.remote) {
     lines.push('')
     lines.push(`Remote: scanned ${report.remote.scannedFiles} file(s), ${report.remote.scannedLines} line(s)`)
     for (const ns of report.remote.namespaces) {
       const own = ns.owner === report.deviceInstanceId ? ' (this device)' : ''
-      const bad = ns.foreignLines + ns.echoLines
-      lines.push(`  ${ns.owner}${own}: ${ns.lines} line(s) in ${ns.files} file(s), ${bad} contaminated (${ns.foreignLines} foreign-device, ${ns.echoLines} echo)`)
+      const bad = ns.foreignLines + ns.echoLines + ns.staleLines + ns.duplicateLines
+      lines.push(`  ${ns.owner}${own}: ${ns.lines} line(s) in ${ns.files} file(s), ${bad} to drop (${ns.foreignLines} foreign-device, ${ns.echoLines} echo, ${ns.staleLines} stale, ${ns.duplicateLines} duplicate)`)
     }
-    const dropped = report.remote.files.reduce((n, f) => n + f.foreignLines + f.echoLines, 0)
+    const dropped = report.remote.files.reduce((n, f) => n + f.foreignLines + f.echoLines + f.staleLines + f.duplicateLines, 0)
     lines.push(`  ${verb} ${dropped} line(s) across ${report.remote.files.length} file(s)`)
     if (report.remoteResult) {
       lines.push(`  Rewrote ${report.remoteResult.rewritten} file(s), deleted ${report.remoteResult.deleted} empty file(s), ${report.remoteResult.flushed ? 'pushed' : 'nothing to push'}`)

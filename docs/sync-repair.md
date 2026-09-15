@@ -1,8 +1,11 @@
 # Repairing cross-device sync contamination
 
 Versions up to 1.5.13 could copy records pulled from one device into another
-device's sync namespace. This document explains how to tell legitimate records
-from copies, and how to clean up existing data with `aiusage sync --repair`.
+device's sync namespace, and versions up to 1.5.16 never removed a record from
+a namespace once it had been uploaded. This document explains how to tell
+legitimate records from copies and leftovers, and how to clean up existing
+data with `aiusage sync --repair`. The current sync model is described in
+[`sync-namespaces.md`](./sync-namespaces.md).
 
 ## What went wrong
 
@@ -53,13 +56,38 @@ Every rule is deterministic; none of them looks at `source_file`.
 | Remote namespace | A line whose `deviceInstanceId` is a concrete id different from the namespace owner. | Only the owning device writes to its namespace, and after the fix it writes only its own records. |
 | Remote or local | A line/row E is an *echo* when a session key K known anywhere in the system (any namespace, any local row) exists such that `sha256(E.device + "\0" + K)[0:24] === E.sessionKey`. | Re-uploading a merged row hashes its already-hashed session key. A genuine session key is the hash of a tool-generated session id, never of another session's 24-hex key. Usage fields are not compared because backfills may rewrite model, cost or timestamps on the origin device after the echo was taken. |
 | Local `synced_records` | A row stamped with this device's own id. | Pull never reads our own namespace, so our id can only appear there by bouncing through another device. The authoritative row is in `records`. |
+| **This device's** namespace | A *stale* line: its id is not produced by any record in the local database. | The namespace is a snapshot of this device's database (see [`sync-namespaces.md`](./sync-namespaces.md)). The record was deleted, the cache was rebuilt with different ids, or the record now travels under a different id (Antigravity/Trae since 1.5.17). Only the owning device can judge this, so other namespaces are never checked for staleness. |
+| Any namespace | A *duplicate* line: the same id appears more than once in one namespace (usually across day files after a record's timestamp changed). | Only the copy with the highest `updatedAt` is kept. |
+| Local `records` | A *wire-id collision*: two local records that map to the same sync id. | Reported, never deleted. The mapper is expected to make this impossible; a non-zero count is a bug worth reporting with the tool names involved. Until fixed, only the most recently updated record of each group is uploaded. |
 
 Lines with `deviceInstanceId = 'unknown'` are records parsed before
-`aiusage init` created `state.json`. They are legitimate for the namespace they
-sit in and are only removed when the echo rule matches.
+`aiusage init` created `state.json`. On pull they are attributed to the
+namespace owner; in this device's own namespace they are stale unless the
+local database still holds the record (in which case the next sync republishes
+it under the real device id anyway).
 
 Removing an echo never loses usage: by construction the parent it was derived
 from still exists (the origin device's own row or its own namespace line).
+Removing a stale line never loses usage either: the local database is the
+source of truth for this device and a normal `aiusage sync` drops it as well.
+
+## Stale records left by 1.5.16 and earlier
+
+Upload used to *merge* into the remote day files and never removed anything,
+and pull never removed rows that had disappeared from a peer's namespace. So
+after rebuilding a local cache, correcting records, or changing how ids are
+derived, the old ids stayed in the namespace and on every peer, and totals
+diverged between machines. In addition, Antigravity records were published
+under `sha256(device, sourceFile, lineOffset)`; several usage events of one
+generation share that key, so on one machine 972 local records became 929
+remote ones. The same applied to Trae sessions (all at offset 0).
+
+Since 1.5.17 both are fixed structurally: every sync rewrites the device's
+namespace as a snapshot of its database and prunes peer rows that vanished
+remotely, and Antigravity/Trae publish under their parser-generated ids. The
+first sync after upgrading cleans up automatically on every device that runs
+it; `--repair` is only needed to inspect the state before that, or to clean
+namespaces of devices that will never sync again.
 
 ## Automatic migration (v13)
 
@@ -83,9 +111,10 @@ aiusage sync --repair                    # dry run: this device's namespace + lo
 aiusage sync --repair --all-namespaces   # dry run, also inspect other devices' namespaces
 ```
 
-The report lists, per namespace, how many lines are foreign-device lines and
-how many are echoes, plus the local rows that would be re-flagged or removed.
-Apply it with:
+The report lists, per namespace, how many lines are foreign-device lines,
+echoes, stale (this device's namespace only) or duplicates, plus the local
+rows that would be re-flagged or removed and any wire-id collisions among
+local records. Apply it with:
 
 ```
 aiusage sync --repair --apply
@@ -98,9 +127,9 @@ aiusage sync --repair --apply --all-namespaces
 2. deletes echo rows from `synced_records` and their merged copies in
    `records` (the originals remain),
 3. removes stale `sync_record_state` rows,
-4. rewrites the contaminated remote files without the foreign/echo lines
-   (deleting a file only if nothing legitimate is left), then commits and
-   pushes (GitHub) or uploads (S3).
+4. rewrites the affected remote files without the foreign, echo, stale and
+   duplicate lines (deleting a file only if nothing legitimate is left), then
+   commits and pushes (GitHub) or uploads (S3).
 
 Recommended order for a fleet of devices:
 

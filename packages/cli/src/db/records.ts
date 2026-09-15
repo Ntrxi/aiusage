@@ -203,3 +203,37 @@ function mapRowToRecord(row: Record<string, unknown>): StatsRecord {
     origin: ((row.origin as string) || 'local') as RecordOrigin,
   }
 }
+
+/**
+ * Re-label locally parsed rows that still carry the pre-init `'unknown'`
+ * sentinel with the real device id. Only `origin = 'local'` rows qualify: a
+ * pulled row is never relabelled, whatever its device id says. Returns the
+ * number of rows updated.
+ */
+export function backfillUnknownDeviceInstanceId(db: Database.Database, deviceInstanceId: string, device?: string): number {
+  if (!deviceInstanceId || deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID) return 0
+  const result = device !== undefined
+    ? db.prepare(`
+        UPDATE records SET device_instance_id = ?, device = ?
+        WHERE device_instance_id = '${UNKNOWN_DEVICE_INSTANCE_ID}' AND ${LOCAL_RECORDS_WHERE}
+      `).run(deviceInstanceId, device)
+    : db.prepare(`
+        UPDATE records SET device_instance_id = ?
+        WHERE device_instance_id = '${UNKNOWN_DEVICE_INSTANCE_ID}' AND ${LOCAL_RECORDS_WHERE}
+      `).run(deviceInstanceId)
+  return result.changes
+}
+
+/**
+ * The complete, authoritative set of records this device publishes: every
+ * locally parsed row stamped with its id. This is what a sync snapshot of the
+ * device's remote namespace is built from — never a delta.
+ */
+export function getLocalRecordsForDevice(db: Database.Database, deviceInstanceId: string): StatsRecord[] {
+  const rows = db.prepare(`
+    SELECT * FROM records
+    WHERE ${LOCAL_RECORDS_WHERE} AND device_instance_id = ?
+    ORDER BY ts, id
+  `).all(deviceInstanceId) as Record<string, unknown>[]
+  return rows.map(mapRowToRecord)
+}

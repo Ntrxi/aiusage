@@ -15,6 +15,12 @@ const RECORD_ID_SYNC_TOOLS = new Set<Tool>([
   'roocode',
   'zcode',
   'codefuse',
+  // Parser-generated ids are the only unique key for these: several Antigravity
+  // usage events share one generation index (their lineOffset), and every Trae
+  // session in a database shares offset 0, so (device, sourceFile, lineOffset)
+  // collapses distinct records into one wire id.
+  'antigravity',
+  'trae',
 ])
 
 export function mapStatsRecordToSyncRecord(record: StatsRecord): SyncRecord {

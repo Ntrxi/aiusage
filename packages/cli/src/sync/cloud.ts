@@ -1,4 +1,4 @@
-import type { SyncRecord, SyncTombstone } from '@aiusage/core'
+import type { SyncRecord } from '@aiusage/core'
 import { computeHmac, sha256, generateNonce, generateIdempotencyKey, buildCanonicalString } from '../leaderboard/crypto.js'
 import { loadCredentials } from '../leaderboard/credentials.js'
 import { getSiteUrl } from '../site-url.js'
@@ -6,9 +6,26 @@ import { getSiteUrl } from '../site-url.js'
 const SYNC_PUSH_PATH = '/api/cli/sync/push'
 const SYNC_PULL_PATH = '/api/cli/sync/pull'
 
+/**
+ * Tombstone as the server returns it from `/sync/pull` (snake_case fields).
+ * `SyncTombstone` from core describes the local table, not this wire shape.
+ */
+export interface CloudPulledTombstone {
+  id: string
+  device_instance_id?: string
+  deleted_at?: string | number
+  updated_at?: number
+}
+
+/** Tombstone as `/sync/push` expects it: the wire id of a record this device retracts. */
+export interface CloudPushTombstone {
+  record_id: string
+  updatedAt: number
+}
+
 export interface PullResult {
   records: SyncRecord[]
-  tombstones: SyncTombstone[]
+  tombstones: CloudPulledTombstone[]
   nextCursor?: string
   hasMore: boolean
   syncGeneration: number
@@ -67,7 +84,7 @@ async function readJsonOrNull(response: Response): Promise<Record<string, unknow
 
 export async function cloudPush(
   records: SyncRecord[],
-  tombstones: SyncTombstone[],
+  tombstones: CloudPushTombstone[],
   deviceInstanceId: string,
   syncGeneration: number
 ): Promise<PushResult> {
@@ -147,7 +164,7 @@ export async function cloudPull(
 
   return {
     records: (data.records as SyncRecord[]) || [],
-    tombstones: (data.tombstones as SyncTombstone[]) || [],
+    tombstones: (data.tombstones as CloudPulledTombstone[]) || [],
     nextCursor: data.next_cursor as string | undefined,
     hasMore: (data.has_more as boolean) || false,
     syncGeneration: (data.sync_generation as number) || 1,
