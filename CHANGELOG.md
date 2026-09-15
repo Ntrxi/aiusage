@@ -5,14 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.17] - 2026-09-15
 
 ### Changed
 - **Local dashboard navigation** — hide the Service & Support item from the sidebar; the `/support` page remains available by direct URL.
 - **Responsive startup parsing** — start listening before the initial parse, yield during historical tool-call backfill, and cache pricing lookups so large local histories do not block the dashboard.
 
 ### Fixed
-- **Local calendar ranges** ([#62](https://github.com/juliantanx/aiusage/pull/62)) — build custom range boundaries and daily aggregation buckets from local calendar dates instead of UTC dates.
+- **Local calendar ranges** ([#62](https://github.com/juliantanx/aiusage/pull/62) by [@Ntrxi](https://github.com/Ntrxi)) — build custom range boundaries and daily aggregation buckets from local calendar dates instead of UTC dates.
 
 ---
 
@@ -477,6 +477,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.17]: https://github.com/juliantanx/aiusage/compare/v1.5.16...v1.5.17
 [1.5.16]: https://github.com/juliantanx/aiusage/compare/v1.5.15...v1.5.16
 [1.5.15]: https://github.com/juliantanx/aiusage/compare/v1.5.14...v1.5.15
 [1.5.14]: https://github.com/juliantanx/aiusage/compare/v1.5.13...v1.5.14
