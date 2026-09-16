@@ -142,7 +142,10 @@ Then, per namespace owner:
 
 Rows attributed to `unknown` that no target claims are dropped: they can only
 be leftovers from a namespace that has since been republished under its real
-device id.
+device id. They are dropped only in a sync during which every namespace on the
+target was read reliably; while any namespace is skipped, the rows it may
+still hold have not been relabelled or claimed, so nothing stamped `unknown`
+is touched.
 
 ### Upload
 
@@ -160,12 +163,27 @@ groups the result by day file, and compares each file with the remote copy:
 
 Files that differ are written in full, **then** the manifest is written if it
 changed, **then** files for days that no longer have any local record are
-deleted (the manifest first, when the namespace becomes empty). Canonical
-content is one JSON line per record sorted by id, so identical snapshots always
-produce identical bytes and identical manifests.
+deleted. A namespace that becomes empty publishes an *empty* manifest first,
+deletes its day files, and removes the manifest last, so at no point does a
+peer find leftover day files without a manifest (which it would read as a
+legacy namespace and keep mirroring). Canonical content is one JSON line per
+record sorted by id, so identical snapshots always produce identical bytes and
+identical manifests.
 
 A sync with no local changes therefore performs no writes. With the GitHub
 backend nothing is committed or pushed; with S3 no `PutObject` is issued.
+
+### Remote cleanup
+
+`aiusage clean --before <days>` also removes records from the remote day files
+of every namespace. It follows the same rules as upload: within a namespace
+the kept records are rewritten in canonical form, **then** the manifest is
+refreshed to name exactly the files that remain (an empty manifest when the
+namespace empties out), **then** day files left without a record are deleted.
+An interrupted cleanup therefore leaves a namespace peers either skip (the
+previous manifest no longer matches) or mirror correctly. A namespace without
+a manifest — still written by a pre-manifest client — does not acquire one,
+since that client would never maintain it.
 
 ### Atomicity and interruptions
 
@@ -227,9 +245,15 @@ Because reconciliation deletes local rows, the backends never mask errors:
 The cloud store is upsert-only on the way up: `push` never deletes anything,
 and retired wire ids are retracted with tombstones. On the way down a pull
 reads every page of the server's current generation, so a completed pull is
-the authoritative list of what the cloud carries. It is reconciled exactly like
-a file-based target: every device the cloud claimed before is reconciled
-against what came back for it, and rows no target claims any more are removed.
+the authoritative list of what the cloud carries. The generation is pinned by
+the first page: if a later page reports another one, the server's data was
+cleared mid-pull and the pull starts over (a pull that cannot observe one
+stable generation fails rather than stitching two generations into one
+snapshot). The pushes that follow go out under the generation the pull
+observed, so a client that last synced before the server was cleared is not
+rejected as stale. A completed pull is reconciled exactly like a file-based
+target: every device the cloud claimed before is reconciled against what came
+back for it, and rows no target claims any more are removed.
 When the server's data is cleared (`aiusage clean --all` advances the server's
 `sync_generation`) the next pull returns neither records nor tombstones for the
 old devices; their cloud claims are released and their rows go unless another

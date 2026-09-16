@@ -5,6 +5,7 @@ import type { StatsRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord, deleteRecordsBySourceFile } from '../../src/db/records.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
+import { manifestPath, parseManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
 import { runParseAntigravity } from '../../src/commands/parse-antigravity.js'
 import { generateSummary } from '../../src/commands/summary.js'
@@ -243,8 +244,13 @@ describe('authoritative device namespaces', () => {
     const a = await sync(dbA, backend, A)
     expect(a.status).toBe('ok')
     expect(backend.files.size).toBe(0)
-    // Manifest first, so a peer never finds a manifest naming a missing file.
-    expect(backend.deletes).toEqual([`${A}/manifest.json`, `${A}/2026/09/06.ndjson`])
+    // An empty manifest is published first (a peer never finds a manifest
+    // naming a missing file, nor a manifest-less leftover), the day file is
+    // deleted next, and the empty manifest is removed last.
+    const lastWrite = backend.writes[backend.writes.length - 1]
+    expect(lastWrite.path).toBe(manifestPath(A))
+    expect(parseManifest(lastWrite.content)).toEqual({ version: 1, files: {} })
+    expect(backend.deletes).toEqual([`${A}/2026/09/06.ndjson`, `${A}/manifest.json`])
   })
 
   it('is idempotent: a second sync without changes performs zero writes', async () => {

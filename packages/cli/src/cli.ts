@@ -295,6 +295,7 @@ program
           all: isAll,
           beforeDays: isAll ? undefined : days,
           target: options.target,
+          deviceInstanceId: getState(AIUSAGE_DIR)?.deviceInstanceId,
         })
         for (const r of propagation.backends) {
           if (r.status === 'ok') {

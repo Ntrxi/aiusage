@@ -2,7 +2,11 @@ import type Database from 'better-sqlite3'
 import { unlinkSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { AIUSAGE_DIR, loadConfig } from '../config.js'
+import type { SyncRecord } from '@aiusage/core'
 import { cloudClear } from '../sync/cloud.js'
+import type { SyncBackend } from '../sync/index.js'
+import { buildManifest, isManifestPath, manifestPath, parseNdjsonLines, serializeManifest, serializeSnapshot } from '../sync/manifest.js'
+import { namespaceOwnerFromPath } from '../sync/ownership.js'
 import { createBackend } from './sync.js'
 import { dropDanglingClaims } from '../db/sync-claims.js'
 
@@ -93,10 +97,83 @@ export function getRemoteBackends(): RemoteBackend[] {
 }
 
 
+export interface RemoteCleanResult {
+  removedRecords: number
+  /** Day files rewritten or deleted (manifests not included). */
+  modifiedFiles: number
+}
+
+/**
+ * Remove every record older than `cutoff` from the day files on a file-based
+ * target, namespace by namespace, following the snapshot rules of sync and
+ * `sync --repair` so peers keep verifying the namespaces that changed: the
+ * kept records are rewritten in canonical form, **then** the namespace
+ * manifest is refreshed, **then** day files left without a record are
+ * deleted. An interrupted run therefore leaves either the previous manifest
+ * (a mismatch peers skip) or a manifest describing exactly the files that
+ * remain. The manifest is refreshed for this device's own namespace and for
+ * every namespace that already carried one; a namespace still written by a
+ * pre-manifest client is left without, as that client would never maintain
+ * it.
+ */
+export async function cleanRemoteBefore(backend: SyncBackend, cutoff: number, deviceInstanceId?: string): Promise<RemoteCleanResult> {
+  const paths = (await backend.listFiles()).filter(p => p.endsWith('.ndjson') && !isManifestPath(p)).sort()
+  const byOwner = new Map<string, string[]>()
+  for (const path of paths) {
+    const owner = namespaceOwnerFromPath(path)
+    if (!byOwner.has(owner)) byOwner.set(owner, [])
+    byOwner.get(owner)!.push(path)
+  }
+
+  let removedRecords = 0
+  let modifiedFiles = 0
+  for (const [owner, ownerPaths] of byOwner) {
+    const rewrites: Array<{ path: string; content: string }> = []
+    const deletions: string[] = []
+    const finalFiles = new Map<string, SyncRecord[]>()
+    for (const path of ownerPaths) {
+      const content = await backend.readFile(path)
+      if (!content) continue
+      const { records } = parseNdjsonLines(content)
+      const kept = records.filter(record => record.ts >= cutoff)
+      const rel = path.slice(owner.length + 1)
+      if (kept.length === records.length) {
+        if (records.length > 0) finalFiles.set(rel, records)
+        continue
+      }
+      removedRecords += records.length - kept.length
+      if (kept.length === 0) {
+        deletions.push(path)
+      } else {
+        rewrites.push({ path, content: serializeSnapshot(kept) })
+        finalFiles.set(rel, kept)
+      }
+    }
+    if (rewrites.length === 0 && deletions.length === 0) continue
+
+    for (const { path, content } of rewrites) {
+      await backend.writeFile(path, content)
+      modifiedFiles++
+    }
+    const hadManifest = (await backend.readFile(manifestPath(owner))) !== null
+    if (owner === deviceInstanceId || hadManifest) {
+      await backend.writeFile(manifestPath(owner), serializeManifest(buildManifest(finalFiles)))
+    }
+    for (const path of deletions) {
+      if (backend.deleteFile) await backend.deleteFile(path)
+      else await backend.writeFile(path, '')
+      modifiedFiles++
+    }
+  }
+  return { removedRecords, modifiedFiles }
+}
+
 export async function propagateClean(options: {
   all: boolean
   beforeDays?: number
   target?: string
+  /** This device's id, so that its own namespace always gets a refreshed manifest. */
+  deviceInstanceId?: string
 }): Promise<CleanPropagationResult> {
   const config = loadConfig()
   if (!config?.sync) return { backends: [] }
@@ -158,39 +235,7 @@ export async function propagateClean(options: {
       })
     } else if (options.beforeDays) {
       const cutoff = Date.now() - options.beforeDays * 86400000
-      const files = await backend.listFiles()
-      let removedRecords = 0
-      let modifiedFiles = 0
-
-      for (const file of files) {
-        const content = await backend.readFile(file)
-        if (!content) continue
-
-        const lines = content.split('\n').filter(Boolean)
-        const kept: string[] = []
-        for (const line of lines) {
-          try {
-            const record = JSON.parse(line)
-            const ts = typeof record.ts === 'string' ? new Date(record.ts).getTime() : record.ts
-            if (ts >= cutoff) {
-              kept.push(line)
-            } else {
-              removedRecords++
-            }
-          } catch {
-            kept.push(line)
-          }
-        }
-
-        if (kept.length === 0) {
-          await backend.deleteFile?.(file)
-          modifiedFiles++
-        } else if (kept.length < lines.length) {
-          await backend.writeFile(file, kept.join('\n') + '\n')
-          modifiedFiles++
-        }
-      }
-
+      const { removedRecords, modifiedFiles } = await cleanRemoteBefore(backend, cutoff, options.deviceInstanceId)
       await backend.flush?.()
       results.push({
         backend: {

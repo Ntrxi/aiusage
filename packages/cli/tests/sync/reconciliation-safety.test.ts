@@ -4,6 +4,7 @@ import { generateRecordId } from '@aiusage/core'
 import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
+import { getClaimingTargets } from '../../src/db/sync-claims.js'
 import { SyncOrchestrator, serializeSnapshot } from '../../src/sync/index.js'
 import { buildManifest, manifestPath, parseManifest, serializeManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
@@ -71,6 +72,8 @@ class FlakyBackend extends FakeSyncBackend {
   vanished = new Set<string>()
   /** Number of writes still allowed before writeFile throws. */
   writeBudget = Infinity
+  /** Number of deletions still allowed before deleteFile throws. */
+  deleteBudget = Infinity
 
   override async listFiles(): Promise<string[]> {
     if (this.listError) throw this.listError
@@ -88,6 +91,12 @@ class FlakyBackend extends FakeSyncBackend {
     if (this.writeBudget <= 0) throw new Error('simulated network failure during PutObject')
     this.writeBudget--
     return super.writeFile(path, content)
+  }
+
+  override async deleteFile(path: string): Promise<void> {
+    if (this.deleteBudget <= 0) throw new Error('simulated network failure during DeleteObject')
+    this.deleteBudget--
+    return super.deleteFile(path)
   }
 }
 
@@ -299,6 +308,69 @@ describe('destructive reconciliation fails closed', () => {
       expect(rb).toMatchObject({ status: 'ok', pulledCount: 0, prunedCount: 0, skippedNamespaces: 0 })
       expect(backend.mutations.length).toBe(mutations)
     }
+  })
+
+  it('publishes an empty manifest before deleting the last day files, so an interrupted wipe is never read as a legacy namespace', async () => {
+    // A drops every local record; its upload is interrupted after the manifest
+    // and before the day file could be deleted.
+    dbA.prepare(`DELETE FROM records WHERE origin = 'local'`).run()
+    backend.deleteBudget = 0
+    const a = await sync(dbA, backend, A)
+    expect(a.status).toBe('failed')
+    expect(backend.files.has(`${A}/2026/09/06.ndjson`)).toBe(true)
+    expect(parseManifest(backend.files.get(manifestPath(A))!)).toEqual({ version: 1, files: {} })
+
+    // The leftover file is not named by the manifest: the peer mirrors the
+    // empty snapshot instead of keeping the stale rows as a legacy namespace.
+    const b = await sync(dbB, backend, B)
+    expect(b).toMatchObject({ status: 'ok', skippedNamespaces: 0, prunedCount: 3 })
+    expect(syncedIds(dbB, A)).toEqual([])
+    expect(mergedCount(dbB, A)).toBe(0)
+
+    // The owner completes: the day file goes, then the empty manifest.
+    backend.deleteBudget = Infinity
+    const a2 = await sync(dbA, backend, A)
+    expect(a2.status).toBe('ok')
+    expect([...backend.files.keys()].filter(p => p.startsWith(`${A}/`))).toEqual([])
+    expect(backend.deletes).toEqual([`${A}/2026/09/06.ndjson`, manifestPath(A)])
+    const b2 = await sync(dbB, backend, B)
+    expect(b2).toMatchObject({ status: 'ok', prunedCount: 0, skippedNamespaces: 0 })
+    expect(syncedIds(dbB, A)).toEqual([])
+    const a3 = await sync(dbA, backend, A)
+    expect(a3).toMatchObject({ status: 'ok', writtenFiles: 0 })
+  })
+
+  it('never prunes unclaimed legacy "unknown" rows while any namespace could not be read reliably', async () => {
+    // Two rows B mirrored before claims existed (migration v14): a line of C
+    // that an old client had written stamped 'unknown', and one that is
+    // genuinely stale (its id is published nowhere any more).
+    const cId = syncedIds(dbB, C)[0]
+    dbB.prepare(`DELETE FROM sync_record_claims WHERE record_id = ?`).run(cId)
+    dbB.prepare(`UPDATE synced_records SET device_instance_id = 'unknown' WHERE id = ?`).run(cId)
+    dbB.prepare(`UPDATE records SET device_instance_id = 'unknown' WHERE id = ?`).run(cId)
+    dbB.prepare(`INSERT INTO synced_records (id, ts, tool, model, provider, session_key, device, device_instance_id, updated_at) VALUES ('stale-unknown', ?, 't', 'm', 'p', 'k', 'X', 'unknown', ?)`).run(DAY6, DAY6)
+    const unknownIds = (db: Database.Database) => syncedIds(db, 'unknown')
+    expect(unknownIds(dbB)).toEqual([cId, 'stale-unknown'].sort())
+
+    // C's namespace cannot be trusted this time (a malformed line): the
+    // rows it may still hold have not been relabelled or claimed, so none of
+    // the unclaimed 'unknown' rows may go.
+    const pathC = `${C}/2026/09/06.ndjson`
+    const good = backend.files.get(pathC)!
+    backend.files.set(pathC, good + '{"id": "truncated\n')
+    let b = await sync(dbB, backend, B)
+    expect(b).toMatchObject({ status: 'ok', skippedNamespaces: 1, prunedCount: 0 })
+    expect(unknownIds(dbB)).toEqual([cId, 'stale-unknown'].sort())
+
+    // Once every namespace reads reliably, the line C still publishes is
+    // attributed to C and claimed; only the stale row is dropped.
+    backend.files.set(pathC, good)
+    b = await sync(dbB, backend, B)
+    expect(b).toMatchObject({ status: 'ok', skippedNamespaces: 0, prunedCount: 1 })
+    expect(unknownIds(dbB)).toEqual([])
+    expect(syncedIds(dbB, C)).toContain(cId)
+    expect(getClaimingTargets(dbB, cId)).toEqual([TARGET])
+    expect(dbB.prepare(`SELECT device_instance_id FROM records WHERE id = ?`).get(cId)).toEqual({ device_instance_id: C })
   })
 
   it('ignores day files the manifest does not name (left behind by an interrupted deletion)', async () => {

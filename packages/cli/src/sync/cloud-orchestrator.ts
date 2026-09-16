@@ -37,6 +37,8 @@ export interface CloudSyncResult {
 }
 
 const BATCH_SIZE = 500
+/** How often a pull is restarted when the server's generation changes between its pages. */
+const MAX_PULL_RESTARTS = 3
 
 export class CloudSyncOrchestrator {
   private db: Database.Database
@@ -108,9 +110,12 @@ export class CloudSyncOrchestrator {
       const mergedCount = mergeSyncedRecordsIntoRecords(this.db, this.options.deviceInstanceId)
 
       // Step 4: Push local records to cloud, then retract retired wire ids.
+      // Both go out under the generation the pull just observed: after the
+      // server's data was cleared (`aiusage clean --all`) the generation the
+      // caller knew about is stale and every push under it would be rejected.
       this.options.onProgress?.({ phase: 'uploading', pulledCount: insertedCount })
-      const uploadedCount = await this.push(syncGeneration)
-      const retiredCount = await this.pushRetiredIds(syncGeneration)
+      const uploadedCount = await this.push(pullResult.syncGeneration)
+      const retiredCount = await this.pushRetiredIds(pullResult.syncGeneration)
 
       // Step 5: Mark local records as synced
       const unsynced = this.getUploadableRecords(this.target)
@@ -149,23 +154,46 @@ export class CloudSyncOrchestrator {
     }
   }
 
+  /**
+   * Read every page of the server's current generation. The generation is
+   * pinned by the first page: if a later page reports another one, the
+   * server's data was cleared mid-pull and the pages read so far describe a
+   * generation that no longer exists, so the pull starts over. A pull that
+   * cannot observe one stable generation fails rather than stitching pages of
+   * two generations into one "complete" snapshot the caller would reconcile
+   * against.
+   */
   private async pullAll(syncGeneration: number): Promise<{ records: SyncRecord[]; tombstones: CloudPulledTombstone[]; syncGeneration: number }> {
-    const allRecords: SyncRecord[] = []
-    const allTombstones: CloudPulledTombstone[] = []
-    let cursor: string | undefined
-    let hasMore = true
-    let generation = syncGeneration
+    let restarts = 0
+    for (;;) {
+      const allRecords: SyncRecord[] = []
+      const allTombstones: CloudPulledTombstone[] = []
+      let cursor: string | undefined
+      let hasMore = true
+      let generation: number | null = null
+      let changed = false
 
-    while (hasMore) {
-      const result = await cloudPull(cursor, 1000)
-      allRecords.push(...result.records)
-      allTombstones.push(...(result.tombstones ?? []))
-      cursor = result.nextCursor
-      hasMore = result.hasMore
-      generation = result.syncGeneration
+      while (hasMore) {
+        const result = await cloudPull(cursor, 1000)
+        if (generation === null) {
+          generation = result.syncGeneration
+        } else if (result.syncGeneration !== generation) {
+          changed = true
+          break
+        }
+        allRecords.push(...result.records)
+        allTombstones.push(...(result.tombstones ?? []))
+        cursor = result.nextCursor
+        hasMore = result.hasMore
+      }
+
+      if (!changed) {
+        return { records: allRecords, tombstones: allTombstones, syncGeneration: generation ?? syncGeneration }
+      }
+      if (++restarts > MAX_PULL_RESTARTS) {
+        throw new CloudSyncError('Cloud sync generation changed repeatedly during pull; try again later.', 'sync_generation_changed')
+      }
     }
-
-    return { records: allRecords, tombstones: allTombstones, syncGeneration: generation }
   }
 
   /**

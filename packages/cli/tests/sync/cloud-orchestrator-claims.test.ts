@@ -10,19 +10,29 @@ import { getClaimingTargets, getRetiredWireIds, replaceNamespaceClaims } from '.
 // owners that come back with nothing (the server's data was cleared and a new
 // generation started) lose their cloud claims, and rows no other target claims
 // go with them. Local database failures abort the sync before any of that.
+// The generation the pull observes is the one every push goes out under, and
+// a pull whose pages span two generations is restarted.
 
-const pulled: { records: SyncRecord[]; tombstones: Array<Record<string, unknown>>; generation: number } = { records: [], tombstones: [], generation: 1 }
-
-vi.mock('../../src/sync/cloud.js', () => ({
-  CloudSyncError: class CloudSyncError extends Error {},
-  cloudPull: vi.fn(async () => ({
+const { pulled, defaultPull } = vi.hoisted(() => {
+  const pulled = { records: [] as SyncRecord[], tombstones: [] as Array<Record<string, unknown>>, generation: 1 }
+  const defaultPull = async () => ({
     records: pulled.records,
     tombstones: pulled.tombstones,
     hasMore: false,
     syncGeneration: pulled.generation,
-  })),
+  })
+  return { pulled, defaultPull }
+})
+
+vi.mock('../../src/sync/cloud.js', () => ({
+  CloudSyncError: class CloudSyncError extends Error {},
+  cloudPull: vi.fn(defaultPull),
   cloudPush: vi.fn(async () => ({ inserted: 0, updated: 0, skipped: 0, syncGeneration: pulled.generation })),
 }))
+
+type PullPage = { records: SyncRecord[]; tombstones: Array<Record<string, unknown>>; hasMore: boolean; nextCursor?: string; syncGeneration: number }
+const page = (generation: number, ids: string[], nextCursor?: string): PullPage =>
+  ({ records: ids.map(id => peerRecord(id)), tombstones: [], hasMore: nextCursor !== undefined, nextCursor, syncGeneration: generation })
 
 const OWN = 'device-a'
 const X = 'device-x'
@@ -156,5 +166,82 @@ describe('CloudSyncOrchestrator claims', () => {
     expect(again.uploadedCount).toBe(0)
     expect(again.retiredCount).toBe(0)
     expect(cloudPush).not.toHaveBeenCalled()
+  })
+
+  it('pushes local records and retired wire ids under the generation the pull observed, not the one the sync started with', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    const { cloudPush } = await import('../../src/sync/cloud.js')
+    const record: StatsRecord = {
+      id: generateRecordId(OWN, 'msg_1', 0), ts: 1000, ingestedAt: 1000, updatedAt: 1000, lineOffset: 64,
+      tool: 'claude-code', model: 'm', provider: 'anthropic', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+      thinkingTokens: 0, cost: 0, costSource: 'pricing', sessionId: 's', sourceFile: 'C:\\s.jsonl', device: 'D', deviceInstanceId: OWN,
+    }
+    insertRecord(db, record)
+    db.prepare(`INSERT INTO sync_retired_wire_ids (target, wire_id) VALUES ('cloud', 'retired-1')`).run()
+
+    // The server was cleared since this client last synced: it now serves generation 2.
+    pulled.generation = 2
+    const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync(1)
+    expect(result.status).toBe('ok')
+    expect(result.syncGeneration).toBe(2)
+    expect(result.uploadedCount).toBe(1)
+    expect(result.retiredCount).toBe(1)
+    const calls = vi.mocked(cloudPush).mock.calls
+    expect(calls).toHaveLength(2)
+    expect(calls.map(c => c[3])).toEqual([2, 2])
+    expect(calls[0][0].map(r => r.id)).toEqual([generateSyncRecordId(OWN, 'C:\\s.jsonl', 64)])
+    expect(calls[1][1]).toEqual([{ record_id: 'retired-1', updatedAt: expect.any(Number) }])
+    expect(getRetiredWireIds(db, 'cloud')).toEqual([])
+  })
+
+  it('restarts the pull when the generation changes between pages and reconciles against the new generation only', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    const { cloudPull } = await import('../../src/sync/cloud.js')
+    pulled.records = [peerRecord('old1'), peerRecord('old2')]
+    await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
+    expect(syncedIds(db)).toEqual(['old1', 'old2'])
+
+    // Page 1 still comes from generation 1; the server is cleared before
+    // page 2, which reports generation 2 with a record that was pushed
+    // afresh. Stitching them together would keep old1 forever.
+    vi.mocked(cloudPull)
+      .mockImplementationOnce(async () => page(1, ['old1'], 'c1'))
+      .mockImplementationOnce(async () => page(2, ['new1']))
+      .mockImplementationOnce(async () => page(2, ['new1'], 'd1'))
+      .mockImplementationOnce(async () => page(2, ['new2']))
+    vi.mocked(cloudPull).mockClear()
+    const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
+    expect(result.status).toBe('ok')
+    expect(result.syncGeneration).toBe(2)
+    expect(cloudPull).toHaveBeenCalledTimes(4)
+    expect(vi.mocked(cloudPull).mock.calls.map(c => c[0])).toEqual([undefined, 'c1', undefined, 'd1'])
+    expect(syncedIds(db)).toEqual(['new1', 'new2'])
+    expect(getClaimingTargets(db, 'old1')).toEqual([])
+    expect(getClaimingTargets(db, 'new2')).toEqual(['cloud'])
+  })
+
+  it('fails instead of reconciling when the generation keeps changing during the pull', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    const { cloudPull, cloudPush } = await import('../../src/sync/cloud.js')
+    pulled.records = [peerRecord('r1')]
+    await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
+
+    let attempt = 0
+    vi.mocked(cloudPull).mockImplementation(async (cursor?: string) => {
+      if (cursor === undefined) attempt++
+      return cursor === undefined ? page(attempt, [], 'next') : page(attempt + 1, ['x'])
+    })
+    vi.mocked(cloudPush).mockClear()
+    try {
+      const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
+      expect(result.status).toBe('failed')
+      expect(result.error).toContain('generation changed')
+      expect(attempt).toBe(4)
+      expect(syncedIds(db)).toEqual(['r1'])
+      expect(getClaimingTargets(db, 'r1')).toEqual(['cloud'])
+      expect(cloudPush).not.toHaveBeenCalled()
+    } finally {
+      vi.mocked(cloudPull).mockImplementation(defaultPull)
+    }
   })
 })

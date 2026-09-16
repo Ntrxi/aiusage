@@ -335,7 +335,11 @@ export class SyncOrchestrator {
           skippedNamespaces++
         }
       }
-      prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
+      // Legacy rows stamped 'unknown' carry no claim until the namespace they
+      // sit in is reconciled (which relabels them to its owner). They may only
+      // be dropped once every namespace on this target was read reliably:
+      // a skipped namespace could still hold them.
+      if (skippedNamespaces === 0) prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
 
       // Rows without any claim whose device is not on this target at all can
       // only be judged when this is the one target the device has ever used:
@@ -360,8 +364,9 @@ export class SyncOrchestrator {
    * written when it differs â€” a file holding the same records in another
    * order is left alone, one with duplicated or malformed lines is rewritten.
    * Then the manifest is written if it changed, and finally files for days
-   * that no longer have any local record are removed. Nothing outside
-   * `<deviceInstanceId>/` is ever touched.
+   * that no longer have any local record are removed (when the snapshot is
+   * empty, an empty manifest is published first and removed last). Nothing
+   * outside `<deviceInstanceId>/` is ever touched.
    *
    * The order matters for backends that cannot replace the namespace
    * atomically (S3): peers verify every file against the manifest, so a
@@ -430,19 +435,16 @@ export class SyncOrchestrator {
 
     // The manifest goes after the day files it describes and before any
     // deletion, so peers never validate a snapshot that is not fully there.
+    // That holds for an empty snapshot too: the empty manifest is published
+    // before the last day files are deleted, so an interrupted deletion
+    // leaves files the manifest does not name (ignored) rather than a
+    // manifest-less namespace peers would read as a legacy snapshot.
     const manifestFile = manifestPath(deviceInstanceId)
     const manifestContent = serializeManifest(buildManifest(byRel))
     this.options.onProgress?.({ phase: 'uploading', currentPath: manifestFile, completedFiles: completed, totalFiles, uploadedCount })
     const existingManifest = await this.backend.readFile(manifestFile)
-    if (byRel.size === 0) {
-      // Nothing to publish: a manifest naming files that are about to be
-      // deleted would make peers treat the namespace as half-written forever.
-      if (existingManifest !== null) {
-        if (this.backend.deleteFile) await this.backend.deleteFile(manifestFile)
-        else await this.backend.writeFile(manifestFile, manifestContent) // an empty manifest verifies as empty
-        writtenFiles++
-      }
-    } else if (existingManifest !== manifestContent) {
+    const publishManifest = byRel.size > 0 || existingManifest !== null || stalePaths.length > 0
+    if (publishManifest && existingManifest !== manifestContent) {
       await this.backend.writeFile(manifestFile, manifestContent)
       writtenFiles++
     }
@@ -456,6 +458,14 @@ export class SyncOrchestrator {
       else await this.backend.writeFile(path, '')
       writtenFiles++
       completed++
+    }
+
+    // Once nothing is left to describe, the empty manifest itself goes, so a
+    // device that wiped its data leaves no trace on the target. Removing it
+    // last keeps the namespace verifiable at every step before.
+    if (byRel.size === 0 && publishManifest && this.backend.deleteFile) {
+      await this.backend.deleteFile(manifestFile)
+      writtenFiles++
     }
 
     // Bookkeeping: rows newly published (or changed since their last upload)
