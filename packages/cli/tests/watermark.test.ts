@@ -152,6 +152,35 @@ describe('WatermarkManager', () => {
     expect(wm.getEntry('grok', '/current/updates.jsonl')?.offset).toBe(300)
   })
 
+  it('clears stale CodeBuddy entries when upgrading the CodeBuddy parser', () => {
+    writeFileSync(watermarkPath, JSON.stringify({
+      files: {
+        codebuddy: { '/cb/session.jsonl': { offset: 400, size: 400, mtime: 4 } },
+        'claude-code': { '/claude/session.jsonl': { offset: 200, size: 200, mtime: 2 } },
+      },
+    }), 'utf-8')
+
+    const wm = new WatermarkManager(watermarkPath)
+    expect(wm.getEntry('codebuddy', '/cb/session.jsonl')).toBeNull()
+    expect(wm.getEntry('claude-code', '/claude/session.jsonl')?.offset).toBe(200)
+
+    wm.save()
+    const saved = JSON.parse(readFileSync(watermarkPath, 'utf-8'))
+    expect(saved.codebuddyParserVersion).toBe(1)
+  })
+
+  it('preserves CodeBuddy entries written by the current parser version', () => {
+    writeFileSync(watermarkPath, JSON.stringify({
+      files: {
+        codebuddy: { '/cb/current.jsonl': { offset: 500, size: 500, mtime: 5 } },
+      },
+      codebuddyParserVersion: 1,
+    }), 'utf-8')
+
+    const wm = new WatermarkManager(watermarkPath)
+    expect(wm.getEntry('codebuddy', '/cb/current.jsonl')?.offset).toBe(500)
+  })
+
   it('returns null when no opencode cursor has been set', () => {
     const wm = new WatermarkManager(watermarkPath)
     expect(wm.getOpenCodeCursor()).toBeNull()
