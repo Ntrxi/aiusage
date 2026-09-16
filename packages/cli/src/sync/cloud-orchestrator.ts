@@ -7,8 +7,15 @@ import {
   markRecordsSynced,
   repairRecordProvenance,
 } from '../db/records.js'
-import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords, reconcileSyncedNamespace } from '../db/synced-records.js'
-import { clearRetiredWireIds, getClaimedOwners, getRetiredWireIds } from '../db/sync-claims.js'
+import {
+  deleteSyncedRecord,
+  getUnclaimedOwners,
+  insertSyncedRecord,
+  mergeSyncedRecordsIntoRecords,
+  pruneUnresolvedSyncedRecords,
+  reconcileSyncedNamespace,
+} from '../db/synced-records.js'
+import { clearRetiredWireIds, getClaimedOwners, getRetiredWireIds, nextSyncTick, recordNamespaceVerdict, UNKNOWN_NAMESPACE_VERDICT } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import { cloudPush, cloudPull, CloudSyncError, type CloudPulledTombstone } from './cloud.js'
 import type { SyncProgress } from './runtime.js'
@@ -16,6 +23,12 @@ import type { SyncProgress } from './runtime.js'
 export interface CloudSyncOptions {
   deviceInstanceId: string
   target?: string
+  /**
+   * Every sync target this device has ever used (the cloud target is always
+   * included); see `SyncOptions.knownTargets`. When omitted, unresolved rows
+   * are never pruned.
+   */
+  knownTargets?: string[]
   onProgress?: (progress: SyncProgress) => void
 }
 
@@ -28,7 +41,8 @@ export interface CloudSyncResult {
   /**
    * Pulled rows removed because the cloud no longer carries them (a tombstone
    * from their origin device, or absence from a complete pull after the
-   * server's data was cleared) and no other target claims them.
+   * server's data was cleared) and no other target claims them, or because
+   * they were unresolved and every known target has judged them absent.
    */
   prunedCount?: number
   /** Wire ids this device retracted from the server (see migration v14). */
@@ -73,9 +87,10 @@ export class CloudSyncOrchestrator {
       // is touched rather than reconciling against a partially applied pull.
       let insertedCount = 0
       const claimed = new Map<string, Set<string>>()
+      const tick = nextSyncTick(this.db)
       for (const record of pullResult.records) {
         if (record.deviceInstanceId === this.options.deviceInstanceId) continue
-        insertSyncedRecord(this.db, record)
+        insertSyncedRecord(this.db, record, tick)
         insertedCount++
         const owner = record.deviceInstanceId || ''
         if (!claimed.has(owner)) claimed.set(owner, new Set())
@@ -84,22 +99,31 @@ export class CloudSyncOrchestrator {
 
       // Step 2a: The pull is complete (every page of the server's current
       // generation was read), so it is authoritative for what the cloud
-      // target claims: every device the cloud claimed before is reconciled
-      // against what came back for it — nothing, when the server's data was
-      // cleared and a new generation started — and rows no target claims any
-      // more are removed. A file-based target reconciling later must not
-      // delete rows the cloud still carries, and vice versa.
+      // target claims: every device the cloud claimed before, every device
+      // that came back, and every device unresolved rows are attributed to
+      // is reconciled against what came back for it — nothing, when the
+      // server's data was cleared and a new generation started — and rows
+      // whose last claim that released are removed. A file-based target
+      // reconciling later must not delete rows the cloud still carries, and
+      // vice versa. A complete pull leaves nothing unread, so it is also the
+      // cloud's verdict on legacy rows stamped 'unknown'.
       let prunedCount = 0
+      const judgedAt = tick
+      const knownTargets = this.options.knownTargets ? new Set<string>([this.target, ...this.options.knownTargets]) : null
       this.db.transaction(() => {
-        const owners = new Set<string>([...claimed.keys(), ...getClaimedOwners(this.db, this.target)])
+        const owners = new Set<string>([...claimed.keys(), ...getClaimedOwners(this.db, this.target), ...getUnclaimedOwners(this.db)])
         owners.delete(this.options.deviceInstanceId)
         for (const owner of owners) {
-          prunedCount += reconcileSyncedNamespace(this.db, this.target, owner, claimed.get(owner) ?? [])
+          prunedCount += reconcileSyncedNamespace(this.db, this.target, owner, claimed.get(owner) ?? [], judgedAt)
         }
+        recordNamespaceVerdict(this.db, this.target, UNKNOWN_NAMESPACE_VERDICT, judgedAt)
+        if (knownTargets) prunedCount += pruneUnresolvedSyncedRecords(this.db, knownTargets)
       })()
 
       // Step 2b: Apply tombstones — records their origin device retracted.
-      // The row itself only goes once no other target claims it.
+      // A tombstone releases the cloud's claim only; the row goes once no
+      // other target claims it, and a row the cloud never claimed is not
+      // touched.
       for (const tombstone of pullResult.tombstones) {
         if (!tombstone.id || tombstone.device_instance_id === this.options.deviceInstanceId) continue
         if (deleteSyncedRecord(this.db, this.target, tombstone.id)) prunedCount++

@@ -7,10 +7,14 @@ import { validateRepo, GitHubAuthError } from '../github/auth.js'
 
 const exec = promisify(execFile)
 
-/** True for the errno codes that mean "no such file or directory". */
+/**
+ * True only for `ENOENT`, the one errno that confirms absence. `ENOTDIR`
+ * (a path component is a file where a directory is expected) means the cache
+ * layout is corrupt, not that the file was deleted: for a reader that prunes
+ * against absence it must surface as an error.
+ */
 function isNotFound(error: unknown): boolean {
-  const code = (error as { code?: string } | null)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
+  return (error as { code?: string } | null)?.code === 'ENOENT'
 }
 
 /**
@@ -99,10 +103,11 @@ export class GitSyncBackend {
   }
 
   /**
-   * `null` only when the file does not exist. Any other failure (permission
-   * denied, I/O error, a directory where a file was expected) is thrown: the
-   * orchestrator treats a missing file as a deletion and prunes against it,
-   * so a masked read error would destroy local data.
+   * `null` only when the file does not exist (`ENOENT`). Any other failure
+   * (permission denied, I/O error, a directory where a file was expected, a
+   * file where a directory was expected) is thrown: the orchestrator treats a
+   * missing file as a deletion and prunes against it, so a masked read error
+   * would destroy local data.
    */
   async readFile(path: string): Promise<string | null> {
     try {

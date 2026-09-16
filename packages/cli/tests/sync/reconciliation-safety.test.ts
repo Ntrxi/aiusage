@@ -55,7 +55,7 @@ function newDb(): Database.Database {
 }
 
 function sync(db: Database.Database, backend: FakeSyncBackend, deviceInstanceId: string) {
-  return new SyncOrchestrator(db, backend, { deviceInstanceId, target: TARGET, consentVerified: true }).sync()
+  return new SyncOrchestrator(db, backend, { deviceInstanceId, target: TARGET, consentVerified: true, knownTargets: [TARGET] }).sync()
 }
 
 const syncedIds = (db: Database.Database, owner: string) =>
@@ -348,7 +348,9 @@ describe('destructive reconciliation fails closed', () => {
     dbB.prepare(`DELETE FROM sync_record_claims WHERE record_id = ?`).run(cId)
     dbB.prepare(`UPDATE synced_records SET device_instance_id = 'unknown' WHERE id = ?`).run(cId)
     dbB.prepare(`UPDATE records SET device_instance_id = 'unknown' WHERE id = ?`).run(cId)
-    dbB.prepare(`INSERT INTO synced_records (id, ts, tool, model, provider, session_key, device, device_instance_id, updated_at) VALUES ('stale-unknown', ?, 't', 'm', 'p', 'k', 'X', 'unknown', ?)`).run(DAY6, DAY6)
+    dbB.prepare(`INSERT INTO synced_records (id, ts, tool, model, provider, session_key, device, device_instance_id, updated_at, unclaimed_since) VALUES ('stale-unknown', ?, 't', 'm', 'p', 'k', 'X', 'unknown', ?, 0)`).run(DAY6, DAY6)
+    // Like a device that has not synced since the upgrade: no verdict yet.
+    dbB.prepare(`DELETE FROM sync_namespace_verdicts`).run()
     const unknownIds = (db: Database.Database) => syncedIds(db, 'unknown')
     expect(unknownIds(dbB)).toEqual([cId, 'stale-unknown'].sort())
 

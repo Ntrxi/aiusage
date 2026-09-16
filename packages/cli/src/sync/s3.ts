@@ -140,7 +140,15 @@ export class S3SyncBackend {
     await this.client.send(command)
   }
 
-  /** Remove every object under the prefix — day files and manifests. Returns the number of data files removed. */
+  /**
+   * Remove every object under the prefix — day files and manifests. Returns
+   * the number of data files removed.
+   *
+   * `DeleteObjects` succeeds as a request even when individual keys could
+   * not be deleted; those come back in `Errors`. A wipe that silently left
+   * objects behind would be reported as complete while peers keep mirroring
+   * them, so any per-object failure is thrown.
+   */
   async deleteAllData(): Promise<number> {
     const entries = await this.listEntries()
     const files = entries.map(e => e.path)
@@ -157,7 +165,14 @@ export class S3SyncBackend {
           Quiet: true,
         },
       })
-      await this.client.send(command)
+      const response = await this.client.send(command)
+      const errors = response.Errors ?? []
+      if (errors.length > 0) {
+        const first = errors[0]
+        const key = first.Key ? first.Key.slice(this.prefix.length) : 'unknown key'
+        const detail = [first.Code, first.Message].filter(Boolean).join(': ')
+        throw new Error(`Could not delete ${errors.length} object(s) from the S3 sync target (first: '${key}'${detail ? `, ${detail}` : ''}).`)
+      }
     }
 
     return files.filter(f => f.endsWith('.ndjson')).length

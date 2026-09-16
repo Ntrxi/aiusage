@@ -58,6 +58,10 @@ sole-target rule below, the old key counts as an alias of the new one.
 
 ## Invariants
 
+These are the rules every code path (sync, cloud sync, `clean`, `--repair`)
+is held to; the scenario matrix at the end names the test that locks each one
+down.
+
 1. **A namespace is a snapshot, not a log.** The contents of
    `data/<X>/` are exactly the records that exist in device X's local database
    with `origin = 'local'` and `device_instance_id = X`, mapped to the wire
@@ -66,28 +70,70 @@ sole-target rule below, the old key counts as an alias of the new one.
    only. It never touches another namespace, whatever its local database
    contains (a pulled copy that lost its provenance flag is re-flagged, never
    uploaded).
-3. **Peers mirror namespaces exactly, per target.** Device Y's
-   `synced_records` rows attributed to X are the current contents of
-   `data/<X>/`. Rows that are no longer there are removed, together with their
-   merged copies in `records` (`origin = 'synced'`) — but only once *no* sync
-   target claims them any more (invariant 5). Locally parsed rows are never
-   deleted by sync.
-4. **Wire ids are unique per device.** Every local record maps to its own wire
+3. **Wire ids are unique per device.** Every local record maps to its own wire
    id. Tools whose parser already generates a stable unique id (Antigravity,
    Trae, OpenCode, Cursor, …) publish under that id; JSONL-based tools publish
    under `sha256(device, sourceFile, lineOffset)`, which is unique because byte
    offsets are.
-5. **Every pulled row is claimed by the targets it was read from.** The
-   `sync_record_claims` table records, per sync target, which records of
-   which namespace this device mirrored. Reconciling one target replaces only
-   that target's claims. A row is deleted only when its last claim goes, so a
-   record that one repository dropped but another repository (or the cloud)
-   still carries is kept.
-6. **Pruning only follows a namespace that was read reliably.** A namespace
-   whose files could not all be read, parsed, and verified against its
-   manifest is *skipped*: its lines are upserted, nothing is pruned, and the
-   next sync retries. A backend that cannot list or read at all aborts the
-   sync before anything is pruned.
+4. **Every pulled row has a provenance.** A `synced_records` row is either
+   *claimed* — `sync_record_claims` names the targets whose verified snapshot
+   of the owner's namespace contained it when last read — or *unresolved*:
+   `unclaimed_since` is set and no target claims it, because it was pulled
+   before claims existed (migration v14) or read from a namespace that no
+   target has verified since. There is no third state.
+5. **A target only ever releases its own claim.** Reconciling a target
+   replaces that target's claims for a namespace and touches no other
+   target's. A cloud tombstone releases the cloud's claim only; a row the
+   cloud never claimed is not touched by it.
+6. **A row is deleted only when no target claims it**, and only in one of two
+   ways: the target that held its last claim released it because its verified
+   snapshot no longer contains the record, or the row is unresolved and every
+   known target has judged it absent (invariant 8). Locally parsed rows are
+   never deleted by sync.
+7. **Peers mirror namespaces exactly, per target.** After a reliable read of
+   `data/<X>/` on target T, T's claims for X are exactly the ids the namespace
+   holds; rows X no longer publishes on T lose T's claim (and go if that was
+   the last one), together with their merged copies in `records`.
+8. **Unresolved rows are settled by verdicts, never by a single target.**
+   `sync_namespace_verdicts` records, per target and namespace owner, the
+   *sync tick* at which the target last judged that namespace reliably — a
+   verified snapshot, an authoritatively empty namespace, or a confirmed
+   absence. An unresolved row is deleted only once every target this device
+   knows (every key in `state.json`, the current one included) has a verdict
+   for its namespace from a sync *after* the one that made the row
+   unresolved, and still none claims it. Ticks come from the sync clock: each
+   sync run takes a tick one greater than any recorded so far, stamps the rows
+   it upserts unresolved with it and records its verdicts under it, so the
+   sync that read a row can never be the one that judges it absent.
+9. **Only a verified authoritative snapshot can cause deletions.** A
+   namespace whose files could not all be read, parsed and verified against
+   its manifest is *skipped*: its lines are upserted (a new row is
+   unresolved; an existing row is refreshed only by a newer version), no claim
+   is touched, nothing is pruned, no verdict is recorded. A backend that
+   cannot list or read at all aborts the sync before anything is reconciled.
+10. **"Absent", "authoritatively empty" and "unverifiable" are distinct
+    states** of a namespace with no listed day file: no manifest means the
+    namespace was deleted; a valid manifest naming no file means the owner
+    published an empty snapshot; a manifest naming files that are gone, or one
+    that does not parse, means nothing can be concluded. The first two are
+    reconciled against the empty set; the third is skipped.
+11. **Interrupted operations never create false absence.** A Git cache with a
+    file where a directory should be, a permission error, an S3 object that
+    vanished between listing and reading, a `DeleteObjects` that deleted only
+    some keys, a cloud pull whose pages span two generations, an upload
+    interrupted between day files and manifest — each surfaces as a failure or
+    an unverifiable namespace, never as "the records are gone".
+12. **The local value of a record is the newest version ever observed.**
+    Claims track *which targets carry* a record; its payload is global and
+    last-writer-wins on `updatedAt`, whatever target or snapshot it came from.
+    If target A carries `r@v2` and target B `r@v1`, the local row is v2; if A
+    then drops the record, B's claim keeps the row and it stays v2. Exact
+    per-target mirroring of payloads is deliberately not attempted.
+13. **Migration converges, and nothing is protected forever.** Rows that
+    predate claims are unresolved at tick 0 and settle as soon as every known
+    target has synced once; a target that will never be synced again keeps
+    withholding its verdict, and `aiusage sync --repair` is the deterministic
+    way to remove what the configured target provably does not carry.
 
 ## What a sync does
 
@@ -132,27 +178,40 @@ read (which then keeps or prunes it), and withholding the lines would hide a
 namespace whose owner crashed mid-rewrite and never came back. The manifest is
 therefore the commit boundary for **pruning**, not for additions.
 
+The namespaces read are not only the ones with day files in the listing:
+every namespace this target claimed before, and every namespace that
+unresolved rows are attributed to, is planned through its manifest too. The
+listing only shows day files, so for a namespace with none the manifest is
+what tells the three states apart (invariant 10):
+
+| `data/<X>/` on the target | State | Effect |
+| --- | --- | --- |
+| no day files, no manifest | **absent** — deleted remotely (the owner reset it, the repository was recreated) | reconciled against the empty set |
+| no day files, valid manifest naming no file | **authoritatively empty** — the owner published an empty snapshot | reconciled against the empty set |
+| no day files, manifest naming files | **unverifiable** — the owner is mid-publish, or the files were lost | skipped |
+| manifest that does not parse | **unverifiable** | skipped |
+
 Then, per namespace owner:
 
 * if the namespace was read **reliably**, the ids collected become this
-  target's claims for that owner (replacing the previous ones), and rows
-  attributed to the owner that no target claims any more are deleted, with
-  their merged copies;
+  target's claims for that owner (replacing the previous ones), rows whose
+  claim this released and that no target claims any more are deleted with
+  their merged copies, and the verdict `(target, owner, tick)` is recorded;
 * if it was **not** (a file listed a moment ago but gone, a malformed line, a
-  manifest that does not parse or whose digests do not match), the namespace
-  is skipped: claims are left as they were and nothing is pruned. `aiusage
-  sync` reports the number of skipped namespaces;
-* a namespace that this target claimed before but that is absent from the
-  listing now was deleted remotely (the owner reset it, or the repository was
-  recreated): its claims on this target are released, and its rows go if no
-  other target still claims them.
+  manifest that does not parse or whose digests do not match, a manifest
+  naming files that are not there), the namespace is skipped: claims are left
+  as they were, nothing is pruned, no verdict is recorded. `aiusage sync`
+  reports the number of skipped namespaces.
 
-Rows attributed to `unknown` that no target claims are dropped: they can only
-be leftovers from a namespace that has since been republished under its real
-device id. They are dropped only in a sync during which every namespace on the
-target was read reliably; while any namespace is skipped, the rows it may
-still hold have not been relabelled or claimed, so nothing stamped `unknown`
-is touched.
+Rows attributed to `unknown` (lines an old client wrote before `aiusage init`,
+mirrored before this release) can sit in any namespace of the target — a
+reliable read relabels them to its owner and claims them — so the target's
+verdict on them is recorded only in a sync during which every namespace on the
+target was read reliably.
+
+Finally, unresolved rows whose namespace every known target has judged since
+they became unresolved, and that still no target claims, are deleted
+(invariant 8). Everything else unresolved waits.
 
 ### Upload
 
@@ -261,20 +320,28 @@ what bounds them.
 
 Because reconciliation deletes local rows, the backends never mask errors:
 
-* `GitSyncBackend.readFile` returns `null` only for `ENOENT`/`ENOTDIR`;
-  permission errors, I/O errors and a corrupt cache are thrown. `listFiles`
-  returns an empty list only when the `data/` directory does not exist; any
-  failure while walking an existing tree is thrown.
+* `GitSyncBackend.readFile` returns `null` only for `ENOENT`, the one errno
+  that confirms absence. `ENOTDIR` (a file where a directory is expected)
+  means the cache layout is corrupt and is thrown like permission and I/O
+  errors. `listFiles` returns an empty list only when the `data/` directory
+  does not exist; any failure while inspecting or walking it is thrown.
 * `S3SyncBackend.readFile` returns `null` only for `NoSuchKey`/404; listing
-  errors are thrown.
+  errors are thrown. `deleteAllData` inspects the per-object `Errors` of every
+  `DeleteObjects` response and throws when any key was not deleted, so
+  `aiusage clean --all` never reports a partial wipe as complete.
 * A thrown listing or read error aborts the sync with `status: 'failed'`
-  before any reconciliation. Lines already upserted stay (upserts are never
-  destructive).
+  before any reconciliation.
 * The local database is held to the same standard: a failure while upserting
   a pulled line is never swallowed — it aborts the sync before the
-  reconciliation phase — and the reconciliation of all namespaces runs in one
-  transaction, so the mirror is either reconciled against a fully applied pull
-  or left exactly as it was. The same holds for the cloud backend.
+  reconciliation phase. What was upserted before the failure stays: an upsert
+  only adds an unresolved row, which no reconciliation can delete until every
+  known target has judged its namespace, or refreshes a row with a newer
+  version of itself. The reconciliation of all namespaces then runs in one
+  transaction, so claims, verdicts and deletions land for every reliable
+  namespace or for none. The pull as a whole is therefore *additive-then-
+  atomic*, not atomic: a sync that fails after upserting may leave new
+  unresolved rows behind, and the next successful sync settles them. The same
+  holds for the cloud backend.
 
 ## Bookkeeping tables
 
@@ -282,6 +349,8 @@ Because reconciliation deletes local rows, the backends never mask errors:
 | --- | --- |
 | `sync_record_state` | Which local records have been published to which target, and when. Drives the `uploaded: N` count and the cloud push; the file backends always publish the full snapshot regardless. |
 | `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. A claim never outlives its row: `sync --repair --apply` and `aiusage clean` drop the claims of the rows they delete. |
+| `synced_records.unclaimed_since` (v14) | The sync tick at which a row became unresolved (no target claims it); `NULL` once a target claims it. Rows that predate the column carry tick 0. |
+| `sync_namespace_verdicts` (v14) | For every sync target and namespace owner, the sync tick at which the target last judged the namespace reliably. Unresolved rows are deleted only once every known target has a verdict for their namespace from a later tick. Cleared by `aiusage clean --all`; copied with the other tables when a target key is adopted. |
 | `sync_retired_wire_ids` (v14) | Wire ids this device used to publish and never will again. Cleared by the next file-backend sync (the snapshot no longer contains them) or pushed as tombstones to the cloud backend. |
 
 ### The cloud backend
@@ -302,7 +371,23 @@ When the server's data is cleared (`aiusage clean --all` advances the server's
 `sync_generation`) the next pull returns neither records nor tombstones for the
 old devices; their cloud claims are released and their rows go unless another
 target still claims them. A tombstone from a device's own retraction likewise
-releases only the cloud's claim.
+releases only the cloud's claim, and never touches a row the cloud does not
+claim. A completed pull is also the cloud's verdict on every namespace —
+including those it returned nothing for, and the legacy `unknown` rows — so
+unresolved rows are settled by the cloud exactly as by a file target.
+
+The cloud API has its own record shape, and `sync/cloud-dto.ts` is the only
+place that knows it: the server stores the device alias as `device_name` and
+serialises it as `deviceName` on both push and pull, where the core
+`SyncRecord` (the file backends' wire format and the local tables) calls it
+`device`; integer columns are Postgres bigints and come back as strings.
+Records go out through `toCloudRecord` and come in through `fromCloudRecord`,
+which normalises numbers and rejects a record that lacks a wire id, an origin
+device, a tool, a model or its timestamps — and a pull containing such a
+record fails rather than silently omitting it, because a completed pull is
+reconciled against and an omission would read as absence. Ownership is not
+part of the translation: `deviceInstanceId` names the origin device on both
+sides.
 
 ## Migration from 1.5.17 and earlier
 
@@ -329,29 +414,25 @@ Nothing needs to be run by hand. On the first sync after upgrading:
   already relabelled at parse time cannot be told apart any more, so a cloud
   copy pushed under the sentinel by 1.5.17 or earlier and never retracted is
   the one case this cannot clean up;
-* rows pulled before the upgrade carry no claim. The first reliable read of
-  their namespace on any target adopts them (claims are created) and prunes
-  the ones the namespace no longer holds.
+* rows pulled before the upgrade carry no claim, and nothing records which
+  target they came from. The migration marks them *unresolved* at sync tick
+  0. A reliable read of their namespace on any target claims the ones the
+  namespace holds; the others stay, unpruned, until every target this device
+  knows (every key in `state.json`) has judged the namespace. With one target
+  that is the first sync; with several it is the first sync of each. Syncing
+  target A first therefore never deletes a row that target B still carries —
+  B's sync claims it — and a row that no target carries goes exactly when the
+  last of them has looked.
 
-Rows pulled before the upgrade from a namespace that had **already
-disappeared** from the target cannot be reconciled that way, because nothing
-remains to read. Two things cover them:
-
-* when the target is the only one this device has ever synced with (the usual
-  case), such rows can only be stale and are pruned automatically;
-* otherwise they are left alone, because they may have arrived through
-  another target that still carries them. `aiusage sync --repair` lists them
-  as *orphaned* pulled rows (device absent from this target, claimed by no
-  target) and removes them with `--apply`. If the device does still publish
-  on another target, sync that target first: it re-establishes the claims and
-  repair no longer reports the rows.
-
-Known limitation for multi-target users upgrading: rows pulled before the
-upgrade through target B, from a device whose namespace on target A is stale,
-are pruned by the first post-upgrade sync of A (they hold no claim yet) and
-come back on the next sync of B. Records are never lost, but totals may dip
-between those two syncs. Syncing every target once after upgrading settles
-the claims.
+Rows of a device whose namespace has **already disappeared** from a target
+are covered by the same rule: an absent namespace is a verdict too. Only a
+target that is never synced again — a repository or bucket still recorded in
+`state.json` but no longer used — withholds its verdict indefinitely. For
+that case `aiusage sync --repair` lists the unresolved rows the configured
+target provably does not carry (device absent, or its verified namespace
+without them) as *orphaned* and removes them with `--apply`. If the device
+does still publish them on another target, sync that target first: it claims
+the rows and repair no longer reports them.
 
 Peers running an older version keep whatever rows they already have; they do
 not prune, and they never write manifests. Their namespaces are still read
@@ -368,6 +449,31 @@ branch, prefix or endpoint, see *Target identity*) adopts the consent,
 bookkeeping and claims recorded under its old key on its first sync, so it
 does not start from the pre-upgrade state described above.
 
+## Scenario matrix
+
+Each row is an adversarial scenario the invariants must survive, with the
+test that exercises it (all under `packages/cli/tests/`).
+
+| Scenario | Invariants | Test |
+| --- | --- | --- |
+| Upgrade with two targets carrying overlapping sets; sync A first, then B, and the reverse | 1, 4, 6, 8, 13 | `sync/sync-invariants.test.ts` — *upgrading with several sync targets* |
+| A known target that is never synced again; repair removes what the configured target verified absent | 8, 13 | same |
+| A verdict recorded before a row became unresolved does not settle it | 8 | same |
+| Namespace with no day files: absent / empty manifest / manifest naming missing files / unparsable manifest | 5, 9, 10 | `sync/sync-invariants.test.ts` — *what a namespace with no listed day file means* |
+| Unverifiable snapshot with newer token data and an extra record: row updated, claims untouched, nothing pruned | 9, 12 | `sync/sync-invariants.test.ts` — *unverified snapshots* |
+| A row read from an unverifiable snapshot on A is not pruned by B verifying the namespace | 5, 8, 9 | same |
+| `r@v2` on A, `r@v1` on B; A drops it; B's claim keeps v2 | 6, 12 | `sync/sync-invariants.test.ts` — *one record, different versions* |
+| Legacy `unknown` rows wait for a fully reliable sync of every known target | 8, 9 | `sync/sync-invariants.test.ts` — *legacy rows stamped 'unknown'* |
+| Listing failure, read failure, local DB failure mid-pull, file vanished between list and read, malformed line, manifest mismatch, record moving between day files on S3, interrupted wipe | 9, 11 | `sync/reconciliation-safety.test.ts` |
+| Git `ENOTDIR`, permission and I/O errors are never absence | 11 | `sync/git-fail-closed.test.ts` |
+| S3 `DeleteObjects` with per-object errors | 11 | `sync/s3-delete-all.test.ts` |
+| Same record on two targets; one target drops it; namespace disappears from one target only; cloud claim vs file target | 5, 6, 7 | `sync/multi-target-claims.test.ts` |
+| Cloud generation reset, pages spanning two generations, tombstones for unclaimed rows | 5, 6, 11 | `sync/cloud-orchestrator-claims.test.ts`, `sync/cloud-orchestrator-tombstones.test.ts` |
+| Cloud wire shape: `deviceName` on push and pull, bigint strings, unparsable record fails the pull | 11 | `sync/cloud-dto.test.ts` |
+| Two branches / prefixes of one store never share claims; legacy key adoption | 5 | `sync/target-identity.test.ts` |
+| Migration stamps pre-existing rows at tick 0; idempotent | 4, 13 | `db/migration-v14.test.ts` |
+| Cleanup and repair only rewrite verified namespaces | 9 | `commands/clean-remote.test.ts`, `sync/repair-verify.test.ts` |
+
 ## Diagnostics
 
 `aiusage sync` prints, besides pulled/merged/uploaded, `pruned: N removed
@@ -375,6 +481,6 @@ remotely` (rows dropped because their owner no longer publishes them) and
 `retired: N stale remote` (lines removed from this device's own namespace),
 and notes how many namespaces were skipped because they could not be verified.
 `aiusage sync --repair` reports stale and duplicated lines in this device's
-namespace, namespaces it could not verify, orphaned pulled rows, and any
-wire-id collisions among local records, see
-[`sync-repair.md`](./sync-repair.md).
+namespace, namespaces it could not verify, orphaned pulled rows (unresolved
+rows the configured target provably does not carry), and any wire-id
+collisions among local records, see [`sync-repair.md`](./sync-repair.md).

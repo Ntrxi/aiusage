@@ -5,7 +5,7 @@ import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
-import { getRetiredWireIds } from '../../src/db/sync-claims.js'
+import { getRetiredWireIds, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
 
 const pulled: { records: SyncRecord[]; tombstones: Array<Record<string, unknown>> } = { records: [], tombstones: [] }
 
@@ -83,12 +83,16 @@ describe('CloudSyncOrchestrator tombstones', () => {
 
   it('applies tombstones from other devices and ignores its own', async () => {
     const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    // Both rows were pulled from the cloud earlier (claimed by it).
     insertSyncedRecord(db, peerRecord('gone'))
     insertSyncedRecord(db, peerRecord('kept'))
+    replaceNamespaceClaims(db, 'cloud', PEER, ['gone', 'kept'])
     mergeSyncedRecordsIntoRecords(db, OWN)
     insertRecord(db, antigravity('mine', 1))
     const mineWire = antigravity('mine', 1).id
 
+    // The peer retracted 'gone': the server returns it as a tombstone and no longer as a record.
+    pulled.records = [peerRecord('kept')]
     pulled.tombstones = [
       { id: 'gone', device_instance_id: PEER },
       { id: mineWire, device_instance_id: OWN },
@@ -99,6 +103,22 @@ describe('CloudSyncOrchestrator tombstones', () => {
     expect(db.prepare(`SELECT id FROM synced_records ORDER BY id`).all()).toEqual([{ id: 'kept' }])
     expect(db.prepare(`SELECT id FROM records WHERE origin = 'synced'`).all()).toEqual([{ id: 'kept' }])
     expect(db.prepare(`SELECT COUNT(*) AS n FROM records WHERE origin = 'local'`).get()).toEqual({ n: 1 })
+  })
+
+  it('a tombstone never deletes a row the cloud does not claim', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    // Unresolved (pulled before claims existed) and claimed by another target only.
+    insertSyncedRecord(db, peerRecord('unresolved'))
+    insertSyncedRecord(db, peerRecord('github-only'))
+    replaceNamespaceClaims(db, 'github:u/r', PEER, ['github-only'])
+    pulled.tombstones = [
+      { id: 'unresolved', device_instance_id: PEER },
+      { id: 'github-only', device_instance_id: PEER },
+    ]
+    const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets: ['cloud', 'github:u/r'] }).sync()
+    expect(result.status).toBe('ok')
+    expect(result.prunedCount).toBe(0)
+    expect(db.prepare(`SELECT id FROM synced_records ORDER BY id`).all()).toEqual([{ id: 'github-only' }, { id: 'unresolved' }])
   })
 
   it('adopts pre-init local rows before pushing', async () => {

@@ -10,14 +10,13 @@ import {
   UNKNOWN_DEVICE_INSTANCE_ID,
 } from '../db/records.js'
 import {
-  getUnclaimedSyncedRecords,
+  getUnclaimedOwners,
   insertSyncedRecord,
   mergeSyncedRecordsIntoRecords,
-  pruneUnclaimedSyncedRecordsOf,
-  pruneUnclaimedUnknownSyncedRecords,
+  pruneUnresolvedSyncedRecords,
   reconcileSyncedNamespace,
 } from '../db/synced-records.js'
-import { clearRetiredWireIds, getClaimedOwners } from '../db/sync-claims.js'
+import { clearRetiredWireIds, getClaimedOwners, nextSyncTick, recordNamespaceVerdict, UNKNOWN_NAMESPACE_VERDICT } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import {
   buildManifest,
@@ -70,13 +69,14 @@ export interface SyncOptions {
   target: string
   consentVerified: boolean
   /**
-   * True when `target` is the only sync target this device has ever used.
-   * Pulled rows that carry no claim (they were mirrored before claims
-   * existed) and whose device namespace is absent from the target can then
-   * only be stale, and are pruned; with several targets in play they are left
-   * for `aiusage sync --repair` to judge.
+   * Every sync target this device has ever used (`target` is always
+   * included). An unresolved pulled row — one no target claims: pulled before
+   * claims existed, or read from a namespace that could not be verified — is
+   * deleted only once every one of these targets has judged its namespace
+   * reliably since the row became unresolved. When omitted, unresolved rows
+   * are never pruned.
    */
-  soleTarget?: boolean
+  knownTargets?: string[]
   onProgress?: (progress: SyncProgress) => void
 }
 
@@ -94,7 +94,10 @@ export interface SyncResult {
   ignoredCount?: number
   /** Local rows whose provenance flag was corrected before uploading. */
   repairedCount?: number
-  /** Pulled rows removed because they no longer exist in their owner's namespace. */
+  /**
+   * Pulled rows removed: claimed by this target only and gone from their
+   * owner's namespace, or unresolved and judged absent by every known target.
+   */
   prunedCount?: number
   /** Lines removed from this device's own namespace because the record no longer exists locally. */
   retiredCount?: number
@@ -222,25 +225,38 @@ export class SyncOrchestrator {
   /**
    * Mirror every foreign namespace.
    *
-   * For each namespace the manifest (if any) is read first, then the day
-   * files it names â€” or, for a namespace written by a pre-manifest client,
-   * every day file listed under it. Lines are upserted as they are read. A
-   * namespace is *reconciled* (its ids become this target's claims and rows
-   * no target claims any more are pruned) only when it was read reliably:
-   * every file present, every line parsed, every digest matching. Namespaces
-   * claimed on this target before but absent from the listing now were
-   * deleted remotely and are reconciled against the empty set. Our own
-   * namespace is never read here.
+   * Every namespace of interest is planned through its manifest: those with
+   * day files in the listing, those this target claimed before, and those
+   * that unresolved rows are attributed to. The plan reads the manifest (one
+   * file) and decides which day files make up the snapshot — for a namespace
+   * without any listed day file that is what tells *deleted* (no manifest:
+   * reconciled against the empty set), *authoritatively empty* (a valid
+   * manifest naming no file: the same) and *unverifiable* (a manifest naming
+   * files that are gone, or one that does not parse: skipped) apart. Then the
+   * day files are read — those the manifest names, or, for a namespace
+   * written by a pre-manifest client, every listed one — and their lines
+   * upserted as they are read. A namespace is *reconciled* (its ids become
+   * this target's claims, rows whose last claim that released are pruned, and
+   * the verdict is recorded) only when it was read reliably: every named file
+   * present, every line parsed, every digest matching. Our own namespace is
+   * never read here.
    *
-   * Nothing here is allowed to fail quietly: a backend read failure or a
-   * local database failure while upserting propagates and aborts the sync
-   * before the reconciliation phase, and the reconciliation itself runs in a
-   * single transaction, so the local mirror is either reconciled against a
-   * fully applied pull or left exactly as it was.
+   * Failure semantics: a backend read failure or a local database failure
+   * while upserting propagates and aborts the sync before anything is
+   * reconciled. Lines upserted before the failure stay — an upsert only adds
+   * an unresolved row (which no reconciliation can prune until every known
+   * target has judged its namespace) or refreshes a row with a newer version
+   * of itself. The reconciliation of all namespaces then runs in one
+   * transaction: claims, verdicts and prunes land for every reliable
+   * namespace, or for none.
    */
   private async pull(allPaths: string[]): Promise<{ pulledCount: number; ignoredCount: number; prunedCount: number; skippedNamespaces: number }> {
     const own = this.options.deviceInstanceId
     const target = this.options.target
+    const knownTargets = this.options.knownTargets ? new Set<string>([target, ...this.options.knownTargets]) : null
+    // This run's tick on the sync clock: rows upserted below become
+    // unresolved as of this tick, and verdicts are recorded under it.
+    const tick = nextSyncTick(this.db)
     const localDevicePrefix = `${own}/`
     const dataPaths = allPaths.filter(p => p.endsWith('.ndjson') && !isManifestPath(p) && !p.startsWith(localDevicePrefix))
 
@@ -251,10 +267,20 @@ export class SyncOrchestrator {
       listedByOwner.get(owner)!.push(path)
     }
 
-    // Phase 1: manifests decide which files make up each namespace.
+    // Every namespace whose state matters to this target: listed now, claimed
+    // here before, or the attributed owner of rows still awaiting a verdict.
+    const owners = new Set<string>(listedByOwner.keys())
+    for (const owner of getClaimedOwners(this.db, target)) owners.add(owner)
+    for (const owner of getUnclaimedOwners(this.db)) owners.add(owner)
+    owners.delete(own)
+    owners.delete(UNKNOWN_DEVICE_INSTANCE_ID)
+    owners.delete('')
+
+    // Phase 1: manifests decide which files make up each namespace, and what
+    // a namespace with nothing listed means.
     const plans = new Map<string, { read: NamespaceReadPlan; reliable: boolean; ids: Set<string> }>()
-    for (const [owner, listed] of listedByOwner) {
-      const read = await planNamespaceRead(this.backend, owner, listed)
+    for (const owner of [...owners].sort()) {
+      const read = await planNamespaceRead(this.backend, owner, listedByOwner.get(owner) ?? [])
       plans.set(owner, { read, reliable: read.reliable, ids: new Set() })
     }
 
@@ -291,7 +317,7 @@ export class SyncOrchestrator {
               record.deviceInstanceId = owner
             }
             plan.ids.add(record.id)
-            if (insertSyncedRecord(this.db, record)) totalPulled++
+            if (insertSyncedRecord(this.db, record, tick)) totalPulled++
           }
           completed++
           this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
@@ -304,39 +330,22 @@ export class SyncOrchestrator {
     }
 
     // Phase 3: reconcile. Only namespaces read reliably replace this target's
-    // claims; namespaces claimed here before but no longer listed are gone.
-    // One transaction: a failure part-way leaves no namespace half-reconciled.
+    // claims and get a verdict; the others are skipped untouched. One
+    // transaction: a failure part-way leaves no namespace half-reconciled.
     const { prunedCount, skippedNamespaces } = this.db.transaction(() => {
       let prunedCount = 0
       let skippedNamespaces = 0
-      const owners = new Set<string>([...plans.keys(), ...getClaimedOwners(this.db, target)])
-      owners.delete(own)
-      for (const owner of owners) {
-        const plan = plans.get(owner)
-        if (!plan) {
-          prunedCount += reconcileSyncedNamespace(this.db, target, owner, [])
-        } else if (plan.reliable) {
-          prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids)
-        } else {
-          skippedNamespaces++
-        }
+      for (const [owner, plan] of plans) {
+        if (plan.reliable) prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids, tick)
+        else skippedNamespaces++
       }
-      // Legacy rows stamped 'unknown' carry no claim until the namespace they
-      // sit in is reconciled (which relabels them to its owner). They may only
-      // be dropped once every namespace on this target was read reliably:
-      // a skipped namespace could still hold them.
-      if (skippedNamespaces === 0) prunedCount += pruneUnclaimedUnknownSyncedRecords(this.db)
-
-      // Rows without any claim whose device is not on this target at all can
-      // only be judged when this is the one target the device has ever used:
-      // then nothing else could still be carrying them.
-      if (this.options.soleTarget) {
-        const absentOwners = new Set<string>()
-        for (const owner of getUnclaimedSyncedRecords(this.db).keys()) {
-          if (owner !== own && owner !== UNKNOWN_DEVICE_INSTANCE_ID && owner !== '' && !plans.has(owner)) absentOwners.add(owner)
-        }
-        if (absentOwners.size > 0) prunedCount += pruneUnclaimedSyncedRecordsOf(this.db, absentOwners)
-      }
+      // Legacy rows stamped 'unknown' can sit in any namespace of the target
+      // (a reliable read relabels them to its owner and claims them), so this
+      // target has judged them only once every namespace here read reliably.
+      if (skippedNamespaces === 0) recordNamespaceVerdict(this.db, target, UNKNOWN_NAMESPACE_VERDICT, tick)
+      // Unresolved rows go only once every known target has judged their
+      // namespace since they became unresolved and none claimed them.
+      if (knownTargets) prunedCount += pruneUnresolvedSyncedRecords(this.db, knownTargets)
       return { prunedCount, skippedNamespaces }
     })()
 
@@ -347,7 +356,7 @@ export class SyncOrchestrator {
    * Publish this device's namespace as an authoritative snapshot of its local
    * records. Every day file is compared with the remote copy (by digest when
    * the backend can provide one, otherwise by canonical content) and only
-   * written when it differs â€” a file holding the same records in another
+   * written when it differs — a file holding the same records in another
    * order is left alone, one with duplicated or malformed lines is rewritten.
    * Then the manifest is written if it changed, and finally files for days
    * that no longer have any local record are removed (when the snapshot is
@@ -357,7 +366,7 @@ export class SyncOrchestrator {
    * The order matters for backends that cannot replace the namespace
    * atomically (S3): peers verify every file against the manifest, so a
    * reader that overlaps with this sequence sees either the previous
-   * consistent snapshot or a mismatch â€” never a partial snapshot it would
+   * consistent snapshot or a mismatch — never a partial snapshot it would
    * prune against.
    */
   private async upload(allPaths: string[]): Promise<{ uploadedCount: number; retiredCount: number; collisionCount: number; writtenFiles: number }> {

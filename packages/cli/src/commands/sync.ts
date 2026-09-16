@@ -14,21 +14,23 @@ import { repairSyncContamination, type RepairReport } from '../sync/repair.js'
 import { githubToken } from '../github/auth.js'
 
 /**
- * True when `target` is the only sync target recorded in state — no other
- * repository, bucket or the cloud has ever been synced from this device.
- * `aliases` are other keys that denote the same store (the key clients up to
- * 1.5.17 used for this configuration, see `getLegacySyncTarget`).
+ * Every sync target recorded in state — each repository, bucket or the cloud
+ * this device has ever synced with — with `target` always included and
+ * `aliases` (other keys that denote the same store: the key clients up to
+ * 1.5.17 used for this configuration, see `getLegacySyncTarget`) folded into
+ * it. Unresolved pulled rows are deleted only once every target in this set
+ * has judged their namespace, so a target that is never synced again keeps
+ * them until `aiusage sync --repair` removes them.
  */
-export function isSoleSyncTarget(state: import('../init.js').State | null, target: string, aliases: Array<string | null> = []): boolean {
-  if (!state) return true
-  const known = new Set<string>([
-    ...Object.keys(state.syncConsents ?? {}),
-    ...Object.keys(state.syncTargets ?? {}),
-  ])
-  if (state.lastSyncTarget) known.add(state.lastSyncTarget)
-  known.delete(target)
+export function knownSyncTargets(state: import('../init.js').State | null, target: string, aliases: Array<string | null> = []): string[] {
+  const known = new Set<string>([target])
+  if (state) {
+    for (const key of Object.keys(state.syncConsents ?? {})) known.add(key)
+    for (const key of Object.keys(state.syncTargets ?? {})) known.add(key)
+    if (state.lastSyncTarget) known.add(state.lastSyncTarget)
+  }
   for (const alias of aliases) if (alias) known.delete(alias)
-  return known.size === 0
+  return [...known].sort()
 }
 
 export function createBackend(config: import('../config.js').Config): SyncBackend | null {
@@ -99,6 +101,7 @@ export async function runSync(
     const orchestrator = new CloudSyncOrchestrator(db, {
       deviceInstanceId: state!.deviceInstanceId,
       target,
+      knownTargets: knownSyncTargets(state, target),
       onProgress: options?.onProgress,
     })
 
@@ -147,7 +150,7 @@ export async function runSync(
     deviceInstanceId: state!.deviceInstanceId,
     target,
     consentVerified: true,
-    soleTarget: isSoleSyncTarget(state, target, [getLegacySyncTarget(config.sync)]),
+    knownTargets: knownSyncTargets(state, target, [getLegacySyncTarget(config.sync)]),
     onProgress: options?.onProgress,
   })
 
@@ -246,7 +249,7 @@ export function formatRepairReport(report: RepairReport): string {
   lines.push(`  ${verb} ${report.local.staleSyncStateCount} stale sync bookkeeping row(s)`)
   if (report.local.orphanedSyncedIds.length > 0) {
     const devices = report.local.orphanedDevices.length
-    lines.push(`  ${verb} ${report.local.orphanedSyncedIds.length} pulled row(s) from ${devices} device(s) that no longer publish on this target and are not tracked by any other target (pulled before this version; if another sync target still carries them, sync it first)`)
+    lines.push(`  ${verb} ${report.local.orphanedSyncedIds.length} unresolved pulled row(s) from ${devices} device(s) that this target does not carry and no target claims (if another sync target still carries them, sync it first; syncing every target you use settles such rows without repair)`)
   }
   if (report.local.wireIdCollisions.length > 0) {
     const affected = report.local.wireIdCollisions.reduce((n, c) => n + c.recordIds.length, 0)

@@ -12,7 +12,7 @@ import { getClaimingTargets, replaceNamespaceClaims } from '../../src/db/sync-cl
 import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget } from '../../src/sync/target.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
-import { isSoleSyncTarget } from '../../src/commands/sync.js'
+import { knownSyncTargets } from '../../src/commands/sync.js'
 import { FakeSyncBackend } from './helpers/fake-backend.js'
 
 // The sync target key scopes consent, publish bookkeeping and record claims.
@@ -115,7 +115,7 @@ describe('adoptLegacySyncTarget', () => {
 
   it('copies state and bookkeeping recorded under the legacy key, once, leaving the legacy key in place', () => {
     const first = adoptLegacySyncTarget(dir, db, config)
-    expect(first).toEqual({ target, legacy, stateCopied: true, syncStateRows: 1, claimRows: 1, retiredWireIdRows: 1 })
+    expect(first).toEqual({ target, legacy, stateCopied: true, syncStateRows: 1, claimRows: 1, retiredWireIdRows: 1, verdictRows: 0 })
 
     const s = state()
     expect(s.syncConsents[target]).toEqual({ syncConsentAt: 1, syncConsentTarget: 'fp' })
@@ -131,7 +131,7 @@ describe('adoptLegacySyncTarget', () => {
     // Idempotent: a second call copies nothing, even after the legacy key gained rows.
     db.prepare(`INSERT INTO sync_retired_wire_ids (target, wire_id) VALUES (?, 'newer')`).run(legacy)
     const second = adoptLegacySyncTarget(dir, db, config)
-    expect(second).toEqual({ target, legacy, stateCopied: false, syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0 })
+    expect(second).toEqual({ target, legacy, stateCopied: false, syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0, verdictRows: 0 })
     expect(rows('sync_retired_wire_ids', target)).toBe(1)
   })
 
@@ -146,11 +146,12 @@ describe('adoptLegacySyncTarget', () => {
     expect(result?.syncStateRows).toBe(1)
   })
 
-  it('treats the legacy key as an alias of the current target when judging sole-target status', () => {
+  it('treats the legacy key as an alias of the current target among the known targets', () => {
     adoptLegacySyncTarget(dir, db, config)
-    expect(isSoleSyncTarget(state(), target)).toBe(false)
-    expect(isSoleSyncTarget(state(), target, [getLegacySyncTarget(config)])).toBe(true)
-    expect(isSoleSyncTarget({ ...state(), syncTargets: { ...state().syncTargets, cloud: {} } }, target, [legacy])).toBe(false)
+    expect(knownSyncTargets(state(), target)).toEqual([legacy, target].sort())
+    expect(knownSyncTargets(state(), target, [getLegacySyncTarget(config)])).toEqual([target])
+    expect(knownSyncTargets({ ...state(), syncTargets: { ...state().syncTargets, cloud: {} } }, target, [legacy])).toEqual(['cloud', target].sort())
+    expect(knownSyncTargets(null, target)).toEqual([target])
   })
 })
 

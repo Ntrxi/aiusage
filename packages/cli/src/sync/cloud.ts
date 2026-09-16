@@ -2,6 +2,7 @@ import type { SyncRecord } from '@aiusage/core'
 import { computeHmac, sha256, generateNonce, generateIdempotencyKey, buildCanonicalString } from '../leaderboard/crypto.js'
 import { loadCredentials } from '../leaderboard/credentials.js'
 import { getSiteUrl } from '../site-url.js'
+import { fromCloudRecord, toCloudRecord } from './cloud-dto.js'
 
 const SYNC_PUSH_PATH = '/api/cli/sync/push'
 const SYNC_PULL_PATH = '/api/cli/sync/pull'
@@ -98,7 +99,7 @@ export async function cloudPush(
     sync_generation: syncGeneration,
     client_version: getClientVersion(),
     client_platform: process.platform,
-    records,
+    records: records.map(toCloudRecord),
     tombstones,
   })
 
@@ -162,10 +163,21 @@ export async function cloudPull(
 
   if (!data) throw new CloudSyncError('Invalid response from server', 'invalid_response')
 
+  // A completed pull is reconciled against: every record must be
+  // representable, or the pull fails rather than silently omitting it (an
+  // omission would read as the record's absence from the cloud).
+  const rawRecords = Array.isArray(data.records) ? data.records : []
+  const records: SyncRecord[] = []
+  for (const raw of rawRecords) {
+    const record = fromCloudRecord(raw)
+    if (!record) throw new CloudSyncError('Invalid response from server: a pulled record could not be parsed', 'invalid_response')
+    records.push(record)
+  }
+
   return {
-    records: (data.records as SyncRecord[]) || [],
+    records,
     tombstones: (data.tombstones as CloudPulledTombstone[]) || [],
-    nextCursor: data.next_cursor as string | undefined,
+    nextCursor: (data.next_cursor as string | null | undefined) ?? undefined,
     hasMore: (data.has_more as boolean) || false,
     syncGeneration: (data.sync_generation as number) || 1,
   }

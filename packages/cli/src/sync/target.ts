@@ -79,12 +79,14 @@ export interface LegacyTargetAdoption {
   syncStateRows: number
   claimRows: number
   retiredWireIdRows: number
+  verdictRows: number
 }
 
 const TARGET_TABLES = [
   { table: 'sync_record_state', columns: ['record_id', 'synced_at'], key: 'syncStateRows' },
   { table: 'sync_record_claims', columns: ['device_instance_id', 'record_id'], key: 'claimRows' },
   { table: 'sync_retired_wire_ids', columns: ['wire_id'], key: 'retiredWireIdRows' },
+  { table: 'sync_namespace_verdicts', columns: ['device_instance_id', 'judged_at'], key: 'verdictRows' },
 ] as const
 
 /**
@@ -122,7 +124,7 @@ export function adoptLegacySyncTarget(aiusageDir: string, db: Database.Database,
     if (stateCopied) setState(aiusageDir, updates)
   }
 
-  const copied = { syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0 }
+  const copied = { syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0, verdictRows: 0 }
   db.transaction(() => {
     for (const { table, columns, key } of TARGET_TABLES) {
       const present = db.prepare(`SELECT 1 FROM ${table} WHERE target = ? LIMIT 1`).get(target)

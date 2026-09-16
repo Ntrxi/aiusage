@@ -34,11 +34,18 @@ describe('GitSyncBackend fails closed on cache I/O errors', () => {
     backend = new GitSyncBackend({ repo: 'u/r', token: 't', cacheDir: CACHE })
   })
 
-  it('readFile returns null only for ENOENT/ENOTDIR', async () => {
+  it('readFile returns null only for ENOENT', async () => {
     mockReadFile.mockRejectedValueOnce(errno('ENOENT'))
     await expect(backend.readFile('dev/2026/09/06.ndjson')).resolves.toBeNull()
+  })
+
+  it('readFile and listFiles treat ENOTDIR (a file where a directory is expected) as corruption, not absence', async () => {
     mockReadFile.mockRejectedValueOnce(errno('ENOTDIR'))
-    await expect(backend.readFile('dev/2026/09/06.ndjson')).resolves.toBeNull()
+    await expect(backend.readFile('dev/manifest.json')).rejects.toThrow("Cannot read 'dev/manifest.json' in the GitHub sync cache (ENOTDIR)")
+    mockStat.mockRejectedValueOnce(errno('ENOTDIR'))
+    await expect(backend.listFiles()).rejects.toThrow("Cannot list 'data' in the GitHub sync cache (ENOTDIR)")
+    mockUnlink.mockRejectedValueOnce(errno('ENOTDIR'))
+    await expect(backend.deleteFile('dev/x.ndjson')).rejects.toThrow("Cannot delete 'dev/x.ndjson' in the GitHub sync cache (ENOTDIR)")
   })
 
   it('readFile throws for permission and I/O errors', async () => {

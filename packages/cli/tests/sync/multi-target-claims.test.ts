@@ -53,8 +53,8 @@ function newDb(): Database.Database {
   return db
 }
 
-function sync(db: Database.Database, backend: FakeSyncBackend, deviceInstanceId: string, target: string, soleTarget = false) {
-  return new SyncOrchestrator(db, backend, { deviceInstanceId, target, consentVerified: true, soleTarget }).sync()
+function sync(db: Database.Database, backend: FakeSyncBackend, deviceInstanceId: string, target: string, knownTargets: string[] = [T_A, T_B]) {
+  return new SyncOrchestrator(db, backend, { deviceInstanceId, target, consentVerified: true, knownTargets }).sync()
 }
 
 const syncedIds = (db: Database.Database, owner: string) =>

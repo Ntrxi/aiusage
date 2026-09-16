@@ -12,6 +12,7 @@ import {
   getClaimedRecordIds,
   getClaimingTargets,
   getRetiredWireIds,
+  nextSyncTick,
   releaseClaim,
   replaceNamespaceClaims,
 } from '../../src/db/sync-claims.js'
@@ -60,11 +61,32 @@ describe('migration v14', () => {
     initializeDatabase(db)
   })
 
-  it('creates the claims and retired-id tables', () => {
+  it('creates the claims, retired-id and verdict tables and the unresolved marker', () => {
     const tables = (db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as Array<{ name: string }>).map(t => t.name)
     expect(tables).toContain('sync_record_claims')
     expect(tables).toContain('sync_retired_wire_ids')
+    expect(tables).toContain('sync_namespace_verdicts')
     expect(tables).not.toContain('sync_namespaces')
+    const columns = (db.prepare(`PRAGMA table_info(synced_records)`).all() as Array<{ name: string }>).map(c => c.name)
+    expect(columns).toContain('unclaimed_since')
+  })
+
+  it('marks every row mirrored before the upgrade unresolved at sync tick 0', () => {
+    const pulled = mapStatsRecordToSyncRecord(record({ id: 'p', deviceInstanceId: 'device-b', tool: 'claude-code', model: 'm', provider: 'p', sourceFile: 'C:\b.jsonl', lineOffset: 1 }))
+    insertSyncedRecord(db, pulled)
+    // Back to the pre-v14 shape, then upgrade.
+    db.exec(`DROP INDEX idx_synced_records_unclaimed; ALTER TABLE synced_records DROP COLUMN unclaimed_since`)
+    db.prepare(`DELETE FROM schema_version WHERE version = 14`).run()
+    migrateV14(db)
+    expect(db.prepare(`SELECT unclaimed_since FROM synced_records`).all()).toEqual([{ unclaimed_since: 0 }])
+    expect(nextSyncTick(db)).toBe(1)
+
+    // Idempotent: a second run neither fails nor re-stamps.
+    replaceNamespaceClaims(db, 'cloud', 'device-b', [pulled.id])
+    expect(db.prepare(`SELECT unclaimed_since FROM synced_records`).all()).toEqual([{ unclaimed_since: null }])
+    db.prepare(`DELETE FROM schema_version WHERE version = 14`).run()
+    migrateV14(db)
+    expect(db.prepare(`SELECT unclaimed_since FROM synced_records`).all()).toEqual([{ unclaimed_since: null }])
   })
 
   it('retires the old generated wire ids of already-synced Antigravity and Trae records and re-queues them', () => {
@@ -217,8 +239,8 @@ describe('upgrade with rows whose namespace disappeared before v14', () => {
     seedPreV14()
   })
 
-  it('prunes the stale rows automatically when this is the only target the device has ever used', async () => {
-    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: true }).sync()
+  it('prunes the stale rows automatically when this is the only target the device has ever known', async () => {
+    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, knownTargets: [TARGET] }).sync()
     expect(result.status).toBe('ok')
     expect(result.prunedCount).toBe(2)
     expect(rowsOf(GONE)).toEqual([])
@@ -228,8 +250,8 @@ describe('upgrade with rows whose namespace disappeared before v14', () => {
     expect(getClaimedOwners(db, TARGET)).toEqual([PRESENT])
   })
 
-  it('keeps the stale rows when other targets exist, and lets sync --repair remove them deterministically', async () => {
-    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: false }).sync()
+  it('keeps the stale rows while another known target has not judged them, and lets sync --repair remove them deterministically', async () => {
+    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, knownTargets: [TARGET, 'cloud'] }).sync()
     expect(result.status).toBe('ok')
     expect(result.prunedCount ?? 0).toBe(0)
     expect(rowsOf(GONE)).toEqual(staleIds.sort())
@@ -251,7 +273,7 @@ describe('upgrade with rows whose namespace disappeared before v14', () => {
 
   it('does not report rows of a device that is present on the target, nor rows another target claims', async () => {
     replaceNamespaceClaims(db, 'cloud', GONE, [staleIds[0]])
-    await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, soleTarget: true }).sync()
+    await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, knownTargets: [TARGET] }).sync()
     // The cloud-claimed row survives the sole-target prune; the other stale row does not.
     expect(rowsOf(GONE)).toEqual([staleIds[0]])
     const dry = await repairSyncContamination(db, { deviceInstanceId: OWN, target: TARGET, backend })

@@ -10,10 +10,20 @@ import { retireWireIdsOfUnknownLocalRows } from '../records.js'
  *    target's claims for a namespace with what the namespace holds now and
  *    deletes pulled rows only when no target claims them any more, so a
  *    namespace that shrinks or disappears on one target never removes rows
- *    another target still carries. Rows pulled before this migration have no
- *    claim; they are adopted (or pruned) the first time their namespace is
- *    reconciled on a target, and `aiusage sync --repair` reports the ones
- *    whose namespace is absent from the configured target.
+ *    another target still carries.
+ *
+ *    Rows pulled before this migration have no claim and nothing records
+ *    which target they came from. They are marked *unresolved*
+ *    (`synced_records.unclaimed_since` = sync tick 0, before any sync of
+ *    this release) and are protected from reconciliation until their
+ *    provenance is settled: `sync_namespace_verdicts` records, per target
+ *    and namespace owner, the sync tick at which the target last judged that
+ *    namespace reliably (a verified read, an authoritatively empty
+ *    namespace, or a confirmed absence). An unresolved row is deleted only
+ *    once every sync target this device knows has judged its namespace in a
+ *    sync after the one that made the row unresolved, and none claimed it.
+ *    The same state and rule cover rows upserted later from a namespace that
+ *    could not be verified. See `docs/sync-namespaces.md`.
  *
  * 2. `sync_retired_wire_ids` holds wire ids this device has published under a
  *    target but will never publish again. Antigravity and Trae records used to
@@ -53,7 +63,29 @@ export function migrateV14(db: Database.Database): void {
       wire_id TEXT NOT NULL,
       PRIMARY KEY (target, wire_id)
     );
+
+    CREATE TABLE IF NOT EXISTS sync_namespace_verdicts (
+      target             TEXT NOT NULL,
+      device_instance_id TEXT NOT NULL,
+      judged_at          INTEGER NOT NULL,
+      PRIMARY KEY (target, device_instance_id)
+    );
   `)
+
+  // Every row mirrored so far is of unknown provenance: no target claims it
+  // and no target has judged its namespace since claims exist. Stamping sync
+  // tick 0 makes such rows wait for a verdict from every known target
+  // (every verdict has a tick of 1 or more) rather than be pruned by the
+  // first one that reconciles.
+  const columns = db.prepare(`PRAGMA table_info(synced_records)`).all() as Array<{ name: string }>
+  if (!columns.some(c => c.name === 'unclaimed_since')) {
+    db.exec(`ALTER TABLE synced_records ADD COLUMN unclaimed_since INTEGER`)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_synced_records_unclaimed ON synced_records(unclaimed_since) WHERE unclaimed_since IS NOT NULL`)
+    db.prepare(`
+      UPDATE synced_records SET unclaimed_since = 0
+      WHERE id NOT IN (SELECT record_id FROM sync_record_claims)
+    `).run()
+  }
 
   const placeholders = REKEYED_TOOLS.map(() => '?').join(', ')
   const rows = db.prepare(`

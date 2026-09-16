@@ -55,13 +55,18 @@ import { listedOwners, readNamespaceSnapshot } from './snapshot.js'
  *  - **wire-id collision** (report only): two local records that map to the
  *    same wire id. The mapper is expected to make this impossible; a non-zero
  *    count is a parser or mapper bug worth reporting.
- *  - **orphaned pulled row**: a `synced_records` row that no sync target
- *    claims (it was pulled before per-target claims existed, migration v14)
- *    and whose device has no namespace on the configured target. Sync cannot
- *    tell whether another, older target still carries it, so it leaves such
- *    rows alone unless this is the only target the device ever used; repair
- *    reports them and removes them on request. If the device does publish
- *    elsewhere, syncing that target first re-establishes its claims.
+ *  - **orphaned pulled row**: an *unresolved* `synced_records` row (no sync
+ *    target claims it: pulled before per-target claims existed, migration
+ *    v14, or read from a namespace that could not be verified since) that
+ *    the configured target provably does not carry: its device has no
+ *    namespace there (neither day files nor a manifest — absent, rather
+ *    than empty or unverifiable), or the device's namespace verified and
+ *    does not contain the row. A row of a namespace that could not be
+ *    verified is never reported. Sync deletes such rows by itself once every
+ *    target this device knows has judged the namespace; a target that is
+ *    never synced again withholds that verdict forever, which is what repair
+ *    is for. If the device does publish the row on another target, syncing
+ *    that target first claims it and it stops being reported.
  *
  * Remote namespaces are read the way pull reads them (`snapshot.ts`): through
  * the manifest when there is one, every listed file otherwise. A namespace
@@ -134,7 +139,7 @@ export interface LocalRepairPlan {
   staleSyncStateCount: number
   /** Local records sharing a wire id (report only; the mapper should make this impossible). */
   wireIdCollisions: Array<{ wireId: string; recordIds: string[] }>
-  /** Unclaimed pulled rows whose device is absent from the configured target. */
+  /** Unresolved pulled rows the configured target provably does not carry (device absent, or verified namespace without them). */
   orphanedSyncedIds: string[]
   /** The devices those rows are attributed to. */
   orphanedDevices: string[]
@@ -166,12 +171,21 @@ function buildSessionKeyChain(db: Database.Database, remoteLines?: Iterable<Sync
   return chain
 }
 
+export interface RemotePresence {
+  /** Namespace owners with day files or a manifest on the target. */
+  presentOwners: Set<string>
+  /** Owners whose namespace snapshot verified. */
+  verifiedOwners: Set<string>
+  /** Every wire id in a verified namespace. */
+  verifiedIds: Set<string>
+}
+
 export function planLocalRepair(
   db: Database.Database,
   deviceInstanceId: string,
   remoteLines?: Iterable<SyncRecord>,
-  /** Namespace owners present on the configured target; omit when unknown (cloud). */
-  presentOwners?: Set<string>,
+  /** What the configured target carries; omit when unknown (cloud). */
+  remote?: RemotePresence,
 ): LocalRepairPlan {
   // 1. Provenance: local-flagged rows that are provably pulled copies.
   const reflagRows = db.prepare(`
@@ -218,13 +232,17 @@ export function planLocalRepair(
   // 5. Wire-id collisions among this device's own records.
   const { collisions } = buildLocalSnapshot(db, deviceInstanceId)
 
-  // 6. Orphaned pulled rows: unclaimed, and their device is not on the target.
+  // 6. Orphaned pulled rows: unresolved, and provably not on the target —
+  //    their device is absent, or its verified namespace lacks them.
   const orphanedSyncedIds: string[] = []
   const orphanedDevices: string[] = []
-  if (presentOwners) {
+  if (remote) {
     for (const [owner, ids] of getUnclaimedSyncedRecords(db)) {
-      if (owner === deviceInstanceId || owner === UNKNOWN_DEVICE_INSTANCE_ID || owner === '' || presentOwners.has(owner)) continue
-      const fresh = ids.filter(id => !echoSet.has(id))
+      if (owner === deviceInstanceId || owner === UNKNOWN_DEVICE_INSTANCE_ID || owner === '') continue
+      const absent = !remote.presentOwners.has(owner)
+      const verified = remote.verifiedOwners.has(owner)
+      if (!absent && !verified) continue
+      const fresh = ids.filter(id => !echoSet.has(id) && (absent || !remote.verifiedIds.has(id)))
       if (fresh.length === 0) continue
       orphanedDevices.push(owner)
       orphanedSyncedIds.push(...fresh)
@@ -508,7 +526,28 @@ export async function repairSyncContamination(db: Database.Database, options: Re
     remote = await planRemoteRepair(backend, { deviceInstanceId, allNamespaces: options.allNamespaces, sessionKeys, ownWireIds })
   }
 
-  const local = planLocalRepair(db, deviceInstanceId, remote?.allRecords, remote?.presentOwners)
+  let presence: RemotePresence | undefined
+  if (backend && remote) {
+    const skipped = new Set(remote.skippedNamespaces.map(n => n.owner))
+    presence = {
+      presentOwners: new Set(remote.presentOwners),
+      verifiedOwners: new Set([...remote.presentOwners].filter(o => !skipped.has(o))),
+      verifiedIds: new Set<string>(),
+    }
+    for (const [owner, files] of remote.finalFiles) {
+      if (skipped.has(owner)) continue
+      for (const records of files.values()) for (const r of records) presence.verifiedIds.add(r.id)
+    }
+    for (const record of remote.allRecords) if (!skipped.has(record.deviceInstanceId)) presence.verifiedIds.add(record.id)
+    // A device with nothing listed may still have a manifest on the target:
+    // its namespace is then authoritatively empty or unverifiable, either
+    // way not absent, and its unresolved rows are sync's to settle.
+    for (const owner of getUnclaimedSyncedRecords(db).keys()) {
+      if (owner === deviceInstanceId || owner === UNKNOWN_DEVICE_INSTANCE_ID || owner === '' || presence.presentOwners.has(owner)) continue
+      if (await backend.readFile(manifestPath(owner)) !== null) presence.presentOwners.add(owner)
+    }
+  }
+  const local = planLocalRepair(db, deviceInstanceId, remote?.allRecords, presence)
   const report: RepairReport = { deviceInstanceId, local, remote, applied: false }
 
   if (!options.apply) return report

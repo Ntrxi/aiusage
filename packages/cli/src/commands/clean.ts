@@ -62,6 +62,7 @@ export function cleanAll(db: Database.Database): CleanAllResult {
   const syncStateResult = db.prepare('DELETE FROM sync_record_state').run()
   const tombstonesResult = db.prepare('DELETE FROM sync_tombstones').run()
   db.prepare('DELETE FROM sync_record_claims').run()
+  db.prepare('DELETE FROM sync_namespace_verdicts').run()
   // A full wipe leaves no sync bookkeeping behind at all: the retirements
   // pending for the cloud backend describe records that no longer exist here
   // (the cloud is cleared alongside, or `--local-only` was chosen knowingly).

@@ -1,9 +1,19 @@
 import type Database from 'better-sqlite3'
 import type { SyncRecord } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from './records.js'
-import { releaseClaim } from './sync-claims.js'
+import { getNamespaceVerdicts, hasClaim, nextSyncTick, recordNamespaceVerdict, releaseClaim, UNKNOWN_NAMESPACE_VERDICT } from './sync-claims.js'
 
-export function insertSyncedRecord(db: Database.Database, record: SyncRecord): boolean {
+/**
+ * Upsert a pulled record. A new row starts *unresolved* (`unclaimed_since =
+ * tick`, the sync clock tick of the pull, see `nextSyncTick`): no target
+ * claims it until the namespace it came from is reconciled reliably. An
+ * existing row only takes the incoming values when they are newer
+ * (`updatedAt`), whatever target or snapshot they came from — the local
+ * value of a record is the newest version ever observed, and an update never
+ * changes the row's claims or its unresolved state.
+ * Returns true when a row was inserted or updated.
+ */
+export function insertSyncedRecord(db: Database.Database, record: SyncRecord, tick: number = nextSyncTick(db)): boolean {
   // Only replace if the incoming record is newer than what we already have.
   // Without this check, a stale remote record could silently overwrite a newer one.
   const result = db.prepare(`
@@ -11,12 +21,12 @@ export function insertSyncedRecord(db: Database.Database, record: SyncRecord): b
       id, ts, tool, model, provider, input_tokens, output_tokens,
       cache_read_tokens, cache_write_tokens, thinking_tokens,
       cost, cost_source, session_key, device, device_instance_id, platform, updated_at,
-      source_file, cwd
+      source_file, cwd, unclaimed_since
     ) VALUES (
       @id, @ts, @tool, @model, @provider, @inputTokens, @outputTokens,
       @cacheReadTokens, @cacheWriteTokens, @thinkingTokens,
       @cost, @costSource, @sessionKey, @device, @deviceInstanceId, @platform, @updatedAt,
-      @sourceFile, @cwd
+      @sourceFile, @cwd, @tick
     )
     ON CONFLICT(id) DO UPDATE SET
       ts = excluded.ts,
@@ -58,6 +68,7 @@ export function insertSyncedRecord(db: Database.Database, record: SyncRecord): b
     updatedAt: record.updatedAt,
     sourceFile: record.sourceFile ?? '',
     cwd: record.cwd ?? '',
+    tick,
   })
   return result.changes > 0
 }
@@ -69,13 +80,16 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 }
 
 /**
- * Release `target`'s claim on a pulled record and, when no target claims it
- * any more, remove it from both `synced_records` and its merged copy in
- * `records`. Locally parsed rows (`origin = 'local'`) are never touched.
+ * Release `target`'s claim on a pulled record and, when that was the last
+ * claim, remove it from both `synced_records` and its merged copy in
+ * `records`. A target can only release its own claim: a row `target` never
+ * claimed (an unresolved row, or one claimed by other targets only) is left
+ * alone. Locally parsed rows (`origin = 'local'`) are never touched.
  * Returns true when a `synced_records` row was removed.
  */
 export function deleteSyncedRecord(db: Database.Database, target: string, id: string): boolean {
   return db.transaction(() => {
+    if (!hasClaim(db, target, id)) return false
     if (!releaseClaim(db, target, id)) return false
     const removed = db.prepare(`DELETE FROM synced_records WHERE id = ?`).run(id).changes > 0
     db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`).run(id)
@@ -92,25 +106,33 @@ function fillRemoteIds(db: Database.Database, ids: Iterable<string>): void {
 
 /**
  * Make the local mirror of `owner`'s namespace, as seen from `target`, match
- * `remoteIds` exactly.
+ * `remoteIds` exactly, and record `target`'s verdict on the namespace.
  *
  *  - Legacy rows stamped `'unknown'` (or empty) whose id is present in the
  *    namespace are relabelled to `owner`: the namespace they sit in is the
  *    device that parsed them, and exposing `'unknown'` as a device of its own
  *    was a display bug.
- *  - `target`'s claims for `owner` are replaced by `remoteIds`.
- *  - Rows attributed to `owner` that no target claims any more are removed
- *    from `synced_records`, together with their merged copies in `records`
- *    (`origin = 'synced'` only). A row another target still claims survives,
- *    and locally parsed rows are never deleted here.
+ *  - `target`'s claims for `owner` are replaced by `remoteIds`; the claimed
+ *    rows are resolved (`unclaimed_since = NULL`).
+ *  - Rows whose claim `target` released here and that no target claims any
+ *    more are removed from `synced_records`, together with their merged
+ *    copies in `records` (`origin = 'synced'` only). A target only ever
+ *    releases its own claim: a row another target still claims survives, and
+ *    so does an *unresolved* row (one `target` never claimed) — only
+ *    `pruneUnresolvedSyncedRecords` may remove those, once every known
+ *    target has judged the namespace. Locally parsed rows are never deleted
+ *    here.
+ *  - The verdict `(target, owner, judgedAt)` is recorded, `judgedAt` being
+ *    the sync clock tick of the run (see `nextSyncTick`).
  *
  * Callers must only invoke this with a `remoteIds` set they read completely
- * and reliably; a namespace whose files could not all be read or parsed must
- * be skipped, never reconciled against a partial set.
+ * and reliably (a verified snapshot, an authoritatively empty namespace, or a
+ * confirmed absence); a namespace whose files could not all be read, parsed
+ * or verified must be skipped, never reconciled against a partial set.
  *
  * Returns the number of `synced_records` rows removed.
  */
-export function reconcileSyncedNamespace(db: Database.Database, target: string, owner: string, remoteIds: Iterable<string>): number {
+export function reconcileSyncedNamespace(db: Database.Database, target: string, owner: string, remoteIds: Iterable<string>, judgedAt: number = nextSyncTick(db)): number {
   return db.transaction(() => {
     fillRemoteIds(db, remoteIds)
 
@@ -128,58 +150,52 @@ export function reconcileSyncedNamespace(db: Database.Database, target: string, 
       `).run({ owner })
     }
 
+    // The claims this target is about to release: the only rows this
+    // reconciliation may delete.
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS sync_released_ids (id TEXT PRIMARY KEY)`)
+    db.exec(`DELETE FROM sync_released_ids`)
+    db.prepare(`
+      INSERT OR IGNORE INTO sync_released_ids (id)
+      SELECT record_id FROM sync_record_claims
+      WHERE target = @target AND device_instance_id = @owner
+        AND record_id NOT IN (SELECT id FROM sync_remote_ids)
+    `).run({ target, owner })
+
     db.prepare(`DELETE FROM sync_record_claims WHERE target = @target AND device_instance_id = @owner`).run({ target, owner })
     db.prepare(`
       INSERT OR IGNORE INTO sync_record_claims (target, device_instance_id, record_id)
       SELECT @target, @owner, id FROM sync_remote_ids
     `).run({ target, owner })
+    db.prepare(`
+      UPDATE synced_records SET unclaimed_since = NULL
+      WHERE unclaimed_since IS NOT NULL AND id IN (SELECT id FROM sync_remote_ids)
+    `).run()
 
+    // A released row goes only when no target claims it any more.
     const pruned = db.prepare(`
       DELETE FROM synced_records
-      WHERE device_instance_id = @owner
+      WHERE id IN (SELECT id FROM sync_released_ids)
         AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run({ owner }).changes
+    `).run().changes
     db.prepare(`
       DELETE FROM records
       WHERE origin = 'synced'
-        AND device_instance_id = @owner
-        AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run({ owner })
+        AND id IN (SELECT id FROM sync_released_ids)
+        AND id NOT IN (SELECT id FROM synced_records)
+    `).run()
 
+    recordNamespaceVerdict(db, target, owner, judgedAt)
+    db.exec(`DELETE FROM sync_released_ids`)
     db.exec(`DELETE FROM sync_remote_ids`)
     return pruned
   })()
 }
 
 /**
- * Drop legacy pulled rows still stamped `'unknown'` that no target claims.
- * Such rows can only be left over from an old client whose device has since
- * re-published its namespace under its real id (the records arrive again
- * under that id and the old copies would otherwise show up as a phantom third
- * device). Returns the number of `synced_records` rows removed.
- */
-export function pruneUnclaimedUnknownSyncedRecords(db: Database.Database): number {
-  return db.transaction(() => {
-    const pruned = db.prepare(`
-      DELETE FROM synced_records
-      WHERE device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run().changes
-    db.prepare(`
-      DELETE FROM records
-      WHERE origin = 'synced'
-        AND device_instance_id IN ('${UNKNOWN_DEVICE_INSTANCE_ID}', '')
-        AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run()
-    return pruned
-  })()
-}
-
-/**
  * Pulled rows that no target claims, grouped by the device they are
- * attributed to. These predate migration v14 (claims did not exist yet) or
- * arrived through a namespace that has not been reconciled since; only the
- * caller can tell whether their device still publishes anywhere.
+ * attributed to. These are the *unresolved* rows: they predate migration v14
+ * (claims did not exist yet) or were read from a namespace no target has
+ * verified since; only a verdict from every known target can settle them.
  */
 export function getUnclaimedSyncedRecords(db: Database.Database): Map<string, string[]> {
   const rows = db.prepare(`
@@ -196,27 +212,65 @@ export function getUnclaimedSyncedRecords(db: Database.Database): Map<string, st
   return byOwner
 }
 
+/** Devices that unresolved rows are attributed to. */
+export function getUnclaimedOwners(db: Database.Database): string[] {
+  const rows = db.prepare(`
+    SELECT DISTINCT device_instance_id AS owner FROM synced_records
+    WHERE id NOT IN (SELECT record_id FROM sync_record_claims)
+    ORDER BY device_instance_id
+  `).all() as Array<{ owner: string }>
+  return rows.map(r => r.owner)
+}
+
+/** Verdict key under which rows attributed to `owner` are judged. */
+export function namespaceVerdictKey(owner: string): string {
+  return owner === '' || owner === UNKNOWN_DEVICE_INSTANCE_ID ? UNKNOWN_NAMESPACE_VERDICT : owner
+}
+
 /**
- * Remove unclaimed pulled rows attributed to any device in `owners`, with
- * their merged copies. Used when the caller has established that those
- * devices publish nowhere this client can still reach. Returns the number of
- * `synced_records` rows removed.
+ * Remove unresolved rows whose provenance has been settled negatively: every
+ * target in `knownTargets` has judged the row's namespace in a sync *after*
+ * the one that made the row unresolved (so the row was on none of them) and
+ * still no target claims it. Rows of a namespace that some known target has
+ * not judged yet — because that target has not been synced since the
+ * upgrade, or skipped the namespace as unverifiable — are kept; they may be
+ * exactly what that target still carries. Rows stamped `'unknown'` are
+ * judged under `UNKNOWN_NAMESPACE_VERDICT`. Returns the number of
+ * `synced_records` rows removed (merged copies go with them).
  */
-export function pruneUnclaimedSyncedRecordsOf(db: Database.Database, owners: Iterable<string>): number {
+export function pruneUnresolvedSyncedRecords(db: Database.Database, knownTargets: Iterable<string>): number {
+  const targets = [...new Set(knownTargets)]
+  if (targets.length === 0) return 0
   return db.transaction(() => {
-    fillRemoteIds(db, owners)
-    const pruned = db.prepare(`
+    const owners = (db.prepare(`
+      SELECT DISTINCT device_instance_id AS owner FROM synced_records
+      WHERE id NOT IN (SELECT record_id FROM sync_record_claims)
+    `).all() as Array<{ owner: string }>).map(r => r.owner)
+    let pruned = 0
+    const del = db.prepare(`
       DELETE FROM synced_records
-      WHERE device_instance_id IN (SELECT id FROM sync_remote_ids)
+      WHERE device_instance_id = @owner
         AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run().changes
-    db.prepare(`
+        AND COALESCE(unclaimed_since, 0) < @cutoff
+    `)
+    const delMerged = db.prepare(`
       DELETE FROM records
       WHERE origin = 'synced'
-        AND device_instance_id IN (SELECT id FROM sync_remote_ids)
-        AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run()
-    db.exec(`DELETE FROM sync_remote_ids`)
+        AND device_instance_id = @owner
+        AND id NOT IN (SELECT id FROM synced_records)
+    `)
+    for (const owner of owners) {
+      const verdicts = getNamespaceVerdicts(db, namespaceVerdictKey(owner))
+      let cutoff = Infinity
+      for (const target of targets) {
+        const judgedAt = verdicts.get(target)
+        if (judgedAt === undefined) { cutoff = -Infinity; break }
+        cutoff = Math.min(cutoff, judgedAt)
+      }
+      if (cutoff === -Infinity) continue
+      pruned += del.run({ owner, cutoff }).changes
+      delMerged.run({ owner })
+    }
     return pruned
   })()
 }
