@@ -6,8 +6,8 @@ import { getUnclaimedSyncedRecords } from '../db/synced-records.js'
 import { dropDanglingClaims } from '../db/sync-claims.js'
 import type { SyncBackend } from './index.js'
 import { buildLocalSnapshot } from './index.js'
-import { buildManifest, isManifestPath, manifestPath, parseNdjsonLines, parseSyncRecordLine, serializeManifest } from './manifest.js'
-import { namespaceOwnerFromPath } from './ownership.js'
+import { buildManifest, manifestPath, serializeManifest, serializeSnapshot } from './manifest.js'
+import { listedOwners, readNamespaceSnapshot } from './snapshot.js'
 
 /**
  * Opt-in cleanup of state left behind by earlier sync bugs.
@@ -62,6 +62,17 @@ import { namespaceOwnerFromPath } from './ownership.js'
  *    rows alone unless this is the only target the device ever used; repair
  *    reports them and removes them on request. If the device does publish
  *    elsewhere, syncing that target first re-establishes its claims.
+ *
+ * Remote namespaces are read the way pull reads them (`snapshot.ts`): through
+ * the manifest when there is one, every listed file otherwise. A namespace
+ * whose snapshot cannot be verified — a manifest that does not parse or does
+ * not match its files, a file gone missing, a malformed line — is *skipped*:
+ * it is reported, its lines still seed the echo detection, but none of its
+ * files is rewritten. Rewriting it (and publishing a manifest over the
+ * result) could turn a half-written or corrupt state into the authoritative
+ * one. For this device's own namespace the next `aiusage sync` republishes
+ * the snapshot from the local database anyway; another device's namespace
+ * is its owner's to fix.
  *
  * Deleting an echo never loses usage: by construction the parent it was
  * derived from still exists (or is itself an echo whose parent exists).
@@ -266,8 +277,8 @@ export interface RemoteFilePlan {
   staleLines: number
   /** Older copies of an id that also appears elsewhere in the namespace. */
   duplicateLines: number
-  /** Lines that survive; the file is deleted when this is empty. */
-  keptLines: string[]
+  /** Records that survive; the file is deleted when this is empty. */
+  keptRecords: SyncRecord[]
 }
 
 export interface RemoteNamespaceSummary {
@@ -278,6 +289,8 @@ export interface RemoteNamespaceSummary {
   echoLines: number
   staleLines: number
   duplicateLines: number
+  /** Set when the namespace could not be verified and is left untouched. */
+  skipped?: string
 }
 
 export interface RemoteRepairPlan {
@@ -297,6 +310,8 @@ export interface RemoteRepairPlan {
   finalFiles: Map<string, Map<string, SyncRecord[]>>
   /** Owners whose namespace carried a manifest when scanned. */
   ownersWithManifest: Set<string>
+  /** Namespaces whose snapshot could not be verified; none of their files is planned. */
+  skippedNamespaces: Array<{ owner: string; reason: string }>
 }
 
 export interface RemoteRepairOptions {
@@ -314,122 +329,119 @@ export interface RemoteRepairOptions {
 }
 
 export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepairOptions): Promise<RemoteRepairPlan> {
-  const paths = (await backend.listFiles()).filter(p => p.endsWith('.ndjson') && !isManifestPath(p)).sort()
+  const listing = await backend.listFiles()
   const chain = options.sessionKeys ?? new SessionKeyChain()
-  const parsed: Array<{ path: string; owner: string; lines: Array<{ raw: string; record: SyncRecord | null }> }> = []
   const allRecords: SyncRecord[] = []
   const presentOwners = new Set<string>()
   const ownersWithManifest = new Set<string>()
+  const skippedNamespaces: RemoteRepairPlan['skippedNamespaces'] = []
+  const files: RemoteFilePlan[] = []
+  const namespaces: RemoteNamespaceSummary[] = []
+  const finalFiles = new Map<string, Map<string, SyncRecord[]>>()
+  let scannedFiles = 0
 
-  for (const path of paths) {
-    const owner = namespaceOwnerFromPath(path)
-    if (!presentOwners.has(owner)) {
-      presentOwners.add(owner)
-      if ((await backend.readFile(manifestPath(owner))) !== null) ownersWithManifest.add(owner)
-    }
-    const content = await backend.readFile(path)
-    if (!content) continue
-    const lines = content.split('\n').filter(Boolean).map(raw => {
-      const record = parseSyncRecordLine(raw)
-      if (record) {
+  for (const owner of listedOwners(listing)) {
+    presentOwners.add(owner)
+    // Every namespace is read the way pull reads it: the manifest decides
+    // which files make up the snapshot and whether it can be trusted.
+    const snapshot = await readNamespaceSnapshot(backend, owner, listing)
+    if (snapshot.hasManifest) ownersWithManifest.add(owner)
+    for (const records of snapshot.files.values()) {
+      for (const record of records) {
         chain.add(record.sessionKey)
         allRecords.push(record)
       }
-      return { raw, record }
-    })
-    parsed.push({ path, owner, lines })
-  }
+    }
+    scannedFiles += snapshot.files.size
 
-  // Duplicate detection: per namespace, the copy of an id with the highest
-  // updatedAt (ties: the first in path order) is the one to keep.
-  const best = new Map<string, Map<string, { path: string; index: number; updatedAt: number }>>()
-  for (const file of parsed) {
-    let perOwner = best.get(file.owner)
-    if (!perOwner) best.set(file.owner, perOwner = new Map())
-    file.lines.forEach(({ record }, index) => {
-      if (!record) return
-      const prev = perOwner!.get(record.id)
-      if (!prev || record.updatedAt > prev.updatedAt) perOwner!.set(record.id, { path: file.path, index, updatedAt: record.updatedAt })
-    })
-  }
+    const ns: RemoteNamespaceSummary = { owner, files: snapshot.files.size, lines: 0, foreignLines: 0, echoLines: 0, staleLines: 0, duplicateLines: 0 }
+    for (const records of snapshot.files.values()) ns.lines += records.length
+    namespaces.push(ns)
 
-  const files: RemoteFilePlan[] = []
-  const perNamespace = new Map<string, RemoteNamespaceSummary>()
-  const finalFiles = new Map<string, Map<string, SyncRecord[]>>()
+    if (!snapshot.reliable) {
+      const reason = snapshot.problems[0] ?? 'snapshot could not be verified'
+      ns.skipped = reason
+      skippedNamespaces.push({ owner, reason })
+      continue
+    }
 
-  for (const file of parsed) {
-    const isOwn = file.owner === options.deviceInstanceId
+    const isOwn = owner === options.deviceInstanceId
     const repairable = options.allNamespaces || isOwn
-    const ns = perNamespace.get(file.owner) ?? { owner: file.owner, files: 0, lines: 0, foreignLines: 0, echoLines: 0, staleLines: 0, duplicateLines: 0 }
-    ns.files++
-    ns.lines += file.lines.length
-    perNamespace.set(file.owner, ns)
-    const winners = best.get(file.owner)!
 
-    let foreignLines = 0
-    let echoLines = 0
-    let staleLines = 0
-    let duplicateLines = 0
-    const keptLines: string[] = []
-    file.lines.forEach(({ raw, record }, index) => {
-      if (!record) { keptLines.push(raw); return }
-      const did = record.deviceInstanceId
-      const foreign = !!did && did !== UNKNOWN_DEVICE_INSTANCE_ID && did !== file.owner
-      const echo = !foreign && chain.isEcho(record)
-      const winner = winners.get(record.id)!
-      const duplicate = !foreign && !echo && !(winner.path === file.path && winner.index === index)
-      const stale = !foreign && !echo && !duplicate && isOwn && options.ownWireIds !== undefined && !options.ownWireIds.has(record.id)
-      if (foreign) foreignLines++
-      else if (echo) echoLines++
-      else if (duplicate) duplicateLines++
-      else if (stale) staleLines++
-      else keptLines.push(raw)
-    })
-    ns.foreignLines += foreignLines
-    ns.echoLines += echoLines
-    ns.staleLines += staleLines
-    ns.duplicateLines += duplicateLines
-    const changed = repairable && (foreignLines > 0 || echoLines > 0 || staleLines > 0 || duplicateLines > 0)
-    if (changed) {
-      files.push({ path: file.path, owner: file.owner, totalLines: file.lines.length, foreignLines, echoLines, staleLines, duplicateLines, keptLines })
+    // Duplicate detection: the copy of an id with the highest updatedAt
+    // (ties: the first in path order) is the one to keep.
+    const best = new Map<string, { rel: string; index: number; updatedAt: number }>()
+    for (const [rel, records] of snapshot.files) {
+      records.forEach((record, index) => {
+        const prev = best.get(record.id)
+        if (!prev || record.updatedAt > prev.updatedAt) best.set(record.id, { rel, index, updatedAt: record.updatedAt })
+      })
     }
-    const finalRecords = changed
-      ? parseNdjsonLines(keptLines.join('\n')).records
-      : file.lines.flatMap(l => (l.record ? [l.record] : []))
-    if (finalRecords.length > 0) {
-      let perOwner = finalFiles.get(file.owner)
-      if (!perOwner) finalFiles.set(file.owner, perOwner = new Map())
-      perOwner.set(file.path.slice(file.owner.length + 1), finalRecords)
+
+    const perOwner = new Map<string, SyncRecord[]>()
+    for (const [rel, records] of snapshot.files) {
+      let foreignLines = 0
+      let echoLines = 0
+      let staleLines = 0
+      let duplicateLines = 0
+      const keptRecords: SyncRecord[] = []
+      records.forEach((record, index) => {
+        const did = record.deviceInstanceId
+        const foreign = !!did && did !== UNKNOWN_DEVICE_INSTANCE_ID && did !== owner
+        const echo = !foreign && chain.isEcho(record)
+        const winner = best.get(record.id)!
+        const duplicate = !foreign && !echo && !(winner.rel === rel && winner.index === index)
+        const stale = !foreign && !echo && !duplicate && isOwn && options.ownWireIds !== undefined && !options.ownWireIds.has(record.id)
+        if (foreign) foreignLines++
+        else if (echo) echoLines++
+        else if (duplicate) duplicateLines++
+        else if (stale) staleLines++
+        else keptRecords.push(record)
+      })
+      ns.foreignLines += foreignLines
+      ns.echoLines += echoLines
+      ns.staleLines += staleLines
+      ns.duplicateLines += duplicateLines
+      const changed = repairable && (foreignLines > 0 || echoLines > 0 || staleLines > 0 || duplicateLines > 0)
+      if (changed) {
+        files.push({ path: `${owner}/${rel}`, owner, totalLines: records.length, foreignLines, echoLines, staleLines, duplicateLines, keptRecords })
+      }
+      const finalRecords = changed ? keptRecords : records
+      if (finalRecords.length > 0) perOwner.set(rel, finalRecords)
     }
+    if (perOwner.size > 0) finalFiles.set(owner, perOwner)
   }
 
   return {
-    scannedFiles: parsed.length,
+    scannedFiles,
     scannedLines: allRecords.length,
     allRecords,
     files,
-    namespaces: Array.from(perNamespace.values()).sort((a, b) => a.owner.localeCompare(b.owner)),
+    namespaces: namespaces.sort((a, b) => a.owner.localeCompare(b.owner)),
     presentOwners,
     finalFiles,
     ownersWithManifest,
+    skippedNamespaces,
   }
 }
 
 /**
- * Rewrite the planned files. Files are written before any deletion, and the
- * manifest of every namespace that changed is refreshed afterwards so peers
- * keep verifying it — for this device's own namespace always, for other
- * namespaces only when they already carried one (a namespace still written by
- * a pre-manifest client must not acquire a manifest that client would never
- * maintain).
+ * Rewrite the planned files. Files are written (in canonical form) before any
+ * deletion, and the manifest of every namespace that changed is refreshed in
+ * between so peers keep verifying it — for this device's own namespace
+ * always, for other namespaces only when they already carried one (a
+ * namespace still written by a pre-manifest client must not acquire a
+ * manifest that client would never maintain). Only namespaces the plan read
+ * reliably have files here, so a manifest written by repair describes that
+ * verified snapshot minus the removed lines and nothing else.
  */
 export async function applyRemoteRepair(backend: SyncBackend, plan: RemoteRepairPlan, deviceInstanceId?: string): Promise<{ rewritten: number; deleted: number }> {
   let rewritten = 0
   let deleted = 0
   const touchedOwners = new Set<string>()
   for (const file of plan.files) {
-    if (file.keptLines.length > 0) {
-      await backend.writeFile(file.path, file.keptLines.join('\n') + '\n')
+    if (file.keptRecords.length > 0) {
+      await backend.writeFile(file.path, serializeSnapshot(file.keptRecords))
       rewritten++
       touchedOwners.add(file.owner)
     }
@@ -440,15 +452,19 @@ export async function applyRemoteRepair(backend: SyncBackend, plan: RemoteRepair
     await backend.writeFile(manifestPath(owner), serializeManifest(buildManifest(files)))
   }
   for (const file of plan.files) {
-    if (file.keptLines.length > 0) continue
-    if (backend.deleteFile) await backend.deleteFile(file.path)
-    else await backend.writeFile(file.path, '')
-    deleted++
+    if (file.keptRecords.length > 0) continue
     if ((file.owner === deviceInstanceId || plan.ownersWithManifest.has(file.owner)) && !touchedOwners.has(file.owner)) {
+      // The manifest must stop naming the file before the file goes, or a
+      // peer reading in between finds a named file missing and skips the
+      // namespace; the manifest going first leaves an unnamed leftover
+      // instead, which peers ignore.
       touchedOwners.add(file.owner)
       const files = plan.finalFiles.get(file.owner) ?? new Map<string, SyncRecord[]>()
       await backend.writeFile(manifestPath(file.owner), serializeManifest(buildManifest(files)))
     }
+    if (backend.deleteFile) await backend.deleteFile(file.path)
+    else await backend.writeFile(file.path, '')
+    deleted++
   }
   return { rewritten, deleted }
 }

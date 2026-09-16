@@ -192,6 +192,6 @@ describe('sync repair', () => {
     backend.files.set(`${B}/2026/09/08.ndjson`, ndjson([stray]))
     const plan = await planRemoteRepair(backend, { deviceInstanceId: B })
     const file = plan.files.find(f => f.path === `${B}/2026/09/08.ndjson`)!
-    expect(file).toMatchObject({ foreignLines: 1, echoLines: 0, keptLines: [] })
+    expect(file).toMatchObject({ foreignLines: 1, echoLines: 0, keptRecords: [] })
   })
 })

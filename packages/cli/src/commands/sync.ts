@@ -257,6 +257,11 @@ export function formatRepairReport(report: RepairReport): string {
     lines.push(`Remote: scanned ${report.remote.scannedFiles} file(s), ${report.remote.scannedLines} line(s)`)
     for (const ns of report.remote.namespaces) {
       const own = ns.owner === report.deviceInstanceId ? ' (this device)' : ''
+      if (ns.skipped) {
+        const hint = ns.owner === report.deviceInstanceId ? 'the next "aiusage sync" republishes it' : 'its owner\'s next sync republishes it'
+        lines.push(`  ${ns.owner}${own}: ${ns.lines} line(s) in ${ns.files} file(s) — NOT verified (${ns.skipped}), left untouched; ${hint}`)
+        continue
+      }
       const bad = ns.foreignLines + ns.echoLines + ns.staleLines + ns.duplicateLines
       lines.push(`  ${ns.owner}${own}: ${ns.lines} line(s) in ${ns.files} file(s), ${bad} to drop (${ns.foreignLines} foreign-device, ${ns.echoLines} echo, ${ns.staleLines} stale, ${ns.duplicateLines} duplicate)`)
     }

@@ -5,8 +5,8 @@ import { AIUSAGE_DIR, loadConfig } from '../config.js'
 import type { SyncRecord } from '@aiusage/core'
 import { cloudClear } from '../sync/cloud.js'
 import type { SyncBackend } from '../sync/index.js'
-import { buildManifest, isManifestPath, manifestPath, parseNdjsonLines, serializeManifest, serializeSnapshot } from '../sync/manifest.js'
-import { namespaceOwnerFromPath } from '../sync/ownership.js'
+import { buildManifest, manifestPath, serializeManifest, serializeSnapshot } from '../sync/manifest.js'
+import { listedOwners, readNamespaceSnapshot } from '../sync/snapshot.js'
 import { createBackend } from './sync.js'
 import { dropDanglingClaims } from '../db/sync-claims.js'
 
@@ -22,6 +22,7 @@ export interface CleanAllResult {
   deletedSyncedRecords: number
   deletedSyncRecordState: number
   deletedTombstones: number
+  deletedRetiredWireIds: number
   watermarkRemoved: boolean
 }
 
@@ -61,6 +62,10 @@ export function cleanAll(db: Database.Database): CleanAllResult {
   const syncStateResult = db.prepare('DELETE FROM sync_record_state').run()
   const tombstonesResult = db.prepare('DELETE FROM sync_tombstones').run()
   db.prepare('DELETE FROM sync_record_claims').run()
+  // A full wipe leaves no sync bookkeeping behind at all: the retirements
+  // pending for the cloud backend describe records that no longer exist here
+  // (the cloud is cleared alongside, or `--local-only` was chosen knowingly).
+  const retiredResult = db.prepare('DELETE FROM sync_retired_wire_ids').run()
 
   const watermarkPath = join(AIUSAGE_DIR, 'watermark.json')
   let watermarkRemoved = false
@@ -75,6 +80,7 @@ export function cleanAll(db: Database.Database): CleanAllResult {
     deletedSyncedRecords: syncedResult.changes,
     deletedSyncRecordState: syncStateResult.changes,
     deletedTombstones: tombstonesResult.changes,
+    deletedRetiredWireIds: retiredResult.changes,
     watermarkRemoved,
   }
 }
@@ -101,51 +107,70 @@ export interface RemoteCleanResult {
   removedRecords: number
   /** Day files rewritten or deleted (manifests not included). */
   modifiedFiles: number
+  /**
+   * Namespaces left untouched because their snapshot could not be verified
+   * (a manifest that does not parse or does not match its files, a file gone
+   * missing, a malformed line): rewriting them could bless a partial or
+   * corrupt state. Keyed by owner, with the reason.
+   */
+  skippedNamespaces: Array<{ owner: string; reason: string }>
 }
 
 /**
  * Remove every record older than `cutoff` from the day files on a file-based
  * target, namespace by namespace, following the snapshot rules of sync and
- * `sync --repair` so peers keep verifying the namespaces that changed: the
- * kept records are rewritten in canonical form, **then** the namespace
- * manifest is refreshed, **then** day files left without a record are
- * deleted. An interrupted run therefore leaves either the previous manifest
- * (a mismatch peers skip) or a manifest describing exactly the files that
- * remain. The manifest is refreshed for this device's own namespace and for
- * every namespace that already carried one; a namespace still written by a
- * pre-manifest client is left without, as that client would never maintain
- * it.
+ * `sync --repair` so peers keep verifying the namespaces that changed.
+ *
+ * A namespace is only modified after its current snapshot was read
+ * *reliably* — through its manifest when it has one (every named file
+ * present, parsing cleanly and matching its digest), or with every listed
+ * file parsing cleanly when it has none. Anything else is skipped and
+ * reported: the owner may be rewriting it (S3 writes object by object), it
+ * may have been left half-written, or a file may be corrupt, and a manifest
+ * published over such a state would make it authoritative for every peer.
+ * Verification also means the rewritten files derive from one consistent
+ * snapshot, so a manifest this function writes can only ever describe that
+ * snapshot minus the removed records — never a mixture with files the owner
+ * wrote in between (those fail the digest check on every peer until the
+ * owner's next sync, which republishes the namespace from its database).
+ *
+ * Within a namespace the kept records are rewritten in canonical form,
+ * **then** the manifest is refreshed, **then** day files left without a
+ * record are deleted. An interrupted run therefore leaves either the previous
+ * manifest (a mismatch peers skip) or a manifest describing exactly the files
+ * that remain. The manifest is refreshed for this device's own namespace and
+ * for every namespace that already carried one; a namespace still written by
+ * a pre-manifest client is left without, as that client would never maintain
+ * it. Day files a manifest does not name are leftovers of an interrupted
+ * deletion by the owner and are not touched.
  */
 export async function cleanRemoteBefore(backend: SyncBackend, cutoff: number, deviceInstanceId?: string): Promise<RemoteCleanResult> {
-  const paths = (await backend.listFiles()).filter(p => p.endsWith('.ndjson') && !isManifestPath(p)).sort()
-  const byOwner = new Map<string, string[]>()
-  for (const path of paths) {
-    const owner = namespaceOwnerFromPath(path)
-    if (!byOwner.has(owner)) byOwner.set(owner, [])
-    byOwner.get(owner)!.push(path)
-  }
+  const listing = await backend.listFiles()
 
   let removedRecords = 0
   let modifiedFiles = 0
-  for (const [owner, ownerPaths] of byOwner) {
+  const skippedNamespaces: RemoteCleanResult['skippedNamespaces'] = []
+  for (const owner of listedOwners(listing)) {
+    const snapshot = await readNamespaceSnapshot(backend, owner, listing)
+    if (!snapshot.reliable) {
+      skippedNamespaces.push({ owner, reason: snapshot.problems[0] ?? 'snapshot could not be verified' })
+      continue
+    }
+
     const rewrites: Array<{ path: string; content: string }> = []
     const deletions: string[] = []
     const finalFiles = new Map<string, SyncRecord[]>()
-    for (const path of ownerPaths) {
-      const content = await backend.readFile(path)
-      if (!content) continue
-      const { records } = parseNdjsonLines(content)
+    for (const [rel, records] of snapshot.files) {
       const kept = records.filter(record => record.ts >= cutoff)
-      const rel = path.slice(owner.length + 1)
       if (kept.length === records.length) {
         if (records.length > 0) finalFiles.set(rel, records)
         continue
       }
       removedRecords += records.length - kept.length
       if (kept.length === 0) {
-        deletions.push(path)
+        deletions.push(`${owner}/${rel}`)
       } else {
-        rewrites.push({ path, content: serializeSnapshot(kept) })
+        rewrites.push({ path: `${owner}/${rel}`, content: serializeSnapshot(kept) })
         finalFiles.set(rel, kept)
       }
     }
@@ -155,8 +180,7 @@ export async function cleanRemoteBefore(backend: SyncBackend, cutoff: number, de
       await backend.writeFile(path, content)
       modifiedFiles++
     }
-    const hadManifest = (await backend.readFile(manifestPath(owner))) !== null
-    if (owner === deviceInstanceId || hadManifest) {
+    if (owner === deviceInstanceId || snapshot.hasManifest) {
       await backend.writeFile(manifestPath(owner), serializeManifest(buildManifest(finalFiles)))
     }
     for (const path of deletions) {
@@ -165,7 +189,19 @@ export async function cleanRemoteBefore(backend: SyncBackend, cutoff: number, de
       modifiedFiles++
     }
   }
-  return { removedRecords, modifiedFiles }
+  return { removedRecords, modifiedFiles, skippedNamespaces }
+}
+
+/**
+ * Wipe a file-based target completely. `deleteAllData` is called even when
+ * the listing shows no day file: the listing excludes manifests, and an
+ * interrupted operation can leave a namespace consisting of nothing but its
+ * `manifest.json`, which peers would otherwise keep reading. Returns the
+ * number of day files removed.
+ */
+export async function cleanRemoteAll(backend: SyncBackend): Promise<number> {
+  if (!backend.deleteAllData) throw new Error('Backend cannot clear remote data')
+  return backend.deleteAllData()
 }
 
 export async function propagateClean(options: {
@@ -218,12 +254,7 @@ export async function propagateClean(options: {
     await backend.prepare?.()
 
     if (options.all) {
-      const files = await backend.listFiles()
-      const fileCount = files.length
-      if (fileCount > 0) {
-        if (!backend.deleteAllData) throw new Error('Backend cannot clear remote data')
-        await backend.deleteAllData()
-      }
+      const fileCount = await cleanRemoteAll(backend)
       await backend.flush?.()
       results.push({
         backend: {
@@ -235,15 +266,18 @@ export async function propagateClean(options: {
       })
     } else if (options.beforeDays) {
       const cutoff = Date.now() - options.beforeDays * 86400000
-      const { removedRecords, modifiedFiles } = await cleanRemoteBefore(backend, cutoff, options.deviceInstanceId)
+      const { removedRecords, modifiedFiles, skippedNamespaces } = await cleanRemoteBefore(backend, cutoff, options.deviceInstanceId)
       await backend.flush?.()
+      const skipped = skippedNamespaces.length > 0
+        ? `; ${skippedNamespaces.length} namespace(s) could not be verified and were left untouched (${skippedNamespaces.map(n => `${n.owner}: ${n.reason}`).join('; ')})`
+        : ''
       results.push({
         backend: {
           type: config.sync.backend as 'github' | 's3',
           label: config.sync.backend === 'github' ? `GitHub (${config.sync.repo})` : `S3 (${config.sync.bucket})`,
         },
         status: 'ok',
-        detail: `removed ${removedRecords} records from ${modifiedFiles} files`,
+        detail: `removed ${removedRecords} records from ${modifiedFiles} files${skipped}`,
       })
     }
   } catch (err) {

@@ -21,18 +21,16 @@ import { clearRetiredWireIds, getClaimedOwners } from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import {
   buildManifest,
-  canonicalDigest,
   contentDigest,
   isManifestPath,
   manifestPath,
   matchesCanonical,
-  parseManifest,
   parseNdjsonLines,
   serializeManifest,
   serializeSnapshot,
-  type NamespaceManifest,
 } from './manifest.js'
 import { classifyPulledRecord, namespaceOwnerFromPath } from './ownership.js'
+import { planNamespaceRead, readNamespaceFiles, type NamespaceReadPlan } from './snapshot.js'
 import type { SyncProgress } from './runtime.js'
 
 export { contentDigest, parseSyncRecordLine, serializeSnapshot } from './manifest.js'
@@ -253,68 +251,56 @@ export class SyncOrchestrator {
       listedByOwner.get(owner)!.push(path)
     }
 
-    // Phase 1: manifests decide which files are authoritative for each namespace.
-    const plans = new Map<string, { manifest: NamespaceManifest | null; reliable: boolean; paths: string[]; ids: Set<string> }>()
+    // Phase 1: manifests decide which files make up each namespace.
+    const plans = new Map<string, { read: NamespaceReadPlan; reliable: boolean; ids: Set<string> }>()
     for (const [owner, listed] of listedByOwner) {
-      const manifestContent = await this.backend.readFile(manifestPath(owner))
-      let manifest: NamespaceManifest | null = null
-      let reliable = true
-      let paths = listed
-      if (manifestContent !== null) {
-        manifest = parseManifest(manifestContent)
-        if (manifest) paths = Object.keys(manifest.files).sort().map(rel => `${owner}/${rel}`)
-        else reliable = false // unreadable manifest: upsert the listed files, prune nothing
-      }
-      plans.set(owner, { manifest, reliable, paths, ids: new Set() })
+      const read = await planNamespaceRead(this.backend, owner, listed)
+      plans.set(owner, { read, reliable: read.reliable, ids: new Set() })
     }
 
-    const totalFiles = [...plans.values()].reduce((n, p) => n + p.paths.length, 0)
+    const totalFiles = [...plans.values()].reduce((n, p) => n + p.read.paths.length, 0)
     this.options.onProgress?.({ phase: 'pulling', completedFiles: 0, totalFiles, pulledCount: 0 })
 
-    // Phase 2: read and upsert.
+    // Phase 2: read and upsert. Lines are applied as they are read, whether
+    // or not the namespace turns out to be reliable: an upsert only ever adds
+    // or refreshes a row, and a row added from a half-published snapshot is
+    // unclaimed until the first reliable read, which then keeps or prunes it.
+    // Withholding the lines instead would hide a namespace whose owner
+    // crashed mid-rewrite and never came back. The manifest is therefore the
+    // commit boundary for *pruning*, not for additions.
     let totalPulled = 0
     let totalIgnored = 0
     let completed = 0
     for (const [owner, plan] of plans) {
-      for (const path of plan.paths) {
-        this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
-        const content = await this.backend.readFile(path)
-        if (content === null) {
-          // Listed (or named by the manifest) a moment ago, gone now: the
-          // owner is rewriting the namespace. Never prune against it.
-          plan.reliable = false
+      const snapshot = await readNamespaceFiles(this.backend, plan.read, {
+        collect: false,
+        visit: (path, records) => {
+          this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
+          for (const record of records) {
+            // Only records that belong to the namespace they were read from are
+            // trusted. Anything else is a pre-fix echo whose authoritative copy
+            // lives elsewhere (or is our own local row).
+            if (classifyPulledRecord(record, owner, own)) {
+              totalIgnored++
+              continue
+            }
+            // Lines written before the origin device had an id belong to the
+            // namespace owner; storing them as 'unknown' would surface a phantom
+            // device.
+            if (!record.deviceInstanceId || record.deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID) {
+              record.deviceInstanceId = owner
+            }
+            plan.ids.add(record.id)
+            if (insertSyncedRecord(this.db, record)) totalPulled++
+          }
           completed++
-          continue
-        }
-
-        const { records, malformed } = parseNdjsonLines(content)
-        if (malformed > 0) plan.reliable = false
-        if (plan.manifest) {
-          const expected = plan.manifest.files[path.slice(owner.length + 1)]
-          if (!expected || expected.digest !== canonicalDigest(records)) plan.reliable = false
-        }
-
-        for (const record of records) {
-          // Only records that belong to the namespace they were read from are
-          // trusted. Anything else is a pre-fix echo whose authoritative copy
-          // lives elsewhere (or is our own local row).
-          if (classifyPulledRecord(record, owner, own)) {
-            totalIgnored++
-            continue
-          }
-          // Lines written before the origin device had an id belong to the
-          // namespace owner; storing them as 'unknown' would surface a phantom
-          // device.
-          if (!record.deviceInstanceId || record.deviceInstanceId === UNKNOWN_DEVICE_INSTANCE_ID) {
-            record.deviceInstanceId = owner
-          }
-          plan.ids.add(record.id)
-          if (insertSyncedRecord(this.db, record)) totalPulled++
-        }
-
-        completed++
-        this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
-      }
+          this.options.onProgress?.({ phase: 'pulling', currentPath: path, completedFiles: completed, totalFiles, pulledCount: totalPulled })
+        },
+      })
+      // A file that vanished between listing and reading is counted as done
+      // too, so the progress total still adds up.
+      completed += snapshot.missing.length
+      plan.reliable = snapshot.reliable
     }
 
     // Phase 3: reconcile. Only namespaces read reliably replace this target's

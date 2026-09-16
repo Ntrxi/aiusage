@@ -125,6 +125,13 @@ namespace owner, or this device's own id. Lines stamped `unknown` (written by a
 client that had not run `aiusage init` yet) belong to the namespace owner and
 are stored under the owner's id, so `unknown` never appears as a device.
 
+Upserting is deliberately *additive* and happens whether or not the namespace
+turns out to be reliable: an upsert only ever adds or refreshes a row, a row
+added from a half-published snapshot carries no claim until the first reliable
+read (which then keeps or prunes it), and withholding the lines would hide a
+namespace whose owner crashed mid-rewrite and never came back. The manifest is
+therefore the commit boundary for **pruning**, not for additions.
+
 Then, per namespace owner:
 
 * if the namespace was read **reliably**, the ids collected become this
@@ -173,17 +180,52 @@ identical manifests.
 A sync with no local changes therefore performs no writes. With the GitHub
 backend nothing is committed or pushed; with S3 no `PutObject` is issued.
 
-### Remote cleanup
+### Remote cleanup and repair
 
 `aiusage clean --before <days>` also removes records from the remote day files
-of every namespace. It follows the same rules as upload: within a namespace
-the kept records are rewritten in canonical form, **then** the manifest is
-refreshed to name exactly the files that remain (an empty manifest when the
-namespace empties out), **then** day files left without a record are deleted.
-An interrupted cleanup therefore leaves a namespace peers either skip (the
-previous manifest no longer matches) or mirror correctly. A namespace without
-a manifest — still written by a pre-manifest client — does not acquire one,
-since that client would never maintain it.
+of every namespace, and `aiusage sync --repair --apply` rewrites files of this
+device's namespace (with `--all-namespaces`, of every namespace). Both read a
+namespace exactly as pull does — through its manifest — and **only modify a
+namespace whose snapshot they could verify**: manifest parsed, every named
+file present, every line parsing, every digest matching (for a legacy
+namespace without a manifest: every listed file parsing). Anything else is
+skipped and reported (`clean` prints the namespaces it left untouched;
+`--repair` lists them as *NOT verified*), because a manifest published over a
+half-written or corrupt state would make that state authoritative for every
+peer. A malformed line is never silently dropped by a rewrite. Day files a
+manifest does not name are leftovers of an interrupted deletion by the owner
+and are not touched either.
+
+Within a namespace the kept records are rewritten in canonical form, **then**
+the manifest is refreshed to name exactly the files that remain (an empty
+manifest when the namespace empties out), **then** day files left without a
+record are deleted. An interrupted cleanup therefore leaves a namespace peers
+either skip (the previous manifest no longer matches) or mirror correctly. A
+namespace without a manifest — still written by a pre-manifest client — does
+not acquire one, since that client would never maintain it.
+
+Cleaning or repairing a namespace one does not own has no transaction on S3:
+the owner may publish between the read and the writes. Verification bounds
+what can happen. Every file the cleanup writes derives from the one snapshot
+it verified, and the manifest it writes records the digests of those files
+and of the verified files it left alone, so it can only ever describe *that
+snapshot minus the removed lines*. A file the owner wrote in the same window
+either stays (its digest no longer matches: peers skip the namespace and
+prune nothing) or is overwritten by the cleanup's version (peers reconcile
+against the verified snapshot minus the removed lines). Either way the
+owner's next sync republishes the namespace from its local database and
+settles it. A namespace is a snapshot of its owner's database, so cleaning
+another device's namespace is durable only for a device that no longer
+syncs; an active owner that has not run `aiusage clean --before` itself
+restores the records on its next sync. On GitHub a concurrent push by the
+owner simply makes the cleanup's push fail (`pull --rebase` conflicts on the
+shared files), and nothing is published.
+
+`aiusage clean --all` wipes the whole target with `deleteAllData`, always —
+the listing only shows day files, and an interrupted operation can leave a
+namespace consisting of nothing but its `manifest.json`, which peers would
+otherwise keep reading as an empty snapshot. A full local clean also drops
+pending retired wire ids along with claims, sync state and tombstones.
 
 ### Atomicity and interruptions
 
@@ -211,7 +253,9 @@ since that client would never maintain it.
 Two devices syncing at the same time write to disjoint namespaces and each
 only reads the other's. Neither can lose records of the other; at worst a
 device reads a namespace mid-rewrite, sees the manifest mismatch, and
-reconciles it next time.
+reconciles it next time. The only writers that cross namespaces are remote
+cleanup and `--repair --all-namespaces`; see *Remote cleanup and repair* for
+what bounds them.
 
 ### Backend failures
 
@@ -331,5 +375,6 @@ remotely` (rows dropped because their owner no longer publishes them) and
 `retired: N stale remote` (lines removed from this device's own namespace),
 and notes how many namespaces were skipped because they could not be verified.
 `aiusage sync --repair` reports stale and duplicated lines in this device's
-namespace, orphaned pulled rows, and any wire-id collisions among local
-records, see [`sync-repair.md`](./sync-repair.md).
+namespace, namespaces it could not verify, orphaned pulled rows, and any
+wire-id collisions among local records, see
+[`sync-repair.md`](./sync-repair.md).

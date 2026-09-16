@@ -94,7 +94,7 @@ describe('sync --repair: stale lines, duplicates and wire-id collisions', () => 
     const plan = await planRemoteRepair(backend, { deviceInstanceId: A, ownWireIds: new Set(wires.map(w => w.id)) })
     expect(plan.namespaces[0]).toMatchObject({ owner: A, duplicateLines: 1, staleLines: 0 })
     const stalePlan = plan.files.find(f => f.path === `${A}/2026/09/05.ndjson`)!
-    expect(stalePlan).toMatchObject({ duplicateLines: 1, keptLines: [] })
+    expect(stalePlan).toMatchObject({ duplicateLines: 1, keptRecords: [] })
     expect(plan.files.some(f => f.path === `${A}/2026/09/06.ndjson`)).toBe(false)
   })
 

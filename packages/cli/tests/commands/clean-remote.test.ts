@@ -5,9 +5,9 @@ import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { dropDanglingClaims } from '../../src/db/sync-claims.js'
-import { cleanRemoteBefore } from '../../src/commands/clean.js'
+import { cleanRemoteAll, cleanRemoteBefore } from '../../src/commands/clean.js'
 import { SyncOrchestrator, serializeSnapshot } from '../../src/sync/index.js'
-import { canonicalDigest, manifestPath, parseManifest } from '../../src/sync/manifest.js'
+import { buildManifest, canonicalDigest, manifestPath, parseManifest, serializeManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
 import { FakeSyncBackend } from '../sync/helpers/fake-backend.js'
 
@@ -70,7 +70,16 @@ const ndjson = (records: SyncRecord[]) => records.map(r => JSON.stringify(r)).jo
 /** Records every write and deletion in the order it happened. */
 class OrderedBackend extends FakeSyncBackend {
   readonly ops: string[] = []
+  /**
+   * Runs once, right before the next write — after a caller has read and
+   * verified whatever it is about to rewrite. Models another device
+   * publishing to S3 in that window.
+   */
+  beforeNextWrite: (() => Promise<void>) | null = null
   override async writeFile(path: string, content: string): Promise<void> {
+    const hook = this.beforeNextWrite
+    this.beforeNextWrite = null
+    if (hook) await hook()
     this.ops.push(`write ${path}`)
     return super.writeFile(path, content)
   }
@@ -78,7 +87,15 @@ class OrderedBackend extends FakeSyncBackend {
     this.ops.push(`delete ${path}`)
     return super.deleteFile(path)
   }
+  async deleteAllData(): Promise<number> {
+    const n = [...this.files.keys()].filter(p => p.endsWith('.ndjson')).length
+    this.files.clear()
+    this.ops.push('deleteAllData')
+    return n
+  }
 }
+
+const snapshotOf = (backend: FakeSyncBackend) => new Map(backend.files)
 
 describe('clean --before on a file-based target', () => {
   let backend: OrderedBackend
@@ -117,7 +134,7 @@ describe('clean --before on a file-based target', () => {
 
   it('rewrites kept records canonically, refreshes the manifest before deleting emptied files, and leaves legacy namespaces manifest-less', async () => {
     const result = await cleanRemoteBefore(backend, CUTOFF, B)
-    expect(result).toEqual({ removedRecords: 3, modifiedFiles: 3 })
+    expect(result).toEqual({ removedRecords: 3, modifiedFiles: 3, skippedNamespaces: [] })
 
     // A: the cutoff-day file keeps only the later record, in canonical form;
     // the old file is gone; the manifest names exactly the remaining files
@@ -190,5 +207,164 @@ describe('clean --before on a file-based target', () => {
       expect(r).toMatchObject({ status: 'ok', pulledCount: 0, prunedCount: 0, skippedNamespaces: 0 })
     }
     expect(backend.mutations.length).toBe(mutations)
+  })
+  describe('never rewrites a namespace it could not verify', () => {
+    const untouched = (before: Map<string, string>, owner: string) => {
+      const after = [...backend.files].filter(([p]) => p.startsWith(`${owner}/`))
+      expect(after).toEqual([...before].filter(([p]) => p.startsWith(`${owner}/`)))
+      expect(backend.ops.filter(op => op.includes(` ${owner}/`))).toEqual([])
+    }
+
+    it('skips a namespace whose day file does not match its manifest (an owner rewriting it), and still cleans the others', async () => {
+      // A is mid-rewrite: one file already holds a new record the manifest does not describe yet.
+      const extra = mapStatsRecordToSyncRecord(local(A, 9, CUTOFF - HOUR))
+      backend.files.set(`${A}/2026/08/17.ndjson`, serializeSnapshot([wiresA[0], wiresA[1], extra]))
+      const before = snapshotOf(backend)
+
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result).toEqual({
+        removedRecords: 1,
+        modifiedFiles: 1,
+        skippedNamespaces: [{ owner: A, reason: '2026/08/17.ndjson does not match the manifest' }],
+      })
+      untouched(before, A)
+      expect(backend.files.has(`${C}/2026/08/07.ndjson`)).toBe(false)
+    })
+
+    it('skips a namespace whose manifest names a file that is gone', async () => {
+      backend.files.delete(`${A}/2026/08/07.ndjson`)
+      const before = snapshotOf(backend)
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result.skippedNamespaces).toEqual([{ owner: A, reason: '2026/08/07.ndjson is missing' }])
+      untouched(before, A)
+    })
+
+    it('skips a namespace whose manifest cannot be parsed', async () => {
+      backend.files.set(manifestPath(A), '{ not json')
+      const before = snapshotOf(backend)
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result.skippedNamespaces).toEqual([{ owner: A, reason: 'manifest cannot be parsed' }])
+      untouched(before, A)
+    })
+
+    it('skips a manifest-bearing namespace with a malformed line instead of dropping the line and blessing the result', async () => {
+      backend.files.set(`${A}/2026/08/17.ndjson`, backend.files.get(`${A}/2026/08/17.ndjson`)! + '{"id": "truncated"\n')
+      const before = snapshotOf(backend)
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result.skippedNamespaces).toEqual([{ owner: A, reason: '2026/08/17.ndjson has 1 malformed line(s)' }])
+      untouched(before, A)
+    })
+
+    it('skips a legacy (manifest-less) namespace with a malformed line', async () => {
+      backend.files.set(`${C}/2026/08/07.ndjson`, 'garbage\n' + ndjson([wiresC[0]]))
+      const before = snapshotOf(backend)
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result.skippedNamespaces).toEqual([{ owner: C, reason: '2026/08/07.ndjson has 1 malformed line(s)' }])
+      untouched(before, C)
+      // A was verified and cleaned as usual.
+      expect(result).toMatchObject({ removedRecords: 2, modifiedFiles: 2 })
+      expect(backend.files.has(`${A}/2026/08/07.ndjson`)).toBe(false)
+    })
+
+    it('ignores day files the manifest does not name (leftovers of an interrupted deletion)', async () => {
+      const leftover = mapStatsRecordToSyncRecord(local(A, 8, CUTOFF - 20 * DAY))
+      backend.files.set(`${A}/2026/07/28.ndjson`, serializeSnapshot([leftover]))
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result).toMatchObject({ removedRecords: 3, modifiedFiles: 3, skippedNamespaces: [] })
+      // Neither removed nor counted nor named by the refreshed manifest.
+      expect(backend.files.has(`${A}/2026/07/28.ndjson`)).toBe(true)
+      expect(Object.keys(parseManifest(backend.files.get(manifestPath(A))!)!.files)).toEqual(['2026/08/17.ndjson', '2026/09/15.ndjson'])
+    })
+  })
+
+  describe('a manifest written by cleanup only ever describes the snapshot it verified', () => {
+    // S3 has no transactions: the owner can publish between cleanup's read
+    // and its writes. Whatever the interleaving, peers must never reconcile
+    // against a mixture of the owner's new files and cleanup's rewrites, and
+    // the owner's next sync (a snapshot of its database) must settle things.
+
+    it('when the owner publishes a file cleanup does not rewrite: peers see a digest mismatch and skip until the owner syncs again', async () => {
+      const fresh = local(A, 4, NOW - DAY + HOUR) // lands in 2026/09/15.ndjson, which keeps every record
+      backend.beforeNextWrite = async () => {
+        insertRecord(dbA, fresh)
+        expect(await sync(dbA, backend, A)).toMatchObject({ status: 'ok', writtenFiles: 2 })
+      }
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result).toMatchObject({ removedRecords: 3, modifiedFiles: 3, skippedNamespaces: [] })
+      expect(backend.beforeNextWrite).toBeNull()
+
+      // The manifest cleanup wrote describes the file it verified, not the one the owner wrote in between.
+      const manifest = parseManifest(backend.files.get(manifestPath(A))!)!
+      expect(manifest.files['2026/09/15.ndjson'].digest).toBe(canonicalDigest([wiresA[3]]))
+      expect(backend.files.get(`${A}/2026/09/15.ndjson`)).toBe(serializeSnapshot([wiresA[3], mapStatsRecordToSyncRecord(fresh)]))
+
+      // Peers skip A's namespace and prune nothing of A's: B keeps all four
+      // rows and, pull being additive, also picks up the fresh one (the one
+      // pruned row is C's old record, which cleanup did remove).
+      const b = await sync(dbB, backend, B)
+      expect(b).toMatchObject({ status: 'ok', skippedNamespaces: 1, prunedCount: 1, pulledCount: 1 })
+      for (const w of wiresA) expect(syncedIds(dbB, A)).toContain(w.id)
+      expect(syncedIds(dbB, A)).toHaveLength(5)
+      expect(syncedIds(dbB, C)).toEqual([wiresC[1].id])
+
+      // The owner's next sync republishes its database; cleanup's rewrite is
+      // undone (A was not cleaned locally) and everyone converges.
+      const a = await sync(dbA, backend, A)
+      expect(a.status).toBe('ok')
+      expect(a.writtenFiles).toBeGreaterThan(0)
+      const b2 = await sync(dbB, backend, B)
+      expect(b2).toMatchObject({ status: 'ok', skippedNamespaces: 0, prunedCount: 0 })
+      expect(syncedIds(dbB, A)).toHaveLength(5)
+    })
+
+    it('when the owner publishes a file cleanup then rewrites: peers reconcile against the verified snapshot minus the removed records, never a mixture', async () => {
+      const fresh = local(A, 5, CUTOFF + 2 * HOUR) // lands in 2026/08/17.ndjson, which cleanup rewrites
+      backend.beforeNextWrite = async () => {
+        insertRecord(dbA, fresh)
+        expect(await sync(dbA, backend, A)).toMatchObject({ status: 'ok', writtenFiles: 2 })
+      }
+      const result = await cleanRemoteBefore(backend, CUTOFF, B)
+      expect(result).toMatchObject({ removedRecords: 3, modifiedFiles: 3, skippedNamespaces: [] })
+
+      // Consistent, and exactly "what cleanup verified, minus the old records".
+      expect(backend.files.get(`${A}/2026/08/17.ndjson`)).toBe(serializeSnapshot([wiresA[1]]))
+      const dbD = newDb()
+      const d = await sync(dbD, backend, D)
+      expect(d).toMatchObject({ status: 'ok', skippedNamespaces: 0 })
+      expect(syncedIds(dbD, A)).toEqual([wiresA[1].id, wiresA[3].id].sort())
+
+      // The owner's next sync restores the record it published in the window.
+      const a = await sync(dbA, backend, A)
+      expect(a).toMatchObject({ status: 'ok' })
+      const d2 = await sync(dbD, backend, D)
+      expect(d2).toMatchObject({ status: 'ok', skippedNamespaces: 0 })
+      expect(syncedIds(dbD, A)).toContain(mapStatsRecordToSyncRecord(fresh).id)
+      expect(syncedIds(dbD, A)).toHaveLength(5)
+    })
+  })
+})
+
+describe('clean --all on a file-based target', () => {
+  it('wipes the target even when nothing but a manifest is left', async () => {
+    const backend = new OrderedBackend()
+    backend.files.set(manifestPath(A), serializeManifest(buildManifest(new Map())))
+    expect(await backend.listFiles()).toEqual([])
+
+    expect(await cleanRemoteAll(backend)).toBe(0)
+    expect(backend.ops).toEqual(['deleteAllData'])
+    expect(backend.files.size).toBe(0)
+  })
+
+  it('reports the number of day files removed', async () => {
+    const backend = new OrderedBackend()
+    const db = newDb()
+    insertRecord(db, local(A, 0, NOW - DAY))
+    await sync(db, backend, A)
+    expect(await cleanRemoteAll(backend)).toBe(1)
+    expect(backend.files.size).toBe(0)
+  })
+
+  it('fails loudly on a backend that cannot wipe', async () => {
+    await expect(cleanRemoteAll(new FakeSyncBackend())).rejects.toThrow('Backend cannot clear remote data')
   })
 })

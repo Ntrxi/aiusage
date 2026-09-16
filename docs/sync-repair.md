@@ -132,8 +132,23 @@ aiusage sync --repair --apply --all-namespaces
    `records` (the originals remain),
 3. removes stale `sync_record_state` rows,
 4. rewrites the affected remote files without the foreign, echo, stale and
-   duplicate lines (deleting a file only if nothing legitimate is left), then
-   commits and pushes (GitHub) or uploads (S3).
+   duplicate lines (deleting a file only if nothing legitimate is left),
+   refreshes the manifest of every namespace it changed, then commits and
+   pushes (GitHub) or uploads (S3).
+
+Remote namespaces are read the way `aiusage sync` reads them: through the
+namespace manifest when there is one (only the files it names count), every
+listed file otherwise. A namespace that cannot be verified — a manifest that
+does not parse or does not match its files, a named file that is missing, a
+malformed line — is reported as *NOT verified* and **left untouched**, even
+with `--apply`: rewriting it and publishing a manifest over the result could
+turn a half-written or corrupt state into the authoritative snapshot for
+every peer. For this device's own namespace the next `aiusage sync`
+republishes the snapshot from the local database, after which `--repair`
+verifies it again; another device's namespace is settled by its owner's next
+sync. See *Remote cleanup and repair* in
+[`sync-namespaces.md`](./sync-namespaces.md) for what bounds a repair that
+overlaps an owner's publish on S3.
 
 Recommended order for a fleet of devices:
 
