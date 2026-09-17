@@ -348,7 +348,7 @@ describe('clean --all on a file-based target', () => {
   it('wipes the target even when nothing but a manifest is left', async () => {
     const backend = new OrderedBackend()
     backend.files.set(manifestPath(A), serializeManifest(buildManifest(new Map())))
-    expect(await backend.listFiles()).toEqual([])
+    expect(await backend.listFiles()).toEqual([manifestPath(A)])
 
     expect(await cleanRemoteAll(backend)).toBe(0)
     expect(backend.ops).toEqual(['deleteAllData'])

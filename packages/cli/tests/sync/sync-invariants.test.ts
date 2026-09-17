@@ -5,7 +5,7 @@ import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
-import { getClaimingTargets, getNamespaceVerdicts } from '../../src/db/sync-claims.js'
+import { getClaimingTargets, getNamespaceVerdicts, UNKNOWN_NAMESPACE_VERDICT } from '../../src/db/sync-claims.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
 import { buildManifest, manifestPath, serializeManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
@@ -179,6 +179,30 @@ describe('I1/I3/I4/I9 — upgrading with several sync targets', () => {
 })
 
 describe('I5/I6/I7 — what a namespace with no listed day file means', () => {
+  it.each(['corrupt', 'missing files'])(
+    'an untracked manifest-only namespace with %s withholds the global unknown verdict', async kind => {
+      const db = newDb()
+      const target = new FakeSyncBackend()
+      const wire = mapStatsRecordToSyncRecord(local(X, 0))
+      try {
+        seedPreV14(db, [{ ...wire, deviceInstanceId: 'unknown' }])
+        target.files.set(manifestPath(X), kind === 'corrupt' ? '{broken'
+          : serializeManifest(buildManifest(new Map([['2026/09/06.ndjson', [wire]]]))))
+        expect(await sync(db, target, ME, T_A, [T_A])).toMatchObject({ status: 'ok', skippedNamespaces: 1, prunedCount: 0 })
+        expect(syncedIds(db, 'unknown')).toEqual([wire.id])
+        expect(mergedIds(db, 'unknown')).toEqual([wire.id])
+        expect(getNamespaceVerdicts(db, UNKNOWN_NAMESPACE_VERDICT).has(T_A)).toBe(false)
+
+        // Once the snapshot is provably empty, the unresolved row converges.
+        target.files.set(manifestPath(X), serializeManifest(buildManifest(new Map())))
+        expect(await sync(db, target, ME, T_A, [T_A])).toMatchObject({ status: 'ok', prunedCount: 1 })
+        expect(syncedIds(db, 'unknown')).toEqual([])
+      } finally {
+        db.close()
+      }
+    },
+  )
+
   let dbX: Database.Database
   let dbMe: Database.Database
   let target: FakeSyncBackend

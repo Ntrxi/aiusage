@@ -123,9 +123,11 @@ export async function readNamespaceSnapshot(backend: SyncBackend, owner: string,
   return readNamespaceFiles(backend, await planNamespaceRead(backend, owner, listedPaths))
 }
 
-/** Owners of every day file in a listing, in sorted order (paths outside a namespace folder have none). */
+/** Owners of day files and manifests, including namespaces with no day files. */
 export function listedOwners(listedPaths: Iterable<string>): string[] {
   const owners = new Set<string>()
-  for (const p of listedPaths) if (isDayFilePath(p)) owners.add(p.slice(0, p.indexOf('/')))
+  for (const p of listedPaths) {
+    if (isDayFilePath(p) || /^[^/]+\/manifest\.json$/.test(p)) owners.add(p.slice(0, p.indexOf('/')))
+  }
   return [...owners].sort()
 }

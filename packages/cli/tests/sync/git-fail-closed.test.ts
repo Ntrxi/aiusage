@@ -86,7 +86,7 @@ describe('GitSyncBackend fails closed on cache I/O errors', () => {
         { name: '2026-09-06.ndjson', isDirectory: () => false },
         { name: 'manifest.json', isDirectory: () => false },
       ] as any)
-    await expect(backend.listFiles()).resolves.toEqual(['dev/2026-09-06.ndjson'])
+    await expect(backend.listFiles()).resolves.toEqual(['dev/2026-09-06.ndjson', 'dev/manifest.json'])
   })
 
   it('deleteFile ignores a missing file but surfaces other failures', async () => {

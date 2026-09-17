@@ -15,7 +15,7 @@ export interface CloudPulledTombstone {
   id: string
   device_instance_id?: string
   deleted_at?: string | number
-  updated_at?: number
+  updated_at?: string | number
 }
 
 /** Tombstone as `/sync/push` expects it: the wire id of a record this device retracts. */
@@ -77,7 +77,9 @@ async function readJsonOrNull(response: Response): Promise<Record<string, unknow
   const contentType = response.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) return null
   try {
-    return await response.json()
+    const data: unknown = await response.json()
+    return data !== null && typeof data === 'object' && !Array.isArray(data)
+      ? data as Record<string, unknown> : null
   } catch {
     return null
   }
@@ -166,7 +168,23 @@ export async function cloudPull(
   // A completed pull is reconciled against: every record must be
   // representable, or the pull fails rather than silently omitting it (an
   // omission would read as the record's absence from the cloud).
-  const rawRecords = Array.isArray(data.records) ? data.records : []
+  if (!Array.isArray(data.records) || !Array.isArray(data.tombstones)
+    || typeof data.has_more !== 'boolean'
+    || !Number.isSafeInteger(data.sync_generation) || (data.sync_generation as number) < 1
+    || (data.next_cursor != null && (typeof data.next_cursor !== 'string' || !/^[0-9]+$/.test(data.next_cursor)))
+    || (data.has_more && (typeof data.next_cursor !== 'string' || BigInt(data.next_cursor) <= 0n))) {
+    throw new CloudSyncError('Invalid response from server: malformed pull envelope', 'invalid_response')
+  }
+  // Tombstones can delete records too; validate their identity before any
+  // page is returned to the authoritative reconciliation path.
+  for (const raw of data.tombstones) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+      || typeof raw.id !== 'string' || !raw.id
+      || typeof raw.device_instance_id !== 'string' || !raw.device_instance_id) {
+      throw new CloudSyncError('Invalid response from server: malformed tombstone', 'invalid_response')
+    }
+  }
+  const rawRecords = data.records
   const records: SyncRecord[] = []
   for (const raw of rawRecords) {
     const record = fromCloudRecord(raw)
@@ -176,10 +194,10 @@ export async function cloudPull(
 
   return {
     records,
-    tombstones: (data.tombstones as CloudPulledTombstone[]) || [],
+    tombstones: data.tombstones as CloudPulledTombstone[],
     nextCursor: (data.next_cursor as string | null | undefined) ?? undefined,
-    hasMore: (data.has_more as boolean) || false,
-    syncGeneration: (data.sync_generation as number) || 1,
+    hasMore: data.has_more,
+    syncGeneration: data.sync_generation as number,
   }
 }
 

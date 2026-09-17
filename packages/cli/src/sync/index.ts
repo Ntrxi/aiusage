@@ -29,7 +29,7 @@ import {
   serializeSnapshot,
 } from './manifest.js'
 import { classifyPulledRecord, namespaceOwnerFromPath } from './ownership.js'
-import { planNamespaceRead, readNamespaceFiles, type NamespaceReadPlan } from './snapshot.js'
+import { listedOwners, planNamespaceRead, readNamespaceFiles, type NamespaceReadPlan } from './snapshot.js'
 import type { SyncProgress } from './runtime.js'
 
 export { contentDigest, parseSyncRecordLine, serializeSnapshot } from './manifest.js'
@@ -44,8 +44,8 @@ export interface SyncBackend {
   readFile(path: string): Promise<string | null>
   writeFile(path: string, content: string): Promise<void>
   /**
-   * Every data file (`*.ndjson`) under the sync root. Must throw when the
-   * listing cannot be completed; an empty array means the target is empty.
+   * Every data file (`*.ndjson`) and namespace manifest under the sync root.
+   * Must throw if listing fails; an empty array means the target is empty.
    */
   listFiles(): Promise<string[]>
   /** Optional: delete a single file from the backend */
@@ -269,7 +269,7 @@ export class SyncOrchestrator {
 
     // Every namespace whose state matters to this target: listed now, claimed
     // here before, or the attributed owner of rows still awaiting a verdict.
-    const owners = new Set<string>(listedByOwner.keys())
+    const owners = new Set<string>(listedOwners(allPaths))
     for (const owner of getClaimedOwners(this.db, target)) owners.add(owner)
     for (const owner of getUnclaimedOwners(this.db)) owners.add(owner)
     owners.delete(own)

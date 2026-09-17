@@ -205,16 +205,16 @@ describe('CloudSyncOrchestrator claims', () => {
     // page 2, which reports generation 2 with a record that was pushed
     // afresh. Stitching them together would keep old1 forever.
     vi.mocked(cloudPull)
-      .mockImplementationOnce(async () => page(1, ['old1'], 'c1'))
+      .mockImplementationOnce(async () => page(1, ['old1'], '100'))
       .mockImplementationOnce(async () => page(2, ['new1']))
-      .mockImplementationOnce(async () => page(2, ['new1'], 'd1'))
+      .mockImplementationOnce(async () => page(2, ['new1'], '1'))
       .mockImplementationOnce(async () => page(2, ['new2']))
     vi.mocked(cloudPull).mockClear()
     const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
     expect(result.status).toBe('ok')
     expect(result.syncGeneration).toBe(2)
     expect(cloudPull).toHaveBeenCalledTimes(4)
-    expect(vi.mocked(cloudPull).mock.calls.map(c => c[0])).toEqual([undefined, 'c1', undefined, 'd1'])
+    expect(vi.mocked(cloudPull).mock.calls.map(c => c[0])).toEqual([undefined, '100', undefined, '1'])
     expect(syncedIds(db)).toEqual(['new1', 'new2'])
     expect(getClaimingTargets(db, 'old1')).toEqual([])
     expect(getClaimingTargets(db, 'new2')).toEqual(['cloud'])
@@ -229,7 +229,7 @@ describe('CloudSyncOrchestrator claims', () => {
     let attempt = 0
     vi.mocked(cloudPull).mockImplementation(async (cursor?: string) => {
       if (cursor === undefined) attempt++
-      return cursor === undefined ? page(attempt, [], 'next') : page(attempt + 1, ['x'])
+      return cursor === undefined ? page(attempt, [], '1') : page(attempt + 1, ['x'])
     })
     vi.mocked(cloudPush).mockClear()
     try {

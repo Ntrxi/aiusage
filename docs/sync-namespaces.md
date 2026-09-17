@@ -198,11 +198,13 @@ read (which then keeps or prunes it), and withholding the lines would hide a
 namespace whose owner crashed mid-rewrite and never came back. The manifest is
 therefore the commit boundary for **pruning**, not for additions.
 
-The namespaces read are not only the ones with day files in the listing:
+The listing includes day files and namespace manifests, so manifest-only
+owners are considered even when no local row names them. The namespaces read
+are not only the ones in the listing:
 every namespace this target claimed before, and every namespace that
 unresolved rows are attributed to, is planned through its manifest too. The
-listing only shows day files, so for a namespace with none the manifest is
-what tells the three states apart (invariant 10):
+manifest tells the three states apart for a namespace with no day files
+(invariant 10):
 
 | `data/<X>/` on the target | State | Effect |
 | --- | --- | --- |
@@ -301,9 +303,8 @@ owner simply makes the cleanup's push fail (`pull --rebase` conflicts on the
 shared files), and nothing is published.
 
 `aiusage clean --all` wipes the whole target with `deleteAllData`, always —
-the listing only shows day files, and an interrupted operation can leave a
-namespace consisting of nothing but its `manifest.json`, which peers would
-otherwise keep reading as an empty snapshot. A full local clean also drops
+an interrupted operation can leave a namespace consisting of nothing but its
+`manifest.json`, which must also be removed. A full local clean also drops
 pending retired wire ids along with claims, sync state and tombstones.
 
 ### Atomicity and interruptions
@@ -345,9 +346,10 @@ Because reconciliation deletes local rows, the backends never mask errors:
   means the cache layout is corrupt and is thrown like permission and I/O
   errors. `listFiles` returns an empty list only when the `data/` directory
   does not exist; any failure while inspecting or walking it is thrown.
-* `S3SyncBackend.readFile` returns `null` only for `NoSuchKey`/404; listing
-  errors are thrown. `deleteAllData` inspects the per-object `Errors` of every
-  `DeleteObjects` response and throws when any key was not deleted, so
+* `S3SyncBackend.readFile` returns `null` only for `NoSuchKey`/404; a successful
+  GET without a body is an error. Listing errors and truncated pages without
+  a new continuation token are thrown. `deleteAllData` inspects the per-object
+  `Errors` of every `DeleteObjects` response and throws when any key was not deleted, so
   `aiusage clean --all` never reports a partial wipe as complete.
 * A thrown listing or read error aborts the sync with `status: 'failed'`
   before any reconciliation.
@@ -403,12 +405,19 @@ serialises it as `deviceName` on both push and pull, where the core
 `SyncRecord` (the file backends' wire format and the local tables) calls it
 `device`; integer columns are Postgres bigints and come back as strings.
 Records go out through `toCloudRecord` and come in through `fromCloudRecord`,
-which normalises numbers and rejects a record that lacks a wire id, an origin
-device, a tool, a model or its timestamps — and a pull containing such a
+which normalises numbers and rejects missing or invalid required fields
+(including token counts, cost, provider and session key). A pull containing such a
 record fails rather than silently omitting it, because a completed pull is
 reconciled against and an omission would read as absence. Ownership is not
 part of the translation: `deviceInstanceId` names the origin device on both
 sides.
+
+Every pull page must contain record and tombstone arrays, a boolean
+`has_more`, a positive integer generation, and a valid cursor when more pages
+remain. Tombstone identities are validated too. Within one generation,
+cursors must advance numerically (compared as bigints); a generation change
+restarts the pull before checking progress. Any invalid page fails the entire
+pull before rows, claims or verdicts change.
 
 ## Migration from 1.5.17 and earlier
 
@@ -494,13 +503,14 @@ test that exercises it (all under `packages/cli/tests/`).
 | Unverifiable snapshot with newer token data and an extra record: row updated, claims untouched, nothing pruned | 9, 12 | `sync/sync-invariants.test.ts` — *unverified snapshots* |
 | A row read from an unverifiable snapshot on A is not pruned by B verifying the namespace | 5, 8, 9 | same |
 | `r@v2` on A, `r@v1` on B; A drops it; B's claim keeps v2 | 6, 12 | `sync/sync-invariants.test.ts` — *one record, different versions* |
-| Legacy `unknown` rows wait for a fully reliable sync of every known target | 8, 9 | `sync/sync-invariants.test.ts` — *legacy rows stamped 'unknown'* |
+| Legacy `unknown` rows wait for a fully reliable sync of every known target, including untracked manifest-only owners | 8, 9 | `sync/sync-invariants.test.ts` |
 | Listing failure, read failure, local DB failure mid-pull, file vanished between list and read, malformed line, manifest mismatch, record moving between day files on S3, interrupted wipe | 9, 11 | `sync/reconciliation-safety.test.ts` |
 | Git `ENOTDIR`, permission and I/O errors are never absence | 11 | `sync/git-fail-closed.test.ts` |
 | S3 `DeleteObjects` with per-object errors | 11 | `sync/s3-delete-all.test.ts` |
+| S3 GET without a body, malformed listings, missing or cyclic continuation tokens fail closed | 9, 11 | `sync/s3.test.ts` |
 | Same record on two targets; one target drops it; namespace disappears from one target only; cloud claim vs file target | 5, 6, 7 | `sync/multi-target-claims.test.ts` |
 | Cloud generation reset, pages spanning two generations, tombstones for unclaimed rows | 5, 6, 11 | `sync/cloud-orchestrator-claims.test.ts`, `sync/cloud-orchestrator-tombstones.test.ts` |
-| Cloud wire shape: `deviceName` on push and pull, bigint strings, unparsable record fails the pull | 11 | `sync/cloud-dto.test.ts` |
+| Cloud wire shape, required fields, malformed envelopes and tombstones, bigint cursor progress; failed later pages leave rows and claims unchanged | 9, 11 | `sync/cloud-dto.test.ts` |
 | Two branches / prefixes of one store never share claims; legacy key adoption copies claims but not verdicts; the old key stays a known target so the changed configuration never settles rows the unchanged one carries | 5, 8 | `sync/target-identity.test.ts` |
 | A stray `.ndjson` file outside any namespace folder is not a namespace | 9 | `sync/reconciliation-safety.test.ts`, `sync/snapshot-listing.test.ts` |
 | Migration stamps pre-existing rows at tick 0; idempotent | 4, 13 | `db/migration-v14.test.ts` |

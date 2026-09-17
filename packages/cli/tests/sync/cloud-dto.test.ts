@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { SyncRecord } from '@aiusage/core'
+import Database from 'better-sqlite3'
+import { initializeDatabase } from '../../src/db/index.js'
+import { CloudSyncOrchestrator } from '../../src/sync/cloud-orchestrator.js'
 
 vi.mock('../../src/leaderboard/credentials.js', () => ({
   loadCredentials: () => ({ device_id: 'dev-1', device_secret: 'secret' }),
@@ -75,14 +78,31 @@ describe('cloud DTO', () => {
     expect(fromCloudRecord(serverRecord)).toEqual(record)
   })
 
-  it('accepts `device` from a server that predates deviceName, and fills defaults', () => {
+  it('accepts the legacy device alias and nullable optional metadata', () => {
     const { deviceName, ...rest } = serverRecord
     expect(fromCloudRecord({ ...rest, device: 'OLD' })?.device).toBe('OLD')
-    const minimal = fromCloudRecord({ id: 'w2', deviceInstanceId: 'd', tool: 'codex', model: 'm', ts: 1, updatedAt: 2, cost: null, platform: null, sourceFile: null })
-    expect(minimal).toEqual({
-      id: 'w2', ts: 1, tool: 'codex', model: 'm', provider: '', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
-      cacheWriteTokens: 0, thinkingTokens: 0, cost: 0, costSource: 'unknown', sessionKey: '', device: '', deviceInstanceId: 'd', updatedAt: 2,
-    })
+    const parsed = fromCloudRecord({ ...serverRecord, platform: null, sourceFile: null, cwd: null })
+    expect(parsed).toMatchObject({ id: record.id, inputTokens: record.inputTokens })
+    expect(parsed).not.toHaveProperty('platform')
+    expect(parsed).not.toHaveProperty('sourceFile')
+    expect(parsed).not.toHaveProperty('cwd')
+  })
+
+  it.each(Object.keys(serverRecord).filter(key => !['platform', 'sourceFile', 'cwd'].includes(key)))(
+    'rejects missing, null or wrongly typed required field %s', key => {
+      for (const value of [undefined, null, {}]) {
+        expect(fromCloudRecord({ ...serverRecord, [key]: value })).toBeNull()
+      }
+    },
+  )
+
+  it('rejects invalid numbers and cost sources without replacing them with defaults', () => {
+    for (const inputTokens of ['', 'NaN', Infinity, false]) {
+      expect(fromCloudRecord({ ...serverRecord, inputTokens })).toBeNull()
+    }
+    expect(fromCloudRecord({ ...serverRecord, costSource: 'other' })).toBeNull()
+    expect(fromCloudRecord({ ...serverRecord, inputTokens: 0, cost: 0, provider: '', sessionKey: '', deviceName: '' }))
+      .toMatchObject({ inputTokens: 0, cost: 0, provider: '', sessionKey: '', device: '' })
   })
 
   it('rejects records without the fields a SyncRecord must have', () => {
@@ -96,6 +116,7 @@ describe('cloud DTO', () => {
 
 describe('cloud API boundary', () => {
   const fetchMock = vi.fn()
+  const envelope = { records: [serverRecord], tombstones: [], sync_generation: 2, has_more: false, next_cursor: null }
 
   beforeEach(() => {
     fetchMock.mockReset()
@@ -142,5 +163,62 @@ describe('cloud API boundary', () => {
     const promise = cloudPull()
     await expect(promise).rejects.toBeInstanceOf(CloudSyncError)
     await promise.catch((e: CloudSyncError) => expect(e.code).toBe('invalid_response'))
+  })
+
+  it.each([
+    null, [], {},
+    { ...envelope, records: undefined }, { ...envelope, records: {} },
+    { ...envelope, tombstones: undefined }, { ...envelope, tombstones: {} },
+    { ...envelope, tombstones: [null] }, { ...envelope, tombstones: [{ id: 'w1' }] },
+    { ...envelope, has_more: undefined }, { ...envelope, has_more: 'false' },
+    { ...envelope, sync_generation: undefined }, { ...envelope, sync_generation: 0 },
+    { ...envelope, sync_generation: 1.5 }, { ...envelope, sync_generation: '2' },
+    { ...envelope, next_cursor: 5 }, { ...envelope, next_cursor: 'invalid' },
+    { ...envelope, has_more: true }, { ...envelope, has_more: true, next_cursor: '' },
+    { ...envelope, has_more: true, next_cursor: '0' },
+  ])('rejects a malformed pull envelope %#', async body => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(body))
+    await expect(cloudPull()).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
+  it.each(['envelope', 'record', 'tombstone', 'repeated cursor', 'backward cursor'])(
+    'preserves rows, values and claims when a later page has a malformed %s', async failure => {
+      const db = new Database(':memory:')
+      initializeDatabase(db)
+      const orchestrator = new CloudSyncOrchestrator(db, { deviceInstanceId: 'me', knownTargets: ['cloud'] })
+      try {
+        fetchMock.mockResolvedValueOnce(jsonResponse(envelope))
+        expect((await orchestrator.sync()).status).toBe('ok')
+        const tables = ['synced_records', 'records', 'sync_record_claims', 'sync_namespace_verdicts']
+        const before = tables.map(table => db.prepare(`SELECT * FROM ${table}`).all())
+        const newer = { ...serverRecord, updatedAt: Number(serverRecord.updatedAt) + 1, inputTokens: '999' }
+        const bad = failure === 'envelope' ? { ...envelope, records: undefined }
+          : failure === 'record' ? { ...envelope, records: [{ ...newer, inputTokens: undefined }] }
+          : failure === 'tombstone' ? { ...envelope, tombstones: [{ id: 'w1' }] }
+          : { ...envelope, has_more: true, next_cursor: failure === 'repeated cursor' ? '9007199254740993' : '9007199254740992' }
+        fetchMock.mockResolvedValueOnce(jsonResponse({ ...envelope, records: [newer], has_more: true, next_cursor: '9007199254740993' }))
+          .mockResolvedValueOnce(jsonResponse(bad))
+        expect((await orchestrator.sync()).status).toBe('failed')
+        expect(tables.map(table => db.prepare(`SELECT * FROM ${table}`).all())).toEqual(before)
+        expect(fetchMock).toHaveBeenCalledTimes(3)
+      } finally {
+        db.close()
+      }
+    },
+  )
+
+  it('allows a generation restart with a lower cursor', async () => {
+    const db = new Database(':memory:')
+    initializeDatabase(db)
+    try {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ ...envelope, has_more: true, next_cursor: '100' }))
+        .mockResolvedValueOnce(jsonResponse({ ...envelope, sync_generation: 3, has_more: true, next_cursor: '1' }))
+        .mockResolvedValueOnce(jsonResponse({ ...envelope, sync_generation: 3, has_more: true, next_cursor: '1' }))
+        .mockResolvedValueOnce(jsonResponse({ ...envelope, sync_generation: 3 }))
+      expect(await new CloudSyncOrchestrator(db, { deviceInstanceId: 'me' }).sync()).toMatchObject({ status: 'ok', syncGeneration: 3 })
+      expect(fetchMock.mock.calls.map(([url]) => new URL(url).searchParams.get('cursor'))).toEqual([null, '100', null, '1'])
+    } finally {
+      db.close()
+    }
   })
 })

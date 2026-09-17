@@ -205,6 +205,12 @@ export class CloudSyncOrchestrator {
           changed = true
           break
         }
+        // Cursors are decimal change_seq bigints. Check progress only after
+        // generation handling: a reset legitimately restarts the sequence.
+        if (result.hasMore && (!result.nextCursor || !/^[0-9]+$/.test(result.nextCursor)
+          || BigInt(result.nextCursor) <= BigInt(cursor ?? '0'))) {
+          throw new CloudSyncError('Cloud pull cursor did not advance.', 'invalid_response')
+        }
         allRecords.push(...result.records)
         allTombstones.push(...(result.tombstones ?? []))
         cursor = result.nextCursor

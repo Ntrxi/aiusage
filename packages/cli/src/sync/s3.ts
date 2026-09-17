@@ -42,7 +42,7 @@ export class S3SyncBackend {
         Key: key,
       })
       const response = await this.client.send(command)
-      if (!response.Body) return null
+      if (!response.Body) throw new Error('S3 GetObject returned no body.')
       return await response.Body.transformToString('utf-8')
     } catch (error: any) {
       if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
@@ -66,7 +66,7 @@ export class S3SyncBackend {
   async listFiles(): Promise<string[]> {
     const files: string[] = []
     for (const entry of await this.listEntries()) {
-      if (entry.path.endsWith('.ndjson')) files.push(entry.path)
+      if (entry.path.endsWith('.ndjson') || /^[^/]+\/manifest\.json$/.test(entry.path)) files.push(entry.path)
     }
     return files.sort()
   }
@@ -91,6 +91,7 @@ export class S3SyncBackend {
   private async listEntries(): Promise<Array<{ path: string; etag?: string }>> {
     const entries: Array<{ path: string; etag?: string }> = []
     let continuationToken: string | undefined
+    const seenTokens = new Set<string>()
 
     do {
       const command = new ListObjectsV2Command({
@@ -100,15 +101,28 @@ export class S3SyncBackend {
       })
       const response = await this.client.send(command)
 
+      if (typeof response.IsTruncated !== 'boolean'
+        || (response.Contents !== undefined && !Array.isArray(response.Contents))) {
+        throw new Error('S3 returned an invalid object listing.')
+      }
       if (response.Contents) {
         for (const obj of response.Contents) {
-          const key = obj.Key!
+          const key = obj?.Key
+          if (typeof key !== 'string' || !key.startsWith(this.prefix)) {
+            throw new Error('S3 returned an invalid object key in its listing.')
+          }
           const relPath = key.slice(this.prefix.length)
           if (relPath) entries.push({ path: relPath, etag: obj.ETag })
         }
       }
 
       continuationToken = response.IsTruncated ? response.NextContinuationToken : undefined
+      if (response.IsTruncated) {
+        if (typeof continuationToken !== 'string' || !continuationToken.trim() || seenTokens.has(continuationToken)) {
+          throw new Error('S3 listing is truncated without a progressing continuation token.')
+        }
+        seenTokens.add(continuationToken)
+      }
     } while (continuationToken)
 
     return entries

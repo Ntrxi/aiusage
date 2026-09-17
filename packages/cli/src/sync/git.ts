@@ -126,8 +126,8 @@ export class GitSyncBackend {
   }
 
   /**
-   * Every `*.ndjson` under `data/`. A repository without a `data/` directory
-   * is genuinely empty; any failure while walking an existing tree is thrown
+   * Every `*.ndjson` and namespace manifest under `data/`. A repository without
+   * a `data/` directory is genuinely empty; a failure walking an existing tree is thrown
    * so that it can never be mistaken for "every namespace was deleted".
    */
   async listFiles(): Promise<string[]> {
@@ -157,7 +157,7 @@ export class GitSyncBackend {
   async deleteAllData(): Promise<number> {
     const files = await this.listFiles()
     await rm(this.dataDir, { recursive: true, force: true })
-    return files.length
+    return files.filter(path => path.endsWith('.ndjson')).length
   }
 
   private static readonly MAX_PUSH_RETRIES = 3
@@ -191,7 +191,7 @@ export class GitSyncBackend {
       const relPath = prefix ? `${prefix}/${entry.name}` : entry.name
       if (entry.isDirectory()) {
         files.push(...await this.walkDir(join(dir, entry.name), relPath))
-      } else if (entry.name.endsWith('.ndjson')) {
+      } else if (entry.name.endsWith('.ndjson') || (entry.name === 'manifest.json' && prefix !== '' && !prefix.includes('/'))) {
         files.push(relPath)
       }
     }

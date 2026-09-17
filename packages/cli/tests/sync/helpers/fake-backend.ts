@@ -19,9 +19,9 @@ export class FakeSyncBackend implements SyncBackend {
     this.writes.push({ path, content })
   }
 
-  /** Like GitHub/S3: only data files are listed; manifests are read directly. */
+  /** Like GitHub/S3: list day files and namespace manifests. */
   async listFiles(): Promise<string[]> {
-    return Array.from(this.files.keys()).filter(p => p.endsWith('.ndjson')).sort()
+    return Array.from(this.files.keys()).filter(p => p.endsWith('.ndjson') || /^[^/]+\/manifest\.json$/.test(p)).sort()
   }
 
   async deleteFile(path: string): Promise<void> {
