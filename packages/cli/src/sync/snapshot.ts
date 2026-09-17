@@ -1,6 +1,6 @@
 import type { SyncRecord } from '@aiusage/core'
 import type { SyncBackend } from './index.js'
-import { canonicalDigest, isManifestPath, manifestPath, parseManifest, parseNdjsonLines, type NamespaceManifest } from './manifest.js'
+import { canonicalDigest, isDayFilePath, manifestPath, parseManifest, parseNdjsonLines, type NamespaceManifest } from './manifest.js'
 
 /**
  * The one way to read a device namespace from a file-based backend.
@@ -49,7 +49,7 @@ export interface NamespaceSnapshot extends NamespaceReadPlan {
 export function ownerDataPaths(owner: string, listedPaths: Iterable<string>): string[] {
   const prefix = `${owner}/`
   const out: string[] = []
-  for (const p of listedPaths) if (p.startsWith(prefix) && p.endsWith('.ndjson') && !isManifestPath(p)) out.push(p)
+  for (const p of listedPaths) if (p.startsWith(prefix) && isDayFilePath(p)) out.push(p)
   return out.sort()
 }
 
@@ -123,13 +123,9 @@ export async function readNamespaceSnapshot(backend: SyncBackend, owner: string,
   return readNamespaceFiles(backend, await planNamespaceRead(backend, owner, listedPaths))
 }
 
-/** Owners of every day file in a listing, in sorted order. */
+/** Owners of every day file in a listing, in sorted order (paths outside a namespace folder have none). */
 export function listedOwners(listedPaths: Iterable<string>): string[] {
   const owners = new Set<string>()
-  for (const p of listedPaths) {
-    if (!p.endsWith('.ndjson') || isManifestPath(p)) continue
-    const idx = p.indexOf('/')
-    owners.add(idx === -1 ? p : p.slice(0, idx))
-  }
+  for (const p of listedPaths) if (isDayFilePath(p)) owners.add(p.slice(0, p.indexOf('/')))
   return [...owners].sort()
 }

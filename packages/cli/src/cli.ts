@@ -5,7 +5,7 @@ import { serve } from './commands/serve.js'
 import { runInit } from './commands/init.js'
 import { runGitHubLogin } from './commands/github-login.js'
 import { safeGitHubError } from './github/auth.js'
-import { runSync, runSyncRepair, formatRepairReport } from './commands/sync.js'
+import { runSync, runSyncRepair, formatRepairReport, formatForgetTargetReport, syncUsageError } from './commands/sync.js'
 import { generateSummary } from './commands/summary.js'
 import { generateStatus } from './commands/status.js'
 import { exportData } from './commands/export.js'
@@ -383,16 +383,22 @@ program
   .option('--repair', 'Report records that an older version copied into the wrong device namespace (dry run unless --apply)')
   .option('--apply', 'With --repair: perform the cleanup (rewrites this device\'s remote namespace and prunes local echoes)')
   .option('--all-namespaces', 'With --repair: also clean namespaces owned by other devices')
-  .action(async (opts: { repair?: boolean; apply?: boolean; allNamespaces?: boolean }) => {
+  .option('--forget-target <key>', 'With --repair: stop counting a sync target you no longer use (releases its claims so rows only it carried can be pruned; dry run unless --apply)')
+  .action(async (opts: { repair?: boolean; apply?: boolean; allNamespaces?: boolean; forgetTarget?: string }) => {
+    const usage = syncUsageError(opts)
+    if (usage) {
+      console.error(usage)
+      process.exit(1)
+    }
     const db = createDatabase(DB_PATH)
     if (opts.repair) {
       try {
-        const result = await runSyncRepair(db, { apply: opts.apply, allNamespaces: opts.allNamespaces })
-        if (result.status !== 'ok' || !result.report) {
+        const result = await runSyncRepair(db, { apply: opts.apply, allNamespaces: opts.allNamespaces, forgetTarget: opts.forgetTarget })
+        if (result.status !== 'ok' || (!result.report && !result.forget)) {
           console.error(`✗ ${result.error ?? 'Repair failed'}`)
           process.exit(1)
         }
-        console.log(formatRepairReport(result.report))
+        console.log(result.forget ? formatForgetTargetReport(result.forget) : formatRepairReport(result.report!))
       } catch (e) {
         console.error(`✗ Repair failed: ${e instanceof Error ? e.message : e}`)
         process.exit(1)
@@ -420,6 +426,10 @@ program
         }
         if ('collisionCount' in result && result.collisionCount) {
           console.log(`  WARNING: ${result.collisionCount} local record(s) share a sync id with another record and were not uploaded. Run "aiusage sync --repair" for details.`)
+        }
+        if (result.lingeringLegacyTarget) {
+          console.log(`  Note: this device still counts "${result.lingeringLegacyTarget}", the key clients up to 1.5.17 used for this configuration. Records synced before the upgrade are not pruned until that key syncs again.`)
+          console.log(`  If nothing syncs under it any more (no configuration uses the default branch/prefix/endpoint), release it: aiusage sync --repair --forget-target "${result.lingeringLegacyTarget}"`)
         }
       } else if (result.status === 'blocked_pending_consent') {
         console.error(`✗ ${result.error}`)

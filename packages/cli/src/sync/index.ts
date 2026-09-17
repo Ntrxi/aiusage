@@ -21,7 +21,7 @@ import { mapStatsRecordToSyncRecord } from './mapper.js'
 import {
   buildManifest,
   contentDigest,
-  isManifestPath,
+  isDayFilePath,
   manifestPath,
   matchesCanonical,
   parseNdjsonLines,
@@ -258,7 +258,7 @@ export class SyncOrchestrator {
     // unresolved as of this tick, and verdicts are recorded under it.
     const tick = nextSyncTick(this.db)
     const localDevicePrefix = `${own}/`
-    const dataPaths = allPaths.filter(p => p.endsWith('.ndjson') && !isManifestPath(p) && !p.startsWith(localDevicePrefix))
+    const dataPaths = allPaths.filter(p => isDayFilePath(p) && !p.startsWith(localDevicePrefix))
 
     const listedByOwner = new Map<string, string[]>()
     for (const path of dataPaths) {
@@ -390,7 +390,7 @@ export class SyncOrchestrator {
       byRel.get(rel)!.push(wire)
     }
 
-    const ownPaths = allPaths.filter(p => p.startsWith(prefix) && p.endsWith('.ndjson') && !isManifestPath(p))
+    const ownPaths = allPaths.filter(p => p.startsWith(prefix) && isDayFilePath(p))
     const ownPathSet = new Set(ownPaths)
     const stalePaths = ownPaths.filter(p => !byRel.has(p.slice(prefix.length)))
     const uploads = Array.from(byRel.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))

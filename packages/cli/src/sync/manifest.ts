@@ -57,6 +57,17 @@ export function isManifestPath(path: string): boolean {
   return path.endsWith(`/${MANIFEST_FILE}`)
 }
 
+/**
+ * True for a day file inside a namespace folder (`<owner>/...ndjson`). A
+ * listing can contain other `.ndjson` files — a stray file at the top of the
+ * data directory has no owner and no namespace to read, and must not be
+ * mistaken for one (its name would become an owner and its manifest path a
+ * file component, which the backends rightly refuse to read through).
+ */
+export function isDayFilePath(path: string): boolean {
+  return path.endsWith('.ndjson') && path.indexOf('/') > 0
+}
+
 /** Parse a single ndjson line, normalising string timestamps. Returns null on bad input. */
 export function parseSyncRecordLine(line: string): SyncRecord | null {
   try {

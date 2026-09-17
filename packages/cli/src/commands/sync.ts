@@ -9,28 +9,23 @@ import { S3SyncBackend } from '../sync/s3.js'
 import { loadConfig, buildConsentConfig, loadCredential, AIUSAGE_DIR } from '../config.js'
 import { hasCredentials } from '../leaderboard/credentials.js'
 import type { SyncProgress } from '../sync/runtime.js'
-import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget } from '../sync/target.js'
-import { repairSyncContamination, type RepairReport } from '../sync/repair.js'
+import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget, knownSyncTargets, otherSyncTargets } from '../sync/target.js'
+import { forgetSyncTarget, repairSyncContamination, type ForgetTargetReport, type RepairReport } from '../sync/repair.js'
 import { githubToken } from '../github/auth.js'
 
+export { knownSyncTargets } from '../sync/target.js'
+
 /**
- * Every sync target recorded in state — each repository, bucket or the cloud
- * this device has ever synced with — with `target` always included and
- * `aliases` (other keys that denote the same store: the key clients up to
- * 1.5.17 used for this configuration, see `getLegacySyncTarget`) folded into
- * it. Unresolved pulled rows are deleted only once every target in this set
- * has judged their namespace, so a target that is never synced again keeps
- * them until `aiusage sync --repair` removes them.
+ * Flag combinations `aiusage sync` rejects before touching anything, or
+ * `null` when the flags are consistent. `--forget-target` is a repair mode:
+ * on its own it would look like an ordinary sync that silently ignores the
+ * key.
  */
-export function knownSyncTargets(state: import('../init.js').State | null, target: string, aliases: Array<string | null> = []): string[] {
-  const known = new Set<string>([target])
-  if (state) {
-    for (const key of Object.keys(state.syncConsents ?? {})) known.add(key)
-    for (const key of Object.keys(state.syncTargets ?? {})) known.add(key)
-    if (state.lastSyncTarget) known.add(state.lastSyncTarget)
+export function syncUsageError(opts: { repair?: boolean; apply?: boolean; allNamespaces?: boolean; forgetTarget?: string }): string | null {
+  if (opts.forgetTarget !== undefined && !opts.repair) {
+    return 'Cannot use --forget-target without --repair. Run "aiusage sync --repair --forget-target <key>" (add --apply to perform it).'
   }
-  for (const alias of aliases) if (alias) known.delete(alias)
-  return [...known].sort()
+  return null
 }
 
 export function createBackend(config: import('../config.js').Config): SyncBackend | null {
@@ -74,10 +69,35 @@ function blockedResult(error: string): SyncResult {
   return { status: 'blocked_pending_consent', pulledCount: 0, uploadedCount: 0, mergedCount: 0, error }
 }
 
+/**
+ * The key clients up to 1.5.17 used for this configuration, when this device
+ * still counts it (listed in `state.json` or holding claims or verdicts).
+ * Such a key withholds the verdict unresolved rows wait for — including the
+ * pre-upgrade Antigravity/Trae rows this release re-publishes under new ids —
+ * until something syncs under it again or it is forgotten. Nothing tells
+ * whether the default configuration still uses it, so `aiusage sync` only
+ * names it.
+ */
+export function lingeringLegacySyncTarget(
+  db: Database.Database,
+  state: import('../init.js').State | null,
+  sync: import('../config.js').SyncConfig | undefined,
+): string | undefined {
+  const target = getSyncTarget(sync)
+  const legacy = getLegacySyncTarget(sync)
+  if (!target || !legacy) return undefined
+  return otherSyncTargets(db, state, target).includes(legacy) ? legacy : undefined
+}
+
+export type RunSyncResult = (SyncResult | CloudSyncResult) & {
+  /** See `lingeringLegacySyncTarget`; set only after a successful sync. */
+  lingeringLegacyTarget?: string
+}
+
 export async function runSync(
   db: Database.Database,
   options?: { onProgress?: (progress: SyncProgress) => void },
-): Promise<SyncResult | CloudSyncResult> {
+): Promise<RunSyncResult> {
   const config = loadConfig()
   if (!config?.sync) {
     return failedResult('Sync not configured. Run "aiusage init" first.')
@@ -150,7 +170,7 @@ export async function runSync(
     deviceInstanceId: state!.deviceInstanceId,
     target,
     consentVerified: true,
-    knownTargets: knownSyncTargets(state, target, [getLegacySyncTarget(config.sync)]),
+    knownTargets: knownSyncTargets(state, target),
     onProgress: options?.onProgress,
   })
 
@@ -167,7 +187,9 @@ export async function runSync(
     lastSyncDurationMs: now - startedAt,
   })
 
-  return result
+  if (result.status !== 'ok') return result
+  const lingeringLegacyTarget = lingeringLegacySyncTarget(db, getState(AIUSAGE_DIR), config.sync)
+  return lingeringLegacyTarget ? { ...result, lingeringLegacyTarget } : result
 }
 
 export interface SyncRepairOptions {
@@ -175,6 +197,19 @@ export interface SyncRepairOptions {
   apply?: boolean
   /** Also repair namespaces owned by other devices (file-based backends). */
   allNamespaces?: boolean
+  /**
+   * Instead of repairing, forget this sync target key (see `forgetSyncTarget`).
+   * Local bookkeeping only; the remote is not read or written.
+   */
+  forgetTarget?: string
+}
+
+export interface SyncRepairResult {
+  status: 'ok' | 'failed' | 'blocked_pending_consent'
+  report?: RepairReport
+  /** Set instead of `report` when `forgetTarget` was given. */
+  forget?: ForgetTargetReport
+  error?: string
 }
 
 /**
@@ -182,11 +217,16 @@ export interface SyncRepairOptions {
  * the pre-provenance sync bug copied into the wrong device namespace.
  * See sync/repair.ts for the rules. Consent is required exactly as for sync,
  * because repairing rewrites files in the configured remote.
+ *
+ * With `forgetTarget` nothing is repaired: the given key is forgotten
+ * (dry run unless `apply`). That touches only the local database and
+ * `state.json`, so it needs neither consent nor a backend and works with the
+ * cloud configured too — except for forgetting `cloud` itself then.
  */
 export async function runSyncRepair(
   db: Database.Database,
   options: SyncRepairOptions = {},
-): Promise<{ status: 'ok' | 'failed' | 'blocked_pending_consent'; report?: RepairReport; error?: string }> {
+): Promise<SyncRepairResult> {
   const config = loadConfig()
   if (!config?.sync) {
     return { status: 'failed', error: 'Sync not configured. Run "aiusage init" first.' }
@@ -201,10 +241,20 @@ export async function runSyncRepair(
     return { status: 'failed', error: 'Device identity not initialised. Run "aiusage init" first.' }
   }
 
+  if (options.forgetTarget !== undefined) {
+    try {
+      const forget = forgetSyncTarget(db, { aiusageDir: AIUSAGE_DIR, target: options.forgetTarget, currentTarget: target, apply: options.apply })
+      return { status: 'ok', forget }
+    } catch (error) {
+      return { status: 'failed', error: error instanceof Error ? error.message : 'Unknown error' }
+    }
+  }
+  const otherTargets = otherSyncTargets(db, state, target)
+
   // Cloud backend has no per-device namespaces: local repair only.
   if (config.sync.backend === 'cloud') {
     const report = await repairSyncContamination(db, { deviceInstanceId: state.deviceInstanceId, apply: options.apply })
-    return { status: 'ok', report }
+    return { status: 'ok', report: { ...report, otherTargets } }
   }
 
   const consent = state.syncConsents?.[target]
@@ -229,7 +279,7 @@ export async function runSyncRepair(
       allNamespaces: options.allNamespaces,
       apply: options.apply,
     })
-    return { status: 'ok', report }
+    return { status: 'ok', report: { ...report, otherTargets } }
   } catch (error) {
     return { status: 'failed', error: error instanceof Error ? error.message : 'Unknown error' }
   }
@@ -273,6 +323,39 @@ export function formatRepairReport(report: RepairReport): string {
     if (report.remoteResult) {
       lines.push(`  Rewrote ${report.remoteResult.rewritten} file(s), deleted ${report.remoteResult.deleted} empty file(s), ${report.remoteResult.flushed ? 'pushed' : 'nothing to push'}`)
     }
+  }
+  if (report.otherTargets && report.otherTargets.length > 0) {
+    lines.push('')
+    lines.push(`Other sync targets this device still counts: ${report.otherTargets.join(', ')}`)
+    lines.push('  Rows only such a target claims are never pruned, and unresolved rows wait for its verdict, until it syncs again.')
+    lines.push('  If one of them will never be synced again, release it with "aiusage sync --repair --forget-target <key>" (dry run; add --apply to perform it). Nothing is done automatically.')
+  }
+  if (!report.applied) {
+    lines.push('')
+    lines.push('Dry run — nothing was changed. Re-run with --apply to perform these changes.')
+  }
+  return lines.join('\n')
+}
+
+/** Human-readable rendering of a `--forget-target` report for the CLI. */
+export function formatForgetTargetReport(report: ForgetTargetReport): string {
+  const b = report.bookkeeping
+  const verb = report.applied ? 'Removed' : 'Would remove'
+  const lines: string[] = []
+  lines.push(`${report.applied ? 'Forgot' : 'Would forget'} sync target: ${report.target}`)
+  lines.push('')
+  lines.push('Local database:')
+  lines.push(`  ${verb} ${b.claimRows} claim(s), ${b.verdictRows} namespace verdict(s), ${b.syncStateRows} publish bookkeeping row(s) and ${b.retiredWireIdRows} retired wire id(s) recorded under this key`)
+  lines.push(`  ${b.lastClaimRows} pulled record(s) ${report.applied ? 'lost' : 'would lose'} their last claim and ${report.applied ? 'became' : 'would become'} unresolved${report.tick !== undefined ? ` (sync tick ${report.tick})` : ''}; none ${report.applied ? 'was' : 'would be'} deleted`)
+  lines.push('')
+  lines.push('state.json:')
+  lines.push(report.inState
+    ? `  ${report.applied ? 'Removed' : 'Would remove'} the key from the known sync targets (consent and last-sync status)`
+    : '  The key was not listed; nothing to remove')
+  lines.push('')
+  if (report.remainingTargets.length > 0) {
+    lines.push(`Unresolved rows are pruned only once every remaining known target has synced again and judged their namespace: ${report.remainingTargets.join(', ')}`)
+    lines.push('  Run "aiusage sync" for each of them; rows a target still carries are claimed and kept, the others are removed.')
   }
   if (!report.applied) {
     lines.push('')

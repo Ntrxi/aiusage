@@ -8,7 +8,8 @@ import type { StatsRecord } from '@aiusage/core'
 import type { SyncConfig } from '../../src/config.js'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
-import { getClaimingTargets, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
+import { getClaimingTargets, getNamespaceVerdicts, recordNamespaceVerdict, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
+import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
 import { adoptLegacySyncTarget, getLegacySyncTarget, getSyncTarget } from '../../src/sync/target.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
@@ -115,7 +116,7 @@ describe('adoptLegacySyncTarget', () => {
 
   it('copies state and bookkeeping recorded under the legacy key, once, leaving the legacy key in place', () => {
     const first = adoptLegacySyncTarget(dir, db, config)
-    expect(first).toEqual({ target, legacy, stateCopied: true, syncStateRows: 1, claimRows: 1, retiredWireIdRows: 1, verdictRows: 0 })
+    expect(first).toEqual({ target, legacy, stateCopied: true, syncStateRows: 1, claimRows: 1, retiredWireIdRows: 1 })
 
     const s = state()
     expect(s.syncConsents[target]).toEqual({ syncConsentAt: 1, syncConsentTarget: 'fp' })
@@ -131,7 +132,7 @@ describe('adoptLegacySyncTarget', () => {
     // Idempotent: a second call copies nothing, even after the legacy key gained rows.
     db.prepare(`INSERT INTO sync_retired_wire_ids (target, wire_id) VALUES (?, 'newer')`).run(legacy)
     const second = adoptLegacySyncTarget(dir, db, config)
-    expect(second).toEqual({ target, legacy, stateCopied: false, syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0, verdictRows: 0 })
+    expect(second).toEqual({ target, legacy, stateCopied: false, syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0 })
     expect(rows('sync_retired_wire_ids', target)).toBe(1)
   })
 
@@ -146,12 +147,77 @@ describe('adoptLegacySyncTarget', () => {
     expect(result?.syncStateRows).toBe(1)
   })
 
-  it('treats the legacy key as an alias of the current target among the known targets', () => {
+  it('never copies namespace verdicts: a verdict permits deletion and was made by whoever synced under the legacy key', () => {
+    recordNamespaceVerdict(db, legacy, 'device-x', 7)
+    const result = adoptLegacySyncTarget(dir, db, config)
+    expect(result?.claimRows).toBe(1)
+    expect(getNamespaceVerdicts(db, 'device-x').get(legacy)).toBe(7)
+    expect(getNamespaceVerdicts(db, 'device-x').has(target)).toBe(false)
+  })
+
+  it('keeps the legacy key among the known targets: it may still be the key of another configuration', () => {
     adoptLegacySyncTarget(dir, db, config)
     expect(knownSyncTargets(state(), target)).toEqual([legacy, target].sort())
-    expect(knownSyncTargets(state(), target, [getLegacySyncTarget(config)])).toEqual([target])
-    expect(knownSyncTargets({ ...state(), syncTargets: { ...state().syncTargets, cloud: {} } }, target, [legacy])).toEqual(['cloud', target].sort())
+    expect(knownSyncTargets({ ...state(), syncTargets: { ...state().syncTargets, cloud: {} } }, target)).toEqual(['cloud', legacy, target].sort())
     expect(knownSyncTargets(null, target)).toEqual([target])
+  })
+})
+
+describe('a configuration whose key changed next to one that kept it', () => {
+  // Before the upgrade, branch `main` and branch `dev` of one repository
+  // shared the key `github:org/usage`. After it, `dev` gets its own key and
+  // adopts the old one, but `main` still syncs under the old key — so the
+  // old key must keep counting as a target that has not judged anything yet.
+  const X = 'device-x'
+  const ME = 'device-me'
+  const DAY = Date.UTC(2026, 8, 6, 12, 0, 0)
+  const mainConfig = github()
+  const devConfig = github({ branch: 'dev' })
+  const mainTarget = getSyncTarget(mainConfig)!
+  const devTarget = getSyncTarget(devConfig)!
+
+  function local(n: number): StatsRecord {
+    return {
+      id: generateRecordId(X, `msg_${n}`, 0), ts: DAY + n * 60_000, ingestedAt: DAY, updatedAt: DAY, lineOffset: 100 * (n + 1),
+      tool: 'claude-code', model: 'm', provider: 'anthropic', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+      thinkingTokens: 0, cost: 0, costSource: 'pricing', sessionId: 'sess', sourceFile: 'C:\\s.jsonl', device: 'X', deviceInstanceId: X,
+    }
+  }
+  const syncedIds = (db: Database.Database) =>
+    (db.prepare(`SELECT id FROM synced_records WHERE device_instance_id = ? ORDER BY id`).all(X) as Array<{ id: string }>).map(r => r.id)
+
+  it('syncing the changed configuration first never deletes a row only the unchanged one carries', async () => {
+    expect(getLegacySyncTarget(devConfig)).toBe(mainTarget)
+    const dbX = new Database(':memory:'); initializeDatabase(dbX)
+    const dbMe = new Database(':memory:'); initializeDatabase(dbMe)
+    const main = new FakeSyncBackend()
+    const dev = new FakeSyncBackend()
+    const records = [0, 1, 2].map(local)
+    const wire = records.map(mapStatsRecordToSyncRecord)
+    for (const r of records.slice(0, 2)) insertRecord(dbX, r)
+    await new SyncOrchestrator(dbX, main, { deviceInstanceId: X, target: mainTarget, consentVerified: true }).sync() // main: r0 r1
+    dbX.prepare(`DELETE FROM records WHERE id = ?`).run(records[0].id)
+    insertRecord(dbX, records[2])
+    await new SyncOrchestrator(dbX, dev, { deviceInstanceId: X, target: devTarget, consentVerified: true }).sync() // dev: r1 r2
+
+    // ME mirrored both branches under the shared key before claims existed.
+    for (const w of wire) insertSyncedRecord(dbMe, w)
+    dbMe.prepare(`UPDATE synced_records SET unclaimed_since = 0`).run()
+    mergeSyncedRecordsIntoRecords(dbMe, ME)
+    const state = { deviceInstanceId: ME, syncTargets: { [mainTarget]: { lastSyncAt: 1, lastSyncStatus: 'ok' as const, lastSyncTarget: mainTarget } } }
+
+    const known = knownSyncTargets(state, devTarget)
+    expect(known).toEqual([mainTarget, devTarget].sort())
+    const first = await new SyncOrchestrator(dbMe, dev, { deviceInstanceId: ME, target: devTarget, consentVerified: true, knownTargets: known }).sync()
+    expect(first.status).toBe('ok')
+    expect(first.prunedCount).toBe(0)
+    expect(syncedIds(dbMe)).toEqual(wire.map(w => w.id).sort())
+    expect(getClaimingTargets(dbMe, wire[0].id)).toEqual([])
+
+    // The unchanged configuration claims what it carries the next time it syncs.
+    await new SyncOrchestrator(dbMe, main, { deviceInstanceId: ME, target: mainTarget, consentVerified: true, knownTargets: known }).sync()
+    expect(getClaimingTargets(dbMe, wire[0].id)).toEqual([mainTarget])
+    expect(syncedIds(dbMe)).toEqual(wire.map(w => w.id).sort())
   })
 })
 

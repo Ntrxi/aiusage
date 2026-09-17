@@ -4,7 +4,7 @@ import { generateRecordId } from '@aiusage/core'
 import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
-import { getClaimingTargets } from '../../src/db/sync-claims.js'
+import { getClaimingTargets, getNamespaceVerdicts } from '../../src/db/sync-claims.js'
 import { SyncOrchestrator, serializeSnapshot } from '../../src/sync/index.js'
 import { buildManifest, manifestPath, parseManifest, serializeManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
@@ -373,6 +373,22 @@ describe('destructive reconciliation fails closed', () => {
     expect(syncedIds(dbB, C)).toContain(cId)
     expect(getClaimingTargets(dbB, cId)).toEqual([TARGET])
     expect(dbB.prepare(`SELECT device_instance_id FROM records WHERE id = ?`).get(cId)).toEqual({ device_instance_id: C })
+  })
+
+  it('ignores an .ndjson file outside any namespace folder instead of reading it as a namespace', async () => {
+    // `data/notes.ndjson` has no owner; treating its name as one would make
+    // pull read `notes.ndjson/manifest.json`, which a real backend refuses
+    // (ENOTDIR) — and every sync would fail while the file is there.
+    backend.files.set('notes.ndjson', 'not a namespace\n')
+    backend.readErrors.set('notes.ndjson/manifest.json', new Error("Cannot read 'notes.ndjson/manifest.json' in the GitHub sync cache (ENOTDIR)"))
+    const b = await sync(dbB, backend, B)
+    expect(b).toMatchObject({ status: 'ok', skippedNamespaces: 0 })
+    expect(syncedIds(dbB, A)).toHaveLength(3)
+    expect(syncedIds(dbB, C)).toHaveLength(2)
+    expect(syncedIds(dbB, 'notes.ndjson')).toEqual([])
+    expect(getNamespaceVerdicts(dbB, 'notes.ndjson').size).toBe(0)
+    expect(backend.files.get('notes.ndjson')).toBe('not a namespace\n')
+    expect(backend.mutations).not.toContain('notes.ndjson')
   })
 
   it('ignores day files the manifest does not name (left behind by an interrupted deletion)', async () => {

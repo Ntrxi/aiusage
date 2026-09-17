@@ -3,8 +3,10 @@ import type { SyncRecord } from '@aiusage/core'
 import { generateSessionKey } from '@aiusage/core'
 import { UNKNOWN_DEVICE_INSTANCE_ID } from '../db/records.js'
 import { getUnclaimedSyncedRecords } from '../db/synced-records.js'
-import { dropDanglingClaims } from '../db/sync-claims.js'
+import { countSyncTargetBookkeeping, dropDanglingClaims, forgetSyncTargetBookkeeping, type SyncTargetBookkeeping } from '../db/sync-claims.js'
+import { getState } from '../init.js'
 import type { SyncBackend } from './index.js'
+import { forgetSyncTargetState, isSyncTargetInState, knownSyncTargets } from './target.js'
 import { buildLocalSnapshot } from './index.js'
 import { buildManifest, manifestPath, serializeManifest, serializeSnapshot } from './manifest.js'
 import { listedOwners, readNamespaceSnapshot } from './snapshot.js'
@@ -497,6 +499,13 @@ export interface RepairReport {
   remote: RemoteRepairPlan | null
   applied: boolean
   remoteResult?: { rewritten: number; deleted: number; flushed: boolean }
+  /**
+   * Sync target keys other than the configured one that this device still
+   * counts (see `otherSyncTargets`). Report only: each keeps the rows it
+   * claims and withholds a verdict until it syncs again, and only the user
+   * knows whether it ever will — `--forget-target` is the way to say it won't.
+   */
+  otherTargets?: string[]
 }
 
 export interface RepairOptions {
@@ -561,3 +570,84 @@ export async function repairSyncContamination(db: Database.Database, options: Re
   report.applied = true
   return report
 }
+
+// ---------------------------------------------------------------------------
+// Forgetting a sync target
+// ---------------------------------------------------------------------------
+
+export interface ForgetTargetOptions {
+  aiusageDir: string
+  /** The key to forget. */
+  target: string
+  /** The key of the configured backend, which can never be forgotten. */
+  currentTarget: string
+  /** Perform the change; without it the report is a dry run. */
+  apply?: boolean
+}
+
+export interface ForgetTargetReport {
+  target: string
+  /** What the key holds (dry run), or what was removed and stamped (applied). */
+  bookkeeping: SyncTargetBookkeeping
+  /** The key is listed in `state.json` (consent, last-sync status or last target). */
+  inState: boolean
+  applied: boolean
+  /** The sync tick at which the rows that lost their last claim became unresolved. */
+  tick?: number
+  /**
+   * The known targets left after the forget. Every one of them has to sync
+   * again before the released rows can be pruned.
+   */
+  remainingTargets: string[]
+}
+
+/**
+ * `aiusage sync --repair --forget-target <key>`: stop counting a sync target
+ * this device will not sync with again.
+ *
+ * A target's claims keep every row they name and, as a known target, it
+ * withholds the verdict unresolved rows wait for; a target that is never
+ * synced again — typically the key a configuration used before its key
+ * changed, which `adoptLegacySyncTarget` deliberately leaves in place because
+ * it may still be the default configuration's — therefore keeps rows alive
+ * forever. Nothing recorded locally can tell that a key is abandoned, so this
+ * is explicit and opt-in.
+ *
+ * Refused for the configured target (it is in use) and for a key nothing is
+ * recorded under (a typo would otherwise "succeed"). With `apply`, the
+ * database is changed first, in one transaction (`forgetSyncTargetBookkeeping`:
+ * rows lose the key's claims and become unresolved at the tick taken before
+ * the change; nothing is deleted), and `state.json` is updated second. That
+ * order makes a crash in between harmless: the key is still a known target,
+ * so the released rows still wait for its verdict and nothing is pruned
+ * early, and re-running the same command completes the forget — the
+ * database part changes nothing the second time. Deletion of the released
+ * rows happens only later, through the normal prune, once every remaining
+ * known target has synced and judged their namespace.
+ */
+export function forgetSyncTarget(db: Database.Database, options: ForgetTargetOptions): ForgetTargetReport {
+  const { aiusageDir, target, currentTarget } = options
+  if (target === currentTarget) {
+    throw new Error(`"${target}" is the configured sync target and cannot be forgotten while it is in use.`)
+  }
+  const state = getState(aiusageDir)
+  const inState = isSyncTargetInState(state, target)
+  const bookkeeping = countSyncTargetBookkeeping(db, target)
+  const inDb = Object.values(bookkeeping).some(n => n > 0)
+  if (!inState && !inDb) {
+    throw new Error(`Unknown sync target "${target}": nothing is recorded under it. Run "aiusage sync --repair" to see the keys this device knows.`)
+  }
+  const remaining = () => knownSyncTargets(getState(aiusageDir), currentTarget).filter(key => key !== target)
+
+  if (!options.apply) return { target, bookkeeping, inState, applied: false, remainingTargets: remaining() }
+
+  const { tick, ...removed } = forgetSyncTargetBookkeeping(db, target)
+  try {
+    forgetSyncTargetState(aiusageDir, target)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    throw new Error(`Removed the bookkeeping of "${target}" from the database, but could not update state.json (${reason}). Nothing is lost: re-run the same command to finish forgetting the key.`)
+  }
+  return { target, bookkeeping: removed, inState, applied: true, tick, remainingTargets: remaining() }
+}
+

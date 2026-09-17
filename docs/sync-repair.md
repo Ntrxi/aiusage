@@ -164,6 +164,78 @@ Recommended order for a fleet of devices:
 The cloud backend has no per-device namespaces; `--repair` there cleans only
 the local database.
 
+## Forgetting a sync target: `--forget-target`
+
+Every sync target this device has ever used keeps counting (see *Target
+identity* in [`sync-namespaces.md`](./sync-namespaces.md)): the rows its
+claims name are never pruned, and unresolved rows wait for a verdict from it.
+A target that is never synced again therefore keeps rows alive forever — most
+commonly the key a non-default branch, prefix or endpoint configuration used
+up to 1.5.17, which the upgrade keeps in place because it may also be the
+default configuration's key. Plain `--repair` cannot help there: its orphan
+rule only looks at rows with no claim at all, and those rows still have one.
+
+The dry run of `--repair` names every key other than the configured one:
+
+```
+Other sync targets this device still counts: github:org/usage
+  Rows only such a target claims are never pruned, and unresolved rows wait for its verdict, until it syncs again.
+  If one of them will never be synced again, release it with "aiusage sync --repair --forget-target <key>" ...
+```
+
+For the most common case — the key this configuration used up to 1.5.17 —
+`aiusage sync` prints the same hint after every successful sync, for as long
+as the key is listed in `state.json` or still holds claims or verdicts:
+
+```
+  Note: this device still counts "github:org/usage", the key clients up to 1.5.17 used for this configuration. ...
+  If nothing syncs under it any more (...), release it: aiusage sync --repair --forget-target "github:org/usage"
+```
+
+Both are hints only. Nothing tells the device whether a key is abandoned or
+merely idle, so nothing acts on it. If you know the key will never be synced
+again:
+
+```
+aiusage sync --repair --forget-target <key>            # dry run: report what would change
+aiusage sync --repair --forget-target <key> --apply    # perform it
+```
+
+The report lists the key, how many claims, namespace verdicts, publish
+bookkeeping rows and retired wire ids it holds, and how many pulled records
+would lose their *last* claim and become unresolved. With `--apply`:
+
+1. in one database transaction, the sync tick is taken *before* anything
+   changes, the key's rows are deleted from `sync_record_claims`,
+   `sync_namespace_verdicts`, `sync_record_state` and
+   `sync_retired_wire_ids`, and every `synced_records` row left without a
+   claim is marked unresolved at that tick (rows that were unresolved
+   already keep their tick);
+2. after that commits, the key is removed from `state.json` (consent,
+   last-sync status, and `lastSyncTarget` if it was the last target synced).
+
+**Nothing is deleted by the forget itself.** The released rows are pruned by
+the normal sync path, once every remaining known target has synced again and
+judged their namespace at a later tick: rows a target still carries are
+claimed and kept, the others are removed. So after `--apply`, run
+`aiusage sync` for each remaining target (the report lists them). Until then
+the released rows are simply unresolved.
+
+The two-step order makes an interruption harmless. If the process dies
+between the database commit and the state write, the key is still a known
+target, so the released rows keep waiting and nothing is pruned early; running
+the same command again changes nothing in the database and finishes the state
+update. The old key is not brought back by the legacy-key adoption either —
+its rows are gone, so there is nothing left to copy. If you later sync under
+the forgotten key after all, it becomes a known target again the normal way
+and its rows are pulled again.
+
+`--forget-target` refuses the configured target (including `cloud` while the
+cloud is the configured backend) and any key nothing is recorded under, and it
+is a usage error without `--repair`. It only touches the local database and
+`state.json` — it needs no consent and does not read or write the remote — so
+it works with the cloud backend configured as well.
+
 ## Manual procedure (if you prefer not to use the command)
 
 For each file under `data/<owner>/`:

@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import type { SyncConfig } from '../config.js'
+import { getBookkeepingTargets } from '../db/sync-claims.js'
 import { getState, setState, type State } from '../init.js'
 
 /**
@@ -79,14 +80,12 @@ export interface LegacyTargetAdoption {
   syncStateRows: number
   claimRows: number
   retiredWireIdRows: number
-  verdictRows: number
 }
 
 const TARGET_TABLES = [
   { table: 'sync_record_state', columns: ['record_id', 'synced_at'], key: 'syncStateRows' },
   { table: 'sync_record_claims', columns: ['device_instance_id', 'record_id'], key: 'claimRows' },
   { table: 'sync_retired_wire_ids', columns: ['wire_id'], key: 'retiredWireIdRows' },
-  { table: 'sync_namespace_verdicts', columns: ['device_instance_id', 'judged_at'], key: 'verdictRows' },
 ] as const
 
 /**
@@ -99,8 +98,11 @@ const TARGET_TABLES = [
  * stay in place. Copied claims can be broader than the store really holds when
  * two configurations shared the legacy key; that only delays pruning until the
  * first reliable read of each namespace on each target corrects them, it
- * never deletes anything. Returns what was copied, or `null` when the
- * configuration has no legacy key.
+ * never deletes anything. Namespace verdicts are *not* copied: a verdict
+ * permits deletion, and one recorded under the legacy key was made by
+ * whichever configuration synced under it — not necessarily this one, and
+ * never against this store's key. Returns what was copied, or `null` when
+ * the configuration has no legacy key.
  */
 export function adoptLegacySyncTarget(aiusageDir: string, db: Database.Database, sync: SyncConfig | undefined): LegacyTargetAdoption | null {
   const target = getSyncTarget(sync)
@@ -124,7 +126,7 @@ export function adoptLegacySyncTarget(aiusageDir: string, db: Database.Database,
     if (stateCopied) setState(aiusageDir, updates)
   }
 
-  const copied = { syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0, verdictRows: 0 }
+  const copied = { syncStateRows: 0, claimRows: 0, retiredWireIdRows: 0 }
   db.transaction(() => {
     for (const { table, columns, key } of TARGET_TABLES) {
       const present = db.prepare(`SELECT 1 FROM ${table} WHERE target = ? LIMIT 1`).get(target)
@@ -139,3 +141,73 @@ export function adoptLegacySyncTarget(aiusageDir: string, db: Database.Database,
 
   return { target, legacy, stateCopied, ...copied }
 }
+
+/**
+ * Every sync target recorded in state — each repository, bucket or the cloud
+ * this device has ever synced with — with `target` always included.
+ * Unresolved pulled rows are deleted only once every target in this set has
+ * judged their namespace, so a target that is never synced again keeps them
+ * until `aiusage sync --repair` removes them, or until the target is
+ * forgotten with `aiusage sync --repair --forget-target` (see
+ * `forgetSyncTargetState`).
+ *
+ * The key clients up to 1.5.17 used for a configuration whose key changed
+ * (see `getLegacySyncTarget`) stays in the set: it is also the current key of
+ * the default configuration of the same repository or bucket (branch `main`
+ * next to branch `x`), and nothing recorded locally tells whether the rows
+ * claimed under it came from that configuration or from this one before the
+ * upgrade. Dropping it would let this configuration alone settle rows the
+ * other one may still carry.
+ */
+export function knownSyncTargets(state: State | null, target: string): string[] {
+  const known = new Set<string>([target])
+  if (state) {
+    for (const key of Object.keys(state.syncConsents ?? {})) known.add(key)
+    for (const key of Object.keys(state.syncTargets ?? {})) known.add(key)
+    if (state.lastSyncTarget) known.add(state.lastSyncTarget)
+  }
+  return [...known].sort()
+}
+
+/** True when `state.json` lists `target` anywhere `knownSyncTargets` looks. */
+export function isSyncTargetInState(state: State | null, target: string): boolean {
+  if (!state) return false
+  return target in (state.syncConsents ?? {}) || target in (state.syncTargets ?? {}) || state.lastSyncTarget === target
+}
+
+/**
+ * Stop listing `target` in `state.json`: its consent, its last-sync status
+ * and — when it was the last target synced — `lastSyncTarget`. After this
+ * `knownSyncTargets` no longer names it, so it no longer withholds the
+ * verdict unresolved rows wait for. Nothing else is touched: a later sync
+ * under the key records it again the normal way. Returns true when the file
+ * changed.
+ */
+export function forgetSyncTargetState(aiusageDir: string, target: string): boolean {
+  const state = getState(aiusageDir)
+  if (!state || !isSyncTargetInState(state, target)) return false
+  const { [target]: _consent, ...syncConsents } = state.syncConsents ?? {}
+  const { [target]: _status, ...syncTargets } = state.syncTargets ?? {}
+  setState(aiusageDir, {
+    syncConsents,
+    syncTargets,
+    lastSyncTarget: state.lastSyncTarget === target ? undefined : state.lastSyncTarget,
+  })
+  return true
+}
+
+/**
+ * Target keys other than `current` that still count on this device: keys
+ * with claims or verdicts in the database, or listed in `state.json`. Each
+ * of them either shields the rows it claims or withholds a verdict from
+ * unresolved rows until it syncs again. `sync --repair` names them as a
+ * hint; whether one is really no longer used is the user's call, so nothing
+ * acts on this list.
+ */
+export function otherSyncTargets(db: Database.Database, state: State | null, current: string): string[] {
+  const keys = new Set<string>(getBookkeepingTargets(db))
+  for (const key of knownSyncTargets(state, current)) keys.add(key)
+  keys.delete(current)
+  return [...keys].sort()
+}
+

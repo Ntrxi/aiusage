@@ -47,14 +47,34 @@ key: it selects the signing region, not the store.
 Clients up to 1.5.17 keyed GitHub by repository and S3 by bucket alone. A
 configuration whose key changed (a non-default branch, prefix or endpoint)
 adopts what was recorded under its old key the first time it syncs: consent,
-last-sync status and the three bookkeeping tables are *copied* to the new key,
-once, and only when the new key has nothing yet. Nothing is moved, because the
-old key may also be the current key of another configuration (branch `main`
-next to branch `x` of the same repository). If two configurations had been
-sharing the old key, the copied claims can be broader than the store really
-holds; that only delays pruning until the first reliable read of each
-namespace on each target corrects them, it never deletes anything. For the
-sole-target rule below, the old key counts as an alias of the new one.
+last-sync status, publish bookkeeping, claims and retired wire ids are
+*copied* to the new key, once, and only when the new key has nothing yet.
+Nothing is moved, because the old key may also be the current key of another
+configuration (branch `main` next to branch `x` of the same repository). If
+two configurations had been sharing the old key, the copied claims can be
+broader than the store really holds; that only delays pruning until the first
+reliable read of each namespace on each target corrects them, it never
+deletes anything. Namespace verdicts are not copied: a verdict permits
+deletion, and one recorded under the old key was made by whichever
+configuration synced under it. For the same reason the old key stays among
+the known targets of invariant 8 — nothing recorded locally tells whether the
+rows it claims came from this configuration before the upgrade or from the
+other one, so the new key alone must not settle them. If the old key really
+was only ever this configuration's, it is a target that is never synced again
+(see *Migration* below): unresolved rows wait for a verdict it never records,
+and its claims keep every row they name — including the old Antigravity/Trae
+wire ids this release retires — because only a sync under the old key could
+release them. Nothing recorded locally can tell the two cases apart, so
+nothing expires the key on its own; `aiusage clean --all` is the only
+automatic path that drops claims, and it wipes everything. The explicit way
+out is `aiusage sync --repair --forget-target <old key>` (dry run; `--apply`
+performs it): it deletes the key's claims, verdicts, publish bookkeeping and
+retired wire ids in one transaction, marks the rows that thereby lost their
+last claim unresolved at the tick taken before the change, and then removes
+the key from `state.json`. It deletes no record itself — the released rows go
+through the normal prune once every remaining known target has synced again —
+and it refuses the configured key and keys nothing is recorded under. See
+[`sync-repair.md`](./sync-repair.md).
 
 ## Invariants
 
@@ -348,10 +368,11 @@ Because reconciliation deletes local rows, the backends never mask errors:
 | Table | Purpose |
 | --- | --- |
 | `sync_record_state` | Which local records have been published to which target, and when. Drives the `uploaded: N` count and the cloud push; the file backends always publish the full snapshot regardless. |
-| `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. A claim never outlives its row: `sync --repair --apply` and `aiusage clean` drop the claims of the rows they delete. |
-| `synced_records.unclaimed_since` (v14) | The sync tick at which a row became unresolved (no target claims it); `NULL` once a target claims it. Rows that predate the column carry tick 0. |
-| `sync_namespace_verdicts` (v14) | For every sync target and namespace owner, the sync tick at which the target last judged the namespace reliably. Unresolved rows are deleted only once every known target has a verdict for their namespace from a later tick. Cleared by `aiusage clean --all`; copied with the other tables when a target key is adopted. |
-| `sync_retired_wire_ids` (v14) | Wire ids this device used to publish and never will again. Cleared by the next file-backend sync (the snapshot no longer contains them) or pushed as tombstones to the cloud backend. |
+| `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. A claim never outlives its row: `sync --repair --apply` and `aiusage clean` drop the claims of the rows they delete. Only `aiusage clean --all` and `sync --repair --forget-target <key> --apply` drop claims wholesale; the latter for one key, turning the rows that lose their last claim into unresolved rows instead of deleting them. |
+| `synced_records.unclaimed_since` (v14) | The sync tick at which a row became unresolved (no target claims it); `NULL` once a target claims it. Rows that predate the column carry tick 0. Forgetting a target stamps the rows it was the last claimant of with the tick taken before the forget, so only a later sync can judge them. |
+| `sync_namespace_verdicts` (v14) | For every sync target and namespace owner, the sync tick at which the target last judged the namespace reliably. Unresolved rows are deleted only once every known target has a verdict for their namespace from a later tick. Cleared by `aiusage clean --all` and, for one key, by `--forget-target`; never copied when a target key is adopted. |
+| `sync_retired_wire_ids` (v14) | Wire ids this device used to publish and never will again. Cleared by the next file-backend sync (the snapshot no longer contains them) or pushed as tombstones to the cloud backend. `--forget-target` drops the forgotten key's entries: nothing will sync under it, so nothing would ever tombstone them. |
+| `state.json` (`syncConsents`, `syncTargets`, `lastSyncTarget`) | The keys `knownSyncTargets` counts. Every key listed here must record a verdict before unresolved rows are pruned. A key is removed only by `--forget-target --apply`, after the database part committed, so a crash in between leaves the key known (nothing pruned early) and a re-run completes the forget. |
 
 ### The cloud backend
 
@@ -447,7 +468,17 @@ above; the push side keeps its existing semantics (no snapshot replacement).
 A configuration whose target key changed with this release (non-default
 branch, prefix or endpoint, see *Target identity*) adopts the consent,
 bookkeeping and claims recorded under its old key on its first sync, so it
-does not start from the pre-upgrade state described above.
+does not start from the pre-upgrade state described above. The old key
+remains a known target: if no configuration syncs under it again, rows it
+alone would have settled stay unresolved, and rows its claims name are never
+pruned — `sync --repair` cannot see them as orphans, because they still have
+a claim. Plain `aiusage sync --repair` names every key other than the
+configured one as a hint; `aiusage sync --repair --forget-target <old key>
+--apply` releases the key (see *Target identity*), after which the next sync
+of every remaining known target settles the rows: those a target still
+carries are claimed and kept, the others are pruned. Syncing under the
+forgotten key later simply makes it a known target again and pulls its rows
+back.
 
 ## Scenario matrix
 
@@ -470,9 +501,11 @@ test that exercises it (all under `packages/cli/tests/`).
 | Same record on two targets; one target drops it; namespace disappears from one target only; cloud claim vs file target | 5, 6, 7 | `sync/multi-target-claims.test.ts` |
 | Cloud generation reset, pages spanning two generations, tombstones for unclaimed rows | 5, 6, 11 | `sync/cloud-orchestrator-claims.test.ts`, `sync/cloud-orchestrator-tombstones.test.ts` |
 | Cloud wire shape: `deviceName` on push and pull, bigint strings, unparsable record fails the pull | 11 | `sync/cloud-dto.test.ts` |
-| Two branches / prefixes of one store never share claims; legacy key adoption | 5 | `sync/target-identity.test.ts` |
+| Two branches / prefixes of one store never share claims; legacy key adoption copies claims but not verdicts; the old key stays a known target so the changed configuration never settles rows the unchanged one carries | 5, 8 | `sync/target-identity.test.ts` |
+| A stray `.ndjson` file outside any namespace folder is not a namespace | 9 | `sync/reconciliation-safety.test.ts`, `sync/snapshot-listing.test.ts` |
 | Migration stamps pre-existing rows at tick 0; idempotent | 4, 13 | `db/migration-v14.test.ts` |
 | Cleanup and repair only rewrite verified namespaces | 9 | `commands/clean-remote.test.ts`, `sync/repair-verify.test.ts` |
+| Forgetting an abandoned key: rows only it claimed (including a retired Antigravity wire id) become unresolved at the pre-change tick and go only with the next sync of every remaining target; rows the current target claims are untouched; dry run changes nothing; refuses the current and unknown keys; idempotent, crash between DB commit and state write completed by a re-run with nothing pruned early; adoption copies nothing back; syncing under the key again pulls its rows back; plain `--repair` only names the key | 3, 4, 13 | `sync/forget-target.test.ts`, `commands/sync.test.ts` |
 
 ## Diagnostics
 

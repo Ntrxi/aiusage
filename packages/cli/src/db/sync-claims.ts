@@ -153,3 +153,91 @@ export function clearRetiredWireIds(db: Database.Database, target: string, wireI
     for (const id of wireIds) del.run(target, id)
   })()
 }
+
+/**
+ * How much a device remembers about one sync target, in rows. `lastClaimRows`
+ * counts the mirrored rows the target is the *only* claimant of: forgetting
+ * the target turns exactly those into unresolved rows (the others keep the
+ * claims of other targets, or are unresolved already).
+ */
+export interface SyncTargetBookkeeping {
+  claimRows: number
+  verdictRows: number
+  syncStateRows: number
+  retiredWireIdRows: number
+  lastClaimRows: number
+}
+
+const TARGET_KEYED_TABLES: Array<{ table: string; key: Exclude<keyof SyncTargetBookkeeping, 'lastClaimRows'> }> = [
+  { table: 'sync_record_claims', key: 'claimRows' },
+  { table: 'sync_namespace_verdicts', key: 'verdictRows' },
+  { table: 'sync_record_state', key: 'syncStateRows' },
+  { table: 'sync_retired_wire_ids', key: 'retiredWireIdRows' },
+]
+
+/**
+ * Rows whose only claim is `target`'s and that are not unresolved yet: the
+ * set a forget of `target` stamps `unclaimed_since` on.
+ */
+const LAST_CLAIM_WHERE = `
+  unclaimed_since IS NULL
+  AND id IN (SELECT record_id FROM sync_record_claims WHERE target = @target)
+  AND id NOT IN (SELECT record_id FROM sync_record_claims WHERE target != @target)
+`
+
+/** Every target key that holds claims or namespace verdicts. */
+export function getBookkeepingTargets(db: Database.Database): string[] {
+  const rows = db.prepare(`
+    SELECT DISTINCT target FROM sync_record_claims
+    UNION
+    SELECT DISTINCT target FROM sync_namespace_verdicts
+    ORDER BY 1
+  `).all() as Array<{ target: string }>
+  return rows.map(r => r.target)
+}
+
+/** What `forgetSyncTargetBookkeeping(db, target)` would remove or stamp; all zero for a key the database has never seen. */
+export function countSyncTargetBookkeeping(db: Database.Database, target: string): SyncTargetBookkeeping {
+  const counts: SyncTargetBookkeeping = { claimRows: 0, verdictRows: 0, syncStateRows: 0, retiredWireIdRows: 0, lastClaimRows: 0 }
+  for (const { table, key } of TARGET_KEYED_TABLES) {
+    counts[key] = (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE target = ?`).get(target) as { n: number }).n
+  }
+  counts.lastClaimRows = (db.prepare(`SELECT COUNT(*) AS n FROM synced_records WHERE ${LAST_CLAIM_WHERE}`).get({ target }) as { n: number }).n
+  return counts
+}
+
+/**
+ * Drop everything the database records under `target` — claims, namespace
+ * verdicts, publish bookkeeping and retired wire ids — and turn the rows that
+ * thereby lose their last claim into unresolved rows, in one transaction.
+ *
+ * This exists for a key nothing syncs under any more (typically the key a
+ * configuration used before its key changed, see `adoptLegacySyncTarget`):
+ * its claims would keep every row they name forever, and unresolved rows
+ * would wait forever for a verdict it never records. Releasing is the only
+ * thing that happens here: **no `synced_records` or `records` row is
+ * deleted**. The released rows are stamped with the sync tick taken *before*
+ * anything changed, so only a sync that runs after the forget — and, through
+ * `pruneUnresolvedSyncedRecords`, only once every remaining known target has
+ * judged their namespace — can remove them. Rows that were unresolved
+ * already keep their tick. `releaseClaim` is not reused: it drops one claim
+ * and does not stamp the row.
+ *
+ * Running this again for the same key changes nothing, which is what makes
+ * it safe to redo after a crash between this commit and the state update
+ * that stops listing the key among the known targets.
+ */
+export function forgetSyncTargetBookkeeping(db: Database.Database, target: string): SyncTargetBookkeeping & { tick: number } {
+  return db.transaction(() => {
+    const tick = nextSyncTick(db)
+    // Identified while the claims still exist; identical to "no claim left
+    // after the delete" because only `target`'s claims go.
+    const lastClaimRows = db.prepare(`UPDATE synced_records SET unclaimed_since = @tick WHERE ${LAST_CLAIM_WHERE}`).run({ target, tick }).changes
+    const counts: SyncTargetBookkeeping & { tick: number } = { claimRows: 0, verdictRows: 0, syncStateRows: 0, retiredWireIdRows: 0, lastClaimRows, tick }
+    for (const { table, key } of TARGET_KEYED_TABLES) {
+      counts[key] = db.prepare(`DELETE FROM ${table} WHERE target = ?`).run(target).changes
+    }
+    return counts
+  })()
+}
+
