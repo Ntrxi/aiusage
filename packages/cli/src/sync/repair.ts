@@ -9,7 +9,7 @@ import type { SyncBackend } from './index.js'
 import { forgetSyncTargetState, isSyncTargetInState, knownSyncTargets } from './target.js'
 import { buildLocalSnapshot } from './index.js'
 import { buildManifest, manifestPath, serializeManifest, serializeSnapshot } from './manifest.js'
-import { listedOwners, readNamespaceSnapshot } from './snapshot.js'
+import { listedOwners, readNamespaceSnapshot, type NamespaceSnapshot } from './snapshot.js'
 
 /**
  * Opt-in cleanup of state left behind by earlier sync bugs.
@@ -52,8 +52,11 @@ import { listedOwners, readNamespaceSnapshot } from './snapshot.js'
  *    travels under a different id). Only this device can judge its own
  *    namespace; other namespaces are never checked for staleness.
  *  - **duplicate line**: the same wire id appearing more than once in one
- *    namespace (across day files). Only the most recently updated copy is
- *    kept.
+ *    namespace (in one day file or across several). Only the most recently
+ *    updated copy is kept — chosen among the copies no rule above removes
+ *    (those are counted under the rule that removes them). Echoes carry
+ *    colliding ids, so a contaminated copy can share an id with a legitimate
+ *    line; it is never the one the id resolves to, however recent it is.
  *  - **wire-id collision** (report only): two local records that map to the
  *    same wire id. The mapper is expected to make this impossible; a non-zero
  *    count is a parser or mapper bug worth reporting.
@@ -360,11 +363,17 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
   const finalFiles = new Map<string, Map<string, SyncRecord[]>>()
   let scannedFiles = 0
 
+  // Every namespace is read before any line is classified: an echo is
+  // recognised by its parent's session key, and the parent may sit in a
+  // namespace that sorts after the echo's. Classifying while reading would
+  // let such an echo pass for a legitimate line in the namespaces read first.
+  const snapshots: NamespaceSnapshot[] = []
   for (const owner of listedOwners(listing)) {
     presentOwners.add(owner)
     // Every namespace is read the way pull reads it: the manifest decides
     // which files make up the snapshot and whether it can be trusted.
     const snapshot = await readNamespaceSnapshot(backend, owner, listing)
+    snapshots.push(snapshot)
     if (snapshot.hasManifest) ownersWithManifest.add(owner)
     for (const records of snapshot.files.values()) {
       for (const record of records) {
@@ -373,7 +382,10 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
       }
     }
     scannedFiles += snapshot.files.size
+  }
 
+  for (const snapshot of snapshots) {
+    const owner = snapshot.owner
     const ns: RemoteNamespaceSummary = { owner, files: snapshot.files.size, lines: 0, foreignLines: 0, echoLines: 0, staleLines: 0, duplicateLines: 0 }
     for (const records of snapshot.files.values()) ns.lines += records.length
     namespaces.push(ns)
@@ -388,11 +400,26 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
     const isOwn = owner === options.deviceInstanceId
     const repairable = options.allNamespaces || isOwn
 
-    // Duplicate detection: the copy of an id with the highest updatedAt
-    // (ties: the first in path order) is the one to keep.
+    // Every line is classified on its own first. Foreign, echo and stale
+    // lines are removed, whatever else the namespace holds, so none of them
+    // may stand in for a line that stays.
+    const verdictOf = (record: SyncRecord): 'foreign' | 'echo' | 'stale' | null => {
+      const did = record.deviceInstanceId
+      if (!!did && did !== UNKNOWN_DEVICE_INSTANCE_ID && did !== owner) return 'foreign'
+      if (chain.isEcho(record)) return 'echo'
+      if (isOwn && options.ownWireIds !== undefined && !options.ownWireIds.has(record.id)) return 'stale'
+      return null
+    }
+
+    // Duplicate detection, among the lines that would otherwise survive: the
+    // copy of an id with the highest updatedAt (ties: the first in path
+    // order) is the one to keep. A contaminated copy never competes — were
+    // it the newest, the legitimate line would go as its older duplicate and
+    // the winner as contamination, and the record would be lost.
     const best = new Map<string, { rel: string; index: number; updatedAt: number }>()
     for (const [rel, records] of snapshot.files) {
       records.forEach((record, index) => {
+        if (verdictOf(record) !== null) return
         const prev = best.get(record.id)
         if (!prev || record.updatedAt > prev.updatedAt) best.set(record.id, { rel, index, updatedAt: record.updatedAt })
       })
@@ -406,17 +433,15 @@ export async function planRemoteRepair(backend: SyncBackend, options: RemoteRepa
       let duplicateLines = 0
       const keptRecords: SyncRecord[] = []
       records.forEach((record, index) => {
-        const did = record.deviceInstanceId
-        const foreign = !!did && did !== UNKNOWN_DEVICE_INSTANCE_ID && did !== owner
-        const echo = !foreign && chain.isEcho(record)
-        const winner = best.get(record.id)!
-        const duplicate = !foreign && !echo && !(winner.rel === rel && winner.index === index)
-        const stale = !foreign && !echo && !duplicate && isOwn && options.ownWireIds !== undefined && !options.ownWireIds.has(record.id)
-        if (foreign) foreignLines++
-        else if (echo) echoLines++
-        else if (duplicate) duplicateLines++
-        else if (stale) staleLines++
-        else keptRecords.push(record)
+        const verdict = verdictOf(record)
+        const winner = best.get(record.id)
+        if (verdict === 'foreign') foreignLines++
+        else if (verdict === 'echo') echoLines++
+        else if (verdict === 'stale') staleLines++
+        // Every surviving line took part in the contest above, so it has a
+        // winner; should that ever stop holding, the line is kept, not dropped.
+        else if (!winner || (winner.rel === rel && winner.index === index)) keptRecords.push(record)
+        else duplicateLines++
       })
       ns.foreignLines += foreignLines
       ns.echoLines += echoLines
