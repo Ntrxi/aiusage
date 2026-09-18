@@ -348,7 +348,9 @@ Because reconciliation deletes local rows, the backends never mask errors:
   does not exist; any failure while inspecting or walking it is thrown.
 * `S3SyncBackend.readFile` returns `null` only for `NoSuchKey`/404; a successful
   GET without a body is an error. Listing errors and truncated pages without
-  a new continuation token are thrown. `deleteAllData` inspects the per-object
+  a new continuation token are thrown. `deleteAllData` removes day files
+  and namespace manifests only (a shared prefix may hold objects this backend
+  never wrote), inspects the per-object
   `Errors` of every `DeleteObjects` response and throws when any key was not deleted, so
   `aiusage clean --all` never reports a partial wipe as complete.
 * A thrown listing or read error aborts the sync with `status: 'failed'`
@@ -406,14 +408,21 @@ serialises it as `deviceName` on both push and pull, where the core
 `device`; integer columns are Postgres bigints and come back as strings.
 Records go out through `toCloudRecord` and come in through `fromCloudRecord`,
 which normalises numbers and rejects missing or invalid required fields
-(including token counts, cost, provider and session key). A pull containing such a
-record fails rather than silently omitting it, because a completed pull is
+(including token counts, cost, provider and session key). An explicit `null`
+is accepted only for the columns the server stores as nullable — `deviceName`
+(NULL for every record a client up to 1.5.17 pushed, since those sent
+`device`), `cost` and `costSource` — and takes the local default; rejecting
+it would fail every pull of an account with pre-upgrade data. A pull
+containing a record that is malformed in any other way
+fails rather than silently omitting it, because a completed pull is
 reconciled against and an omission would read as absence. Ownership is not
 part of the translation: `deviceInstanceId` names the origin device on both
 sides.
 
 Every pull page must contain record and tombstone arrays, a boolean
-`has_more`, a positive integer generation, and a valid cursor when more pages
+`has_more`, a positive integer generation (a number, or the decimal string
+the server's bigint column yields once the cloud data has been cleared; it is
+always pushed back as a number), and a valid cursor when more pages
 remain. Tombstone identities are validated too. Within one generation,
 cursors must advance numerically (compared as bigints); a generation change
 restarts the pull before checking progress. Any invalid page fails the entire

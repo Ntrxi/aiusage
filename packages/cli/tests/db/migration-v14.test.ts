@@ -250,6 +250,21 @@ describe('upgrade with rows whose namespace disappeared before v14', () => {
     expect(getClaimedOwners(db, TARGET)).toEqual([PRESENT])
   })
 
+  it('prunes merged copies by id: a re-flagged row of the same device that was never mirrored survives', async () => {
+    // A local row stamped with another device's id (e.g. a database carried
+    // over from a previous machine) is re-flagged `synced` at the start of
+    // every sync. It has no `synced_records` counterpart, so no target ever
+    // judged it, and settling the device's unresolved rows must not take it.
+    insertRecord(db, record({ id: 'carried-over', deviceInstanceId: GONE, tool: 'claude-code', sourceFile: 'C:\\old.jsonl', lineOffset: 7 }))
+    const carriedOver = db.prepare(`SELECT id FROM records WHERE device_instance_id = ? AND source_file = 'C:\\old.jsonl'`).get(GONE) as { id: string }
+
+    const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, knownTargets: [TARGET] }).sync()
+    expect(result.status).toBe('ok')
+    expect(result.prunedCount).toBe(2)
+    expect(rowsOf(GONE)).toEqual([])
+    expect(mergedOf(GONE)).toEqual([carriedOver.id])
+  })
+
   it('keeps the stale rows while another known target has not judged them, and lets sync --repair remove them deterministically', async () => {
     const result = await new SyncOrchestrator(db, backend, { deviceInstanceId: OWN, target: TARGET, consentVerified: true, knownTargets: [TARGET, 'cloud'] }).sync()
     expect(result.status).toBe('ok')

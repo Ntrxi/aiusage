@@ -247,18 +247,17 @@ export function pruneUnresolvedSyncedRecords(db: Database.Database, knownTargets
       WHERE id NOT IN (SELECT record_id FROM sync_record_claims)
     `).all() as Array<{ owner: string }>).map(r => r.owner)
     let pruned = 0
-    const del = db.prepare(`
-      DELETE FROM synced_records
+    const settled = db.prepare(`
+      SELECT id FROM synced_records
       WHERE device_instance_id = @owner
         AND id NOT IN (SELECT record_id FROM sync_record_claims)
         AND COALESCE(unclaimed_since, 0) < @cutoff
     `)
-    const delMerged = db.prepare(`
-      DELETE FROM records
-      WHERE origin = 'synced'
-        AND device_instance_id = @owner
-        AND id NOT IN (SELECT id FROM synced_records)
-    `)
+    // Merged copies go by id, with the row they mirror. A `records` row of
+    // the same device that has no `synced_records` counterpart (re-flagged by
+    // `repairRecordProvenance`) was never judged by anyone and stays.
+    const del = db.prepare(`DELETE FROM synced_records WHERE id = ?`)
+    const delMerged = db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`)
     for (const owner of owners) {
       const verdicts = getNamespaceVerdicts(db, namespaceVerdictKey(owner))
       let cutoff = Infinity
@@ -268,8 +267,10 @@ export function pruneUnresolvedSyncedRecords(db: Database.Database, knownTargets
         cutoff = Math.min(cutoff, judgedAt)
       }
       if (cutoff === -Infinity) continue
-      pruned += del.run({ owner, cutoff }).changes
-      delMerged.run({ owner })
+      for (const { id } of settled.all({ owner, cutoff }) as Array<{ id: string }>) {
+        pruned += del.run(id).changes
+        delMerged.run(id)
+      }
     }
     return pruned
   })()

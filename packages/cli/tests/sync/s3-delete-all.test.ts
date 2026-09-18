@@ -33,6 +33,13 @@ describe('S3SyncBackend.deleteAllData', () => {
     expect(mockSend.mock.calls[1][0].Delete.Objects).toEqual([{ Key: 'aiusage/x/2026/09/06.ndjson' }, { Key: 'aiusage/x/manifest.json' }])
   })
 
+  it('leaves objects outside the sync layout alone when the prefix is shared', async () => {
+    const shared = { ...listing, Contents: [...listing.Contents, { Key: 'aiusage/backup.tar' }, { Key: 'aiusage/x/notes/manifest.json' }] }
+    mockSend.mockResolvedValueOnce(shared).mockResolvedValueOnce({ Deleted: [] })
+    await expect(backend.deleteAllData()).resolves.toBe(1)
+    expect(mockSend.mock.calls[1][0].Delete.Objects).toEqual([{ Key: 'aiusage/x/2026/09/06.ndjson' }, { Key: 'aiusage/x/manifest.json' }])
+  })
+
   it('throws when the response reports per-object failures', async () => {
     mockSend.mockResolvedValueOnce(listing).mockResolvedValueOnce({
       Deleted: [{ Key: 'aiusage/x/2026/09/06.ndjson' }],

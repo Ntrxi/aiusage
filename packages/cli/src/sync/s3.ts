@@ -155,8 +155,10 @@ export class S3SyncBackend {
   }
 
   /**
-   * Remove every object under the prefix — day files and manifests. Returns
-   * the number of data files removed.
+   * Remove every file of the sync layout under the prefix — day files and
+   * namespace manifests, exactly what `listFiles` reports. Anything else a
+   * shared prefix may hold was not written by this backend and is left
+   * alone. Returns the number of data files removed.
    *
    * `DeleteObjects` succeeds as a request even when individual keys could
    * not be deleted; those come back in `Errors`. A wipe that silently left
@@ -164,8 +166,7 @@ export class S3SyncBackend {
    * them, so any per-object failure is thrown.
    */
   async deleteAllData(): Promise<number> {
-    const entries = await this.listEntries()
-    const files = entries.map(e => e.path)
+    const files = await this.listFiles()
     if (files.length === 0) return 0
 
     // Delete in batches of 1000 (S3 limit)

@@ -194,9 +194,9 @@ export async function cleanRemoteBefore(backend: SyncBackend, cutoff: number, de
 }
 
 /**
- * Wipe a file-based target completely. `deleteAllData` is called even when
- * the listing shows no day file: the listing excludes manifests, and an
- * interrupted operation can leave a namespace consisting of nothing but its
+ * Wipe a file-based target completely. `deleteAllData` is called
+ * unconditionally rather than only when day files are listed: an interrupted
+ * operation can leave a namespace consisting of nothing but its
  * `manifest.json`, which peers would otherwise keep reading. Returns the
  * number of day files removed.
  */

@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import type { SyncRecord } from '@aiusage/core'
+import { generateRecordId } from '@aiusage/core'
+import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import Database from 'better-sqlite3'
 import { initializeDatabase } from '../../src/db/index.js'
+import { insertRecord } from '../../src/db/records.js'
 import { CloudSyncOrchestrator } from '../../src/sync/cloud-orchestrator.js'
 
 vi.mock('../../src/leaderboard/credentials.js', () => ({
@@ -9,7 +11,7 @@ vi.mock('../../src/leaderboard/credentials.js', () => ({
 }))
 vi.mock('../../src/site-url.js', () => ({ getSiteUrl: () => 'https://sync.test' }))
 
-import { fromCloudRecord, toCloudRecord } from '../../src/sync/cloud-dto.js'
+import { fromCloudRecord, parseSyncGeneration, toCloudRecord } from '../../src/sync/cloud-dto.js'
 import { cloudPull, cloudPush, CloudSyncError } from '../../src/sync/cloud.js'
 
 // The core `SyncRecord` calls the device alias `device`; the cloud API calls
@@ -88,13 +90,35 @@ describe('cloud DTO', () => {
     expect(parsed).not.toHaveProperty('cwd')
   })
 
+  // `null` is how the server serialises a nullable column; for every other
+  // column it is as malformed as a missing key or a wrong type.
+  const nullableColumns = ['deviceName', 'cost', 'costSource']
+
   it.each(Object.keys(serverRecord).filter(key => !['platform', 'sourceFile', 'cwd'].includes(key)))(
     'rejects missing, null or wrongly typed required field %s', key => {
-      for (const value of [undefined, null, {}]) {
+      for (const value of nullableColumns.includes(key) ? [undefined, {}] : [undefined, null, {}]) {
         expect(fromCloudRecord({ ...serverRecord, [key]: value })).toBeNull()
       }
     },
   )
+
+  it('parses a record pushed by a client up to 1.5.17, whose device_name the server stored as NULL', () => {
+    // Those clients sent `device`, which the server does not read, so every
+    // record they pushed comes back with `deviceName: null`.
+    expect(fromCloudRecord({ ...serverRecord, deviceName: null })).toEqual({ ...record, device: '' })
+  })
+
+  it('takes the local defaults for the other nullable server columns', () => {
+    expect(fromCloudRecord({ ...serverRecord, cost: null, costSource: null })).toEqual({ ...record, cost: 0, costSource: 'unknown' })
+  })
+
+  it('reads the generation as a number or as the decimal string a bigint column yields', () => {
+    expect(parseSyncGeneration(1)).toBe(1)
+    expect(parseSyncGeneration('2')).toBe(2)
+    for (const value of [undefined, null, 0, '0', -1, '-1', 1.5, '1.5', '', ' 2', '2e3', 'abc', '9007199254740993', {}, true]) {
+      expect(parseSyncGeneration(value)).toBeUndefined()
+    }
+  })
 
   it('rejects invalid numbers and cost sources without replacing them with defaults', () => {
     for (const inputTokens of ['', 'NaN', Infinity, false]) {
@@ -172,13 +196,40 @@ describe('cloud API boundary', () => {
     { ...envelope, tombstones: [null] }, { ...envelope, tombstones: [{ id: 'w1' }] },
     { ...envelope, has_more: undefined }, { ...envelope, has_more: 'false' },
     { ...envelope, sync_generation: undefined }, { ...envelope, sync_generation: 0 },
-    { ...envelope, sync_generation: 1.5 }, { ...envelope, sync_generation: '2' },
+    { ...envelope, sync_generation: 1.5 }, { ...envelope, sync_generation: '0' },
+    { ...envelope, sync_generation: '1.5' }, { ...envelope, sync_generation: 'two' },
     { ...envelope, next_cursor: 5 }, { ...envelope, next_cursor: 'invalid' },
     { ...envelope, has_more: true }, { ...envelope, has_more: true, next_cursor: '' },
     { ...envelope, has_more: true, next_cursor: '0' },
   ])('rejects a malformed pull envelope %#', async body => {
     fetchMock.mockResolvedValueOnce(jsonResponse(body))
     await expect(cloudPull()).rejects.toMatchObject({ code: 'invalid_response' })
+  })
+
+  it('pulls and pushes under a generation the server serialises as a string', async () => {
+    // `cloud_sync_resets.sync_generation` is a bigint: once the user has
+    // cleared their cloud data the server answers "2", not 2, while
+    // `/sync/push` only accepts a number.
+    const db = new Database(':memory:')
+    initializeDatabase(db)
+    try {
+      const local: StatsRecord = {
+        id: generateRecordId('me', 'msg_1', 0), ts: 1000, ingestedAt: 1000, updatedAt: 1000, lineOffset: 64,
+        tool: 'claude-code', model: 'm', provider: 'anthropic', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+        thinkingTokens: 0, cost: 0, costSource: 'pricing', sessionId: 's', sourceFile: 'C:\s.jsonl', device: 'D', deviceInstanceId: 'me',
+      }
+      insertRecord(db, local)
+      fetchMock.mockResolvedValueOnce(jsonResponse({ ...envelope, records: [{ ...serverRecord, deviceName: null }], sync_generation: '2' }))
+        .mockResolvedValueOnce(jsonResponse({ status: 'accepted', inserted: 1, updated: 0, skipped: 0, sync_generation: '2', server_cursor: '9' }))
+      const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: 'me' }).sync()
+      expect(result).toMatchObject({ status: 'ok', syncGeneration: 2, pulledCount: 1, uploadedCount: 1 })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      const pushed = JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)
+      expect(pushed.sync_generation).toBe(2)
+      expect(db.prepare(`SELECT device FROM synced_records WHERE id = 'w1'`).get()).toEqual({ device: '' })
+    } finally {
+      db.close()
+    }
   })
 
   it.each(['envelope', 'record', 'tombstone', 'repeated cursor', 'backward cursor'])(

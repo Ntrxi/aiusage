@@ -42,12 +42,30 @@ function num(value: unknown): number | undefined {
 }
 
 /**
+ * The server's `sync_generation`: a positive integer. It comes from a bigint
+ * column, so it arrives as a decimal string once the user has cleared their
+ * cloud data (before that the server answers with the literal `1`).
+ * `undefined` for anything else.
+ */
+export function parseSyncGeneration(value: unknown): number | undefined {
+  if (typeof value === 'string' && !/^[0-9]+$/.test(value)) return undefined
+  const n = num(value)
+  return n !== undefined && Number.isSafeInteger(n) && n >= 1 ? n : undefined
+}
+
+/**
  * Parse one record as `/sync/pull` returns it. Returns `null` when the
  * record lacks any required `SyncRecord` field. Callers reconcile against the
  * pull, so a record they cannot represent must fail the pull rather than vanish from
  * it. Nullable optional metadata is omitted.
  * `device` is accepted as a fallback for `deviceName` so a server that
  * predates the field still round-trips.
+ *
+ * An explicit `null` is how the server serialises its nullable columns, and
+ * is a value, not a malformed field: `device_name` (NULL for every record a
+ * client up to 1.5.17 pushed, which sent `device`), `cost` and `cost_source`.
+ * They take the defaults the local tables use. A missing key or a wrong type
+ * is still rejected, as is `null` for a column the server declares NOT NULL.
  */
 export function fromCloudRecord(raw: unknown): SyncRecord | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -59,16 +77,16 @@ export function fromCloudRecord(raw: unknown): SyncRecord | null {
   const ts = num(r.ts)
   const updatedAt = num(r.updatedAt)
   if (!id || !deviceInstanceId || !tool || !model || ts === undefined || updatedAt === undefined) return null
-  const costSource = str(r.costSource)
+  const costSource = r.costSource === null ? 'unknown' : str(r.costSource)
   const provider = str(r.provider)
   const sessionKey = str(r.sessionKey)
-  const device = str(r.deviceName ?? r.device)
+  const device = r.deviceName === null && r.device == null ? '' : str(r.deviceName ?? r.device)
   const inputTokens = num(r.inputTokens)
   const outputTokens = num(r.outputTokens)
   const cacheReadTokens = num(r.cacheReadTokens)
   const cacheWriteTokens = num(r.cacheWriteTokens)
   const thinkingTokens = num(r.thinkingTokens)
-  const cost = num(r.cost)
+  const cost = r.cost === null ? 0 : num(r.cost)
   if (provider === undefined || sessionKey === undefined || device === undefined
     || inputTokens === undefined || outputTokens === undefined || cacheReadTokens === undefined
     || cacheWriteTokens === undefined || thinkingTokens === undefined || cost === undefined

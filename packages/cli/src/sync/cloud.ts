@@ -2,7 +2,7 @@ import type { SyncRecord } from '@aiusage/core'
 import { computeHmac, sha256, generateNonce, generateIdempotencyKey, buildCanonicalString } from '../leaderboard/crypto.js'
 import { loadCredentials } from '../leaderboard/credentials.js'
 import { getSiteUrl } from '../site-url.js'
-import { fromCloudRecord, toCloudRecord } from './cloud-dto.js'
+import { fromCloudRecord, parseSyncGeneration, toCloudRecord } from './cloud-dto.js'
 
 const SYNC_PUSH_PATH = '/api/cli/sync/push'
 const SYNC_PULL_PATH = '/api/cli/sync/pull'
@@ -128,7 +128,7 @@ export async function cloudPush(
     updated: (data.updated as number) || 0,
     skipped: (data.skipped as number) || 0,
     serverCursor: data.server_cursor as string | undefined,
-    syncGeneration: (data.sync_generation as number) || syncGeneration,
+    syncGeneration: parseSyncGeneration(data.sync_generation) ?? syncGeneration,
   }
 }
 
@@ -168,9 +168,10 @@ export async function cloudPull(
   // A completed pull is reconciled against: every record must be
   // representable, or the pull fails rather than silently omitting it (an
   // omission would read as the record's absence from the cloud).
+  const syncGeneration = parseSyncGeneration(data.sync_generation)
   if (!Array.isArray(data.records) || !Array.isArray(data.tombstones)
     || typeof data.has_more !== 'boolean'
-    || !Number.isSafeInteger(data.sync_generation) || (data.sync_generation as number) < 1
+    || syncGeneration === undefined
     || (data.next_cursor != null && (typeof data.next_cursor !== 'string' || !/^[0-9]+$/.test(data.next_cursor)))
     || (data.has_more && (typeof data.next_cursor !== 'string' || BigInt(data.next_cursor) <= 0n))) {
     throw new CloudSyncError('Invalid response from server: malformed pull envelope', 'invalid_response')
@@ -197,7 +198,7 @@ export async function cloudPull(
     tombstones: data.tombstones as CloudPulledTombstone[],
     nextCursor: (data.next_cursor as string | null | undefined) ?? undefined,
     hasMore: data.has_more,
-    syncGeneration: data.sync_generation as number,
+    syncGeneration,
   }
 }
 
@@ -226,7 +227,7 @@ export async function cloudClear(): Promise<{ syncGeneration: number }> {
   if (!data) throw new CloudSyncError('Invalid response from server', 'invalid_response')
 
   return {
-    syncGeneration: (data.sync_generation as number) || 1,
+    syncGeneration: parseSyncGeneration(data.sync_generation) ?? 1,
   }
 }
 
