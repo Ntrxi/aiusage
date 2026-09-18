@@ -15,8 +15,16 @@ import {
   mergeSyncedRecordsIntoRecords,
   pruneUnresolvedSyncedRecords,
   reconcileSyncedNamespace,
+  settleReleasedSyncedRecords,
 } from '../db/synced-records.js'
-import { clearRetiredWireIds, getClaimedOwners, nextSyncTick, recordNamespaceVerdict, UNKNOWN_NAMESPACE_VERDICT } from '../db/sync-claims.js'
+import {
+  clearRetiredWireIds,
+  getClaimedOwners,
+  nextSyncTick,
+  recordNamespaceVerdict,
+  UNKNOWN_NAMESPACE_VERDICT,
+  withdrawNamespaceVerdict,
+} from '../db/sync-claims.js'
 import { mapStatsRecordToSyncRecord } from './mapper.js'
 import {
   buildManifest,
@@ -73,8 +81,11 @@ export interface SyncOptions {
    * included). An unresolved pulled row — one no target claims: pulled before
    * claims existed, or read from a namespace that could not be verified — is
    * deleted only once every one of these targets has judged its namespace
-   * reliably since the row became unresolved. When omitted, unresolved rows
-   * are never pruned.
+   * reliably since the row became unresolved. Likewise, a row whose last
+   * claim this target releases is deleted on the spot only when every other
+   * one of these targets has judged its namespace; otherwise it becomes
+   * unresolved. When omitted, unresolved rows are never pruned and `target`
+   * is taken to be the only target there is.
    */
   knownTargets?: string[]
   onProgress?: (progress: SyncProgress) => void
@@ -236,19 +247,25 @@ export class SyncOrchestrator {
    * day files are read — those the manifest names, or, for a namespace
    * written by a pre-manifest client, every listed one — and their lines
    * upserted as they are read. A namespace is *reconciled* (its ids become
-   * this target's claims, rows whose last claim that released are pruned, and
-   * the verdict is recorded) only when it was read reliably: every named file
-   * present, every line parsed, every digest matching. Our own namespace is
-   * never read here.
+   * this target's claims, rows whose last claim that released are pruned —
+   * or, while a known target has not judged the namespace yet, left
+   * unresolved for that target to claim or settle — and the verdict is
+   * recorded) only when it was read reliably: every named file present, every
+   * line parsed, every digest matching. The verdict this target recorded for
+   * a namespace earlier is withdrawn when the namespace is read again and
+   * comes back only with that reconciliation: the lines are upserted either
+   * way, so after an unverifiable read the old verdict no longer says what
+   * the target carries. Our own namespace is never read here.
    *
    * Failure semantics: a backend read failure or a local database failure
    * while upserting propagates and aborts the sync before anything is
    * reconciled. Lines upserted before the failure stay — an upsert only adds
    * an unresolved row (which no reconciliation can prune until every known
    * target has judged its namespace) or refreshes a row with a newer version
-   * of itself. The reconciliation of all namespaces then runs in one
-   * transaction: claims, verdicts and prunes land for every reliable
-   * namespace, or for none.
+   * of itself — and this target's verdicts on the namespaces read so far
+   * stay withdrawn until its next reliable read of them. The reconciliation
+   * of all namespaces then runs in one transaction: claims, verdicts and
+   * prunes land for every reliable namespace, or for none.
    */
   private async pull(allPaths: string[]): Promise<{ pulledCount: number; ignoredCount: number; prunedCount: number; skippedNamespaces: number }> {
     const own = this.options.deviceInstanceId
@@ -297,7 +314,13 @@ export class SyncOrchestrator {
     let totalPulled = 0
     let totalIgnored = 0
     let completed = 0
+    // What this target concluded from earlier reads stops counting the
+    // moment it reads again: from here on rows it does not claim may be seen
+    // in its namespaces, and only a reliable reconciliation (phase 3) can say
+    // once more that it does not carry them.
+    withdrawNamespaceVerdict(this.db, target, UNKNOWN_NAMESPACE_VERDICT)
     for (const [owner, plan] of plans) {
+      withdrawNamespaceVerdict(this.db, target, owner)
       const snapshot = await readNamespaceFiles(this.backend, plan.read, {
         collect: false,
         visit: (path, records) => {
@@ -335,10 +358,15 @@ export class SyncOrchestrator {
     const { prunedCount, skippedNamespaces } = this.db.transaction(() => {
       let prunedCount = 0
       let skippedNamespaces = 0
+      // Released claims are settled once every namespace has its new claims:
+      // an id that left one namespace for another of this target must not be
+      // deleted in between.
+      const released = new Set<string>()
       for (const [owner, plan] of plans) {
-        if (plan.reliable) prunedCount += reconcileSyncedNamespace(this.db, target, owner, plan.ids, tick)
+        if (plan.reliable) reconcileSyncedNamespace(this.db, target, owner, plan.ids, tick, { released })
         else skippedNamespaces++
       }
+      prunedCount += settleReleasedSyncedRecords(this.db, target, released, knownTargets ?? [target])
       // Legacy rows stamped 'unknown' can sit in any namespace of the target
       // (a reliable read relabels them to its owner and claims them), so this
       // target has judged them only once every namespace here read reliably.

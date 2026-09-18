@@ -4,7 +4,8 @@ import { generateRecordId, generateSyncRecordId } from '@aiusage/core'
 import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord, markRecordsSynced } from '../../src/db/records.js'
-import { getClaimingTargets, getRetiredWireIds, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
+import { getClaimingTargets, getNamespaceVerdicts, getRetiredWireIds, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
+import { pruneUnresolvedSyncedRecords, reconcileSyncedNamespace } from '../../src/db/synced-records.js'
 
 // A complete cloud pull is authoritative for what the cloud target claims:
 // owners that come back with nothing (the server's data was cleared and a new
@@ -103,6 +104,32 @@ describe('CloudSyncOrchestrator claims', () => {
     expect(getClaimingTargets(db, 'r2')).toEqual(['cloud'])
   })
 
+  it('keeps rows whose last claim the cloud released while a known file target has not judged their namespace', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    const knownTargets = ['cloud', T_A]
+    pulled.records = [peerRecord('r1'), peerRecord('r2')]
+    await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()
+
+    // r1 is retracted with a tombstone, r2 simply stops coming back. The
+    // GitHub target is known but has not been synced yet: it may carry both.
+    pulled.records = []
+    pulled.tombstones = [{ id: 'r1', device_instance_id: X, deleted_at: 2000 }]
+    const second = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()
+    expect(second).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(syncedIds(db)).toEqual(['r1', 'r2'])
+    expect(mergedIds(db)).toEqual(['r1', 'r2'])
+    expect(getClaimingTargets(db, 'r1')).toEqual([])
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM synced_records WHERE unclaimed_since IS NULL`).get()).toEqual({ n: 0 })
+
+    // GitHub judges the namespace: it carries r1 only.
+    reconcileSyncedNamespace(db, T_A, X, ['r1'], undefined, { knownTargets })
+    pulled.tombstones = []
+    const third = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()
+    expect(third).toMatchObject({ status: 'ok', prunedCount: 1 })
+    expect(syncedIds(db)).toEqual(['r1'])
+    expect(getClaimingTargets(db, 'r1')).toEqual([T_A])
+  })
+
   it('never touches rows of a device the cloud has not claimed', async () => {
     const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
     // Pulled through GitHub only; the cloud has never seen device-y.
@@ -137,6 +164,31 @@ describe('CloudSyncOrchestrator claims', () => {
     expect(recovered.status).toBe('ok')
     expect(recovered.prunedCount).toBe(1)
     expect(syncedIds(db)).toEqual(['r2', 'r3'])
+  })
+
+  it('a failed cloud sync withdraws the cloud verdict, so another target cannot settle a row the cloud was just seen to carry', async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    const knownTargets = ['cloud', T_A]
+    // u1 is unresolved from before claims existed; the cloud judges X and lacks it.
+    db.prepare(`INSERT INTO synced_records (id, ts, tool, model, provider, session_key, device, device_instance_id, updated_at, unclaimed_since) VALUES ('u1', 1000, 'claude-code', 'm', 'p', 'k-u1', 'MSI', ?, 1000, 0)`).run(X)
+    pulled.records = [peerRecord('r1')]
+    expect(await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(getNamespaceVerdicts(db, X).has('cloud')).toBe(true)
+
+    // The cloud now returns u1, but applying the pull fails locally.
+    db.exec(`CREATE TRIGGER boom BEFORE INSERT ON synced_records WHEN NEW.id = 'r9' BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END`)
+    pulled.records = [peerRecord('r1'), peerRecord('u1'), peerRecord('r9')]
+    expect(await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()).toMatchObject({ status: 'failed' })
+    expect(getNamespaceVerdicts(db, X).has('cloud')).toBe(false)
+
+    // GitHub verifies X without u1: the cloud's earlier verdict must not count.
+    reconcileSyncedNamespace(db, T_A, X, [], undefined, { knownTargets })
+    expect(pruneUnresolvedSyncedRecords(db, knownTargets)).toBe(0)
+    expect(syncedIds(db)).toContain('u1')
+
+    db.exec(`DROP TRIGGER boom`)
+    expect(await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN, knownTargets }).sync()).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(getClaimingTargets(db, 'u1')).toEqual(['cloud'])
   })
 
   it('retracts the wire id a legacy unknown-device row was pushed under and re-pushes it under the real device id', async () => {

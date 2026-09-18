@@ -4,8 +4,8 @@ import { generateRecordId } from '@aiusage/core'
 import type { StatsRecord, SyncRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
-import { insertSyncedRecord, mergeSyncedRecordsIntoRecords } from '../../src/db/synced-records.js'
-import { getClaimingTargets, getNamespaceVerdicts, UNKNOWN_NAMESPACE_VERDICT } from '../../src/db/sync-claims.js'
+import { deleteSyncedRecord, insertSyncedRecord, mergeSyncedRecordsIntoRecords, pruneUnresolvedSyncedRecords } from '../../src/db/synced-records.js'
+import { getClaimingTargets, getNamespaceVerdicts, recordNamespaceVerdict, replaceNamespaceClaims, UNKNOWN_NAMESPACE_VERDICT } from '../../src/db/sync-claims.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
 import { buildManifest, manifestPath, serializeManifest } from '../../src/sync/manifest.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
@@ -342,6 +342,301 @@ describe('I6/I7 — unverified snapshots', () => {
     a = await sync(dbMe, targetA, ME, T_A)
     expect(a).toMatchObject({ skippedNamespaces: 0, prunedCount: 1 })
     expect(syncedIds(dbMe, X)).toEqual([r0.id])
+  })
+})
+
+describe('I3/I4 — releasing the last claim while a known target has not judged the namespace', () => {
+  let dbX: Database.Database
+  let dbMe: Database.Database
+  let targetA: FakeSyncBackend
+  let targetB: FakeSyncBackend
+  let records: StatsRecord[]
+  let ids: string[]
+  let R: string
+
+  const unclaimedSince = (db: Database.Database, id: string) =>
+    (db.prepare(`SELECT unclaimed_since FROM synced_records WHERE id = ?`).get(id) as { unclaimed_since: number | null } | undefined)?.unclaimed_since
+
+  // No pre-upgrade seeding anywhere: a fresh database, X on both targets, and
+  // ME has only ever synced A.
+  beforeEach(async () => {
+    dbX = newDb()
+    dbMe = newDb()
+    targetA = new FakeSyncBackend()
+    targetB = new FakeSyncBackend()
+    records = [0, 1, 2].map(n => local(X, n))
+    for (const r of records) insertRecord(dbX, r)
+    ids = records.map(r => mapStatsRecordToSyncRecord(r).id)
+    R = ids[1]
+    await sync(dbX, targetA, X, T_A)
+    await sync(dbX, targetB, X, T_B)
+    await sync(dbMe, targetA, ME, T_A)
+    for (const id of ids) expect(getClaimingTargets(dbMe, id)).toEqual([T_A])
+    expect(getNamespaceVerdicts(dbMe, X).has(T_B)).toBe(false)
+  })
+
+  it('keeps the row, unresolved, and the other target claims it without any re-insertion', async () => {
+    // R leaves target A only; target B still carries it.
+    dbX.prepare(`DELETE FROM records WHERE id = ?`).run(records[1].id)
+    await sync(dbX, targetA, X, T_A)
+    expect(targetB.linesUnder(X).map(l => l.id)).toContain(R)
+    dbMe.prepare(`UPDATE records SET ingested_at = 424242 WHERE id = ?`).run(R)
+
+    const a = await sync(dbMe, targetA, ME, T_A)
+    expect(a).toMatchObject({ status: 'ok', prunedCount: 0, skippedNamespaces: 0 })
+    expect(syncedIds(dbMe, X)).toEqual([...ids].sort())
+    expect(mergedIds(dbMe, X)).toEqual([...ids].sort())
+    expect(getClaimingTargets(dbMe, R)).toEqual([])
+    expect(unclaimedSince(dbMe, R)).not.toBeNull()
+
+    // However often A is synced, it cannot settle the row alone.
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ prunedCount: 0 })
+    expect(syncedIds(dbMe, X)).toContain(R)
+
+    const b = await sync(dbMe, targetB, ME, T_B)
+    expect(b).toMatchObject({ status: 'ok', prunedCount: 0, pulledCount: 0 })
+    expect(getClaimingTargets(dbMe, R)).toEqual([T_B])
+    expect(unclaimedSince(dbMe, R)).toBeNull()
+    expect(dbMe.prepare(`SELECT ingested_at FROM records WHERE id = ?`).get(R)).toEqual({ ingested_at: 424242 })
+  })
+
+  it('removes the row as soon as the missing target has judged the namespace and does not carry it either', async () => {
+    dbX.prepare(`DELETE FROM records WHERE id = ?`).run(records[1].id)
+    await sync(dbX, targetA, X, T_A)
+    await sync(dbX, targetB, X, T_B)
+
+    const a = await sync(dbMe, targetA, ME, T_A)
+    expect(a).toMatchObject({ prunedCount: 0 })
+    expect(syncedIds(dbMe, X)).toContain(R)
+
+    // B's first verdict is the one that was missing: A need not sync again.
+    const b = await sync(dbMe, targetB, ME, T_B)
+    expect(b).toMatchObject({ prunedCount: 1 })
+    expect(syncedIds(dbMe, X)).toEqual([ids[0], ids[2]].sort())
+    expect(mergedIds(dbMe, X)).toEqual([ids[0], ids[2]].sort())
+  })
+
+  it('deletes at once when every known target has judged the namespace (steady state)', async () => {
+    await sync(dbMe, targetB, ME, T_B)
+    dbX.prepare(`DELETE FROM records WHERE id = ?`).run(records[1].id)
+    await sync(dbX, targetA, X, T_A)
+    await sync(dbX, targetB, X, T_B)
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ prunedCount: 0 }) // B still claims it
+    expect(await sync(dbMe, targetB, ME, T_B)).toMatchObject({ prunedCount: 1 })
+    expect(syncedIds(dbMe, X)).not.toContain(R)
+  })
+
+  it('a namespace that disappears from the only target synced so far is kept until the other target has looked', async () => {
+    for (const path of [...targetA.files.keys()]) if (path.startsWith(`${X}/`)) targetA.files.delete(path)
+    const a = await sync(dbMe, targetA, ME, T_A)
+    expect(a).toMatchObject({ prunedCount: 0, skippedNamespaces: 0 })
+    expect(syncedIds(dbMe, X)).toEqual([...ids].sort())
+
+    const b = await sync(dbMe, targetB, ME, T_B)
+    expect(b).toMatchObject({ prunedCount: 0 })
+    for (const id of ids) expect(getClaimingTargets(dbMe, id)).toEqual([T_B])
+  })
+
+  it('a cloud tombstone for the last claim defers to a known target that has not judged the namespace', () => {
+    const db = newDb()
+    const wire = mapStatsRecordToSyncRecord(records[0])
+    insertSyncedRecord(db, wire)
+    mergeSyncedRecordsIntoRecords(db, ME)
+    replaceNamespaceClaims(db, T_C, X, [wire.id])
+    recordNamespaceVerdict(db, T_C, X, 1) // a tombstone is applied after a complete pull
+
+    expect(deleteSyncedRecord(db, T_C, wire.id, { knownTargets: [T_C, T_A] })).toBe(false)
+    expect(syncedIds(db, X)).toEqual([wire.id])
+    expect(mergedIds(db, X)).toEqual([wire.id])
+    expect(getClaimingTargets(db, wire.id)).toEqual([])
+    expect(unclaimedSince(db, wire.id)).not.toBeNull()
+
+    // With A's verdict on record the same tombstone deletes.
+    replaceNamespaceClaims(db, T_C, X, [wire.id])
+    recordNamespaceVerdict(db, T_A, X, 1)
+    expect(deleteSyncedRecord(db, T_C, wire.id, { knownTargets: [T_C, T_A] })).toBe(true)
+    expect(syncedIds(db, X)).toEqual([])
+    expect(mergedIds(db, X)).toEqual([])
+    db.close()
+  })
+})
+
+describe('I3/I4 — one id published by two devices', () => {
+  it('is judged under the device the row is attributed to, by the release and by the settling step alike', () => {
+    const db = newDb()
+    const Y = 'device-y'
+    const known = [T_C, T_A]
+    const wire = { ...mapStatsRecordToSyncRecord(local(X, 0)), id: 'shared' } // X's copy is the one stored
+    insertSyncedRecord(db, wire)
+    mergeSyncedRecordsIntoRecords(db, ME)
+    replaceNamespaceClaims(db, T_C, X, ['shared'])
+    replaceNamespaceClaims(db, T_C, Y, ['shared'])
+    recordNamespaceVerdict(db, T_C, X, 1)
+    recordNamespaceVerdict(db, T_C, Y, 1)
+    recordNamespaceVerdict(db, T_A, Y, 1) // A has judged Y's namespace, never X's
+
+    // X retracts its copy: Y's claim keeps the row.
+    expect(deleteSyncedRecord(db, T_C, 'shared', { owner: X, knownTargets: known })).toBe(false)
+    expect(getClaimingTargets(db, 'shared')).toEqual([T_C])
+    // Y retracts too. The last claim was held for Y, which A has judged — but
+    // the row is X's, and A may carry it in X's namespace.
+    expect(deleteSyncedRecord(db, T_C, 'shared', { owner: Y, knownTargets: known })).toBe(false)
+    expect(syncedIds(db, X)).toEqual(['shared'])
+    expect(mergedIds(db, X)).toEqual(['shared'])
+    expect(pruneUnresolvedSyncedRecords(db, known)).toBe(0)
+
+    recordNamespaceVerdict(db, T_A, X, 2)
+    expect(pruneUnresolvedSyncedRecords(db, known)).toBe(1)
+    expect(syncedIds(db, X)).toEqual([])
+    expect(mergedIds(db, X)).toEqual([])
+    db.close()
+  })
+})
+
+describe('I3 — an id that moves from one device namespace to another within one sync', () => {
+  it('is kept and claimed for its new namespace, whatever order the namespaces are reconciled in', async () => {
+    const Y = 'device-y'
+    const dbX = newDb()
+    const dbY = newDb()
+    const dbMe = newDb()
+    const target = new FakeSyncBackend()
+    // A parser-generated id: the same tool data parsed on two machines.
+    const shared = (owner: string, updatedAt: number) => local(owner, 0, { id: 'shared-parser-id', tool: 'opencode', updatedAt })
+    insertRecord(dbX, shared(X, DAY))
+    await sync(dbX, target, X, T_A, [T_A])
+    expect(await sync(dbMe, target, ME, T_A, [T_A])).toMatchObject({ status: 'ok', pulledCount: 1 })
+    expect(syncedIds(dbMe, X)).toEqual(['shared-parser-id'])
+
+    // X retracts it, Y publishes it (newer): device-x is reconciled first.
+    dbX.prepare(`DELETE FROM records`).run()
+    await sync(dbX, target, X, T_A, [T_A])
+    insertRecord(dbY, shared(Y, DAY + 1))
+    await sync(dbY, target, Y, T_A, [T_A])
+
+    expect(await sync(dbMe, target, ME, T_A, [T_A])).toMatchObject({ status: 'ok', prunedCount: 0, skippedNamespaces: 0 })
+    expect(syncedIds(dbMe, Y)).toEqual(['shared-parser-id'])
+    expect(mergedIds(dbMe, Y)).toEqual(['shared-parser-id'])
+    expect(dbMe.prepare(`SELECT target, device_instance_id FROM sync_record_claims WHERE record_id = 'shared-parser-id'`).all())
+      .toEqual([{ target: T_A, device_instance_id: Y }])
+    expect(dbMe.prepare(`SELECT COUNT(*) AS n FROM sync_record_claims WHERE record_id NOT IN (SELECT id FROM synced_records)`).get()).toEqual({ n: 0 })
+  })
+})
+
+describe('I3/I6 — a shared id whose attributed namespace the releasing target could not verify', () => {
+  it('is not deleted by the release in the other namespace', async () => {
+    const Y = 'device-y'
+    const dbX = newDb()
+    const dbY = newDb()
+    const dbMe = newDb()
+    const targetA = new FakeSyncBackend()
+    const targetB = new FakeSyncBackend()
+    const shared = (owner: string, updatedAt: number) => local(owner, 0, { id: 'shared-parser-id', tool: 'opencode', updatedAt })
+    insertRecord(dbX, shared(X, DAY))
+    await sync(dbX, targetA, X, T_A)
+    insertRecord(dbY, local(Y, 5))
+    await sync(dbY, targetA, Y, T_A)
+    await sync(dbY, targetB, Y, T_B)
+    await sync(dbMe, targetA, ME, T_A) // A claims the id under X
+    await sync(dbMe, targetB, ME, T_B) // B judges Y and does not hold the id
+    expect(getNamespaceVerdicts(dbMe, Y).has(T_B)).toBe(true)
+
+    // X retracts the id on A; Y publishes a newer copy there but is
+    // interrupted before its manifest, so Y's namespace does not verify.
+    dbX.prepare(`DELETE FROM records`).run()
+    await sync(dbX, targetA, X, T_A)
+    const yFile = dayFilesOf(targetA, Y)[0]
+    targetA.files.set(yFile, targetA.files.get(yFile)! + JSON.stringify(mapStatsRecordToSyncRecord(shared(Y, DAY + 1))) + '\n')
+
+    const a = await sync(dbMe, targetA, ME, T_A)
+    expect(a).toMatchObject({ status: 'ok', skippedNamespaces: 1, prunedCount: 0 })
+    // The row is Y's now, A has just seen it there, and A has no verdict on Y.
+    expect(syncedIds(dbMe, Y)).toContain('shared-parser-id')
+    expect(getNamespaceVerdicts(dbMe, Y).has(T_A)).toBe(false)
+
+    // Y completes its publish: A claims it under Y.
+    insertRecord(dbY, shared(Y, DAY + 1))
+    await sync(dbY, targetA, Y, T_A)
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ status: 'ok', skippedNamespaces: 0, prunedCount: 0 })
+    expect(dbMe.prepare(`SELECT target, device_instance_id FROM sync_record_claims WHERE record_id = 'shared-parser-id'`).all())
+      .toEqual([{ target: T_A, device_instance_id: Y }])
+  })
+})
+
+describe('I4/I6 — an unresolved row seen again in an unverifiable snapshot', () => {
+  it('is not settled by the verdict its target recorded before the sighting', async () => {
+    const dbX = newDb()
+    const dbMe = newDb()
+    const targetA = new FakeSyncBackend()
+    const targetB = new FakeSyncBackend()
+    const r0 = mapStatsRecordToSyncRecord(local(X, 0))
+    const r1 = mapStatsRecordToSyncRecord(local(X, 1))
+    insertRecord(dbX, local(X, 0))
+    await sync(dbX, targetA, X, T_A)
+    await sync(dbX, targetB, X, T_B)
+
+    // r1 is unresolved from before claims existed; A judges X and lacks it.
+    seedPreV14(dbMe, [r1])
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ prunedCount: 0, skippedNamespaces: 0 })
+    expect(getNamespaceVerdicts(dbMe, X).has(T_A)).toBe(true)
+
+    // X publishes r1 to A but is interrupted before the manifest: A shows the
+    // row in a snapshot that does not verify.
+    const path = dayFilesOf(targetA, X)[0]
+    targetA.files.set(path, targetA.files.get(path)! + JSON.stringify(r1) + '\n')
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ prunedCount: 0, skippedNamespaces: 1 })
+
+    // B verifies X without r1. A's earlier verdict predates the sighting and
+    // must not count: A probably carries the row.
+    expect(await sync(dbMe, targetB, ME, T_B)).toMatchObject({ prunedCount: 0, skippedNamespaces: 0 })
+    expect(syncedIds(dbMe, X)).toContain(r1.id)
+
+    // The owner completes the publish; A claims the row.
+    insertRecord(dbX, local(X, 1))
+    await sync(dbX, targetA, X, T_A)
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ prunedCount: 0, skippedNamespaces: 0 })
+    expect(getClaimingTargets(dbMe, r1.id)).toEqual([T_A])
+  })
+})
+
+describe('I4/I7 — a sync that fails after reading a namespace', () => {
+  it("withdraws the target's earlier verdict on it, so another target cannot settle the rows that were seen", async () => {
+    class FailingBackend extends FakeSyncBackend {
+      failOn: string | null = null
+      override async readFile(path: string): Promise<string | null> {
+        if (path === this.failOn) throw new Error('simulated I/O failure')
+        return super.readFile(path)
+      }
+    }
+    const dbX = newDb()
+    const dbY = newDb()
+    const dbMe = newDb()
+    const targetA = new FailingBackend()
+    const targetB = new FakeSyncBackend()
+    const Y = 'device-y'
+    const r1 = mapStatsRecordToSyncRecord(local(X, 1))
+    insertRecord(dbX, local(X, 0))
+    insertRecord(dbY, local(Y, 0))
+    await sync(dbX, targetA, X, T_A)
+    await sync(dbX, targetB, X, T_B)
+    await sync(dbY, targetA, Y, T_A)
+
+    seedPreV14(dbMe, [r1])
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(getNamespaceVerdicts(dbMe, X).has(T_A)).toBe(true)
+
+    // X publishes r1 to A; ME reads X's namespace, then the read of Y's fails.
+    insertRecord(dbX, local(X, 1))
+    await sync(dbX, targetA, X, T_A)
+    targetA.failOn = dayFilesOf(targetA, Y)[0]
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ status: 'failed', error: 'simulated I/O failure' })
+    expect(getNamespaceVerdicts(dbMe, X).has(T_A)).toBe(false)
+
+    expect(await sync(dbMe, targetB, ME, T_B)).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(syncedIds(dbMe, X)).toContain(r1.id)
+
+    targetA.failOn = null
+    expect(await sync(dbMe, targetA, ME, T_A)).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(getClaimingTargets(dbMe, r1.id)).toEqual([T_A])
   })
 })
 

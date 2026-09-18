@@ -80,20 +80,118 @@ export function getSyncedRecordById(db: Database.Database, id: string): SyncReco
 }
 
 /**
+ * Tick stamped on a row whose last claim was released while some known target
+ * had not judged its namespace yet. Every verdict is from a later tick, so the
+ * row waits for exactly the verdicts that are missing: a target that has a
+ * verdict and no claim did not carry the row at its last reliable read,
+ * however long ago that was.
+ */
+const AWAITING_MISSING_VERDICTS = 0
+
+/**
+ * True when every known target — `target`, which is releasing a claim,
+ * included — has a verdict on the namespace rows of `owner` are judged under.
+ * A target's claims are exactly what its last reliable read of the namespace
+ * held, so a target with a verdict and no claim on a row did not carry it at
+ * that read; a target without a verdict (never synced since the upgrade or
+ * since `clean --all`, or whose last read of the namespace could not be
+ * verified) may carry anything. For `target` itself the verdict is normally
+ * the one it has just recorded for the namespace it released the claim in;
+ * it is missing when the row is attributed to *another* namespace (two
+ * devices publishing one id) that `target` could not verify in this run —
+ * where it may have just seen the row.
+ */
+function everyKnownTargetHasJudged(db: Database.Database, target: string, owner: string, knownTargets: Iterable<string>): boolean {
+  const verdicts = getNamespaceVerdicts(db, namespaceVerdictKey(owner))
+  if (!verdicts.has(target)) return false
+  for (const known of knownTargets) {
+    if (!verdicts.has(known)) return false
+  }
+  return true
+}
+
+/**
+ * Decide the fate of rows whose claim `target` has just released: a row some
+ * target still claims is left alone; one that lost its last claim is deleted
+ * with its merged copy when every known target (`target` included) has
+ * judged its namespace, and left unresolved otherwise. A row is judged under the device
+ * it is *attributed to* (`device_instance_id`), exactly as
+ * `pruneUnresolvedSyncedRecords` judges it afterwards — not under the
+ * namespace the last claim happened to be held for, which differs when two
+ * devices publish the same id.
+ *
+ * A sync that reconciles several namespaces must call this once, after all
+ * of them (see the `released` option of `reconcileSyncedNamespace`): an id
+ * that left one namespace and appeared in another of the same target is
+ * claimed again by the time the last namespace is reconciled, and settling
+ * in between would delete a row the target carries. Returns the number of
+ * rows deleted.
+ */
+export function settleReleasedSyncedRecords(db: Database.Database, target: string, ids: Iterable<string>, knownTargets: Iterable<string> = [target]): number {
+  return db.transaction(() => settleReleasedRows(db, target, ids, knownTargets))()
+}
+
+function settleReleasedRows(db: Database.Database, target: string, ids: Iterable<string>, knownTargets: Iterable<string>): number {
+  const known = [...knownTargets]
+  const find = db.prepare(`
+    SELECT device_instance_id AS owner FROM synced_records
+    WHERE id = ? AND id NOT IN (SELECT record_id FROM sync_record_claims)
+  `)
+  const defer = db.prepare(`UPDATE synced_records SET unclaimed_since = ${AWAITING_MISSING_VERDICTS} WHERE id = ?`)
+  const del = db.prepare(`DELETE FROM synced_records WHERE id = ?`)
+  const delMerged = db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`)
+  // A merged copy whose mirrored row is gone already has nothing left to mirror.
+  const delStrayMerged = db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced' AND id NOT IN (SELECT id FROM synced_records)`)
+  const judged = new Map<string, boolean>()
+  let pruned = 0
+  for (const id of ids) {
+    const row = find.get(id) as { owner: string } | undefined
+    if (!row) {
+      delStrayMerged.run(id)
+      continue
+    }
+    const key = namespaceVerdictKey(row.owner)
+    if (!judged.has(key)) judged.set(key, everyKnownTargetHasJudged(db, target, row.owner, known))
+    if (!judged.get(key)) {
+      defer.run(id)
+      continue
+    }
+    pruned += del.run(id).changes
+    delMerged.run(id)
+  }
+  return pruned
+}
+
+/**
  * Release `target`'s claim on a pulled record and, when that was the last
  * claim, remove it from both `synced_records` and its merged copy in
- * `records`. A target can only release its own claim: a row `target` never
- * claimed (an unresolved row, or one claimed by other targets only) is left
- * alone. Locally parsed rows (`origin = 'local'`) are never touched.
+ * `records` — provided every known target, `target` included, has judged the
+ * row's namespace (a tombstone is applied after a complete pull, which is the
+ * cloud's verdict); otherwise the row becomes unresolved and is left to
+ * `pruneUnresolvedSyncedRecords` (see `reconcileSyncedNamespace`). A target
+ * can only release its own claim: a row `target` never claimed (an unresolved
+ * row, or one claimed by other targets only) is left alone. Locally parsed
+ * rows (`origin = 'local'`) are never touched.
+ *
+ * `owner` names the namespace the retraction comes from (the device a cloud
+ * tombstone belongs to): only the claim `target` holds for that namespace is
+ * released, so a copy of the same id that another device still publishes on
+ * `target` keeps its claim and the row. When omitted, every claim `target`
+ * holds on the id is released. `knownTargets` is as for
+ * `reconcileSyncedNamespace`.
  * Returns true when a `synced_records` row was removed.
  */
-export function deleteSyncedRecord(db: Database.Database, target: string, id: string): boolean {
+export function deleteSyncedRecord(
+  db: Database.Database,
+  target: string,
+  id: string,
+  options: { owner?: string; knownTargets?: Iterable<string> } = {},
+): boolean {
+  const knownTargets = options.knownTargets ?? [target]
   return db.transaction(() => {
-    if (!hasClaim(db, target, id)) return false
-    if (!releaseClaim(db, target, id)) return false
-    const removed = db.prepare(`DELETE FROM synced_records WHERE id = ?`).run(id).changes > 0
-    db.prepare(`DELETE FROM records WHERE id = ? AND origin = 'synced'`).run(id)
-    return removed
+    if (!hasClaim(db, target, id, options.owner)) return false
+    if (!releaseClaim(db, target, id, options.owner)) return false
+    return settleReleasedRows(db, target, [id], knownTargets) > 0
   })()
 }
 
@@ -116,23 +214,46 @@ function fillRemoteIds(db: Database.Database, ids: Iterable<string>): void {
  *    rows are resolved (`unclaimed_since = NULL`).
  *  - Rows whose claim `target` released here and that no target claims any
  *    more are removed from `synced_records`, together with their merged
- *    copies in `records` (`origin = 'synced'` only). A target only ever
- *    releases its own claim: a row another target still claims survives, and
- *    so does an *unresolved* row (one `target` never claimed) — only
+ *    copies in `records` (`origin = 'synced'` only) — provided every known
+ *    target, this one included, has judged the namespace of the device the
+ *    row is attributed to (see `settleReleasedRows`). A known target
+ *    without a verdict has not established its claims yet and may well carry
+ *    the row, so the released rows become *unresolved* instead
+ *    (`unclaimed_since = 0`) and go once the missing verdicts are in, unless
+ *    one of those targets claims them first. A target only ever releases its
+ *    own claim: a row another target still claims survives, and so does a
+ *    row that was unresolved already (one `target` never claimed) — only
  *    `pruneUnresolvedSyncedRecords` may remove those, once every known
  *    target has judged the namespace. Locally parsed rows are never deleted
  *    here.
  *  - The verdict `(target, owner, judgedAt)` is recorded, `judgedAt` being
- *    the sync clock tick of the run (see `nextSyncTick`).
+ *    the sync clock tick of the run (see `nextSyncTick`) — under
+ *    `namespaceVerdictKey(owner)`, the key the verdict is looked up by.
  *
  * Callers must only invoke this with a `remoteIds` set they read completely
  * and reliably (a verified snapshot, an authoritatively empty namespace, or a
  * confirmed absence); a namespace whose files could not all be read, parsed
  * or verified must be skipped, never reconciled against a partial set.
  *
- * Returns the number of `synced_records` rows removed.
+ * `options.knownTargets` is every sync target this device knows (`target`
+ * included or not); when omitted, `target` is the only one. A caller that
+ * reconciles several namespaces in one run passes the same `options.released`
+ * set to every call: the ids whose claim was released are added to it
+ * instead of being settled here, and the caller settles them once with
+ * `settleReleasedSyncedRecords` after the last namespace, when an id that
+ * moved from one namespace to another has its new claim.
+ *
+ * Returns the number of `synced_records` rows removed (0 with `released`).
  */
-export function reconcileSyncedNamespace(db: Database.Database, target: string, owner: string, remoteIds: Iterable<string>, judgedAt: number = nextSyncTick(db)): number {
+export function reconcileSyncedNamespace(
+  db: Database.Database,
+  target: string,
+  owner: string,
+  remoteIds: Iterable<string>,
+  judgedAt: number = nextSyncTick(db),
+  options: { knownTargets?: Iterable<string>; released?: Set<string> } = {},
+): number {
+  const knownTargets = options.knownTargets ?? [target]
   return db.transaction(() => {
     fillRemoteIds(db, remoteIds)
 
@@ -171,20 +292,15 @@ export function reconcileSyncedNamespace(db: Database.Database, target: string, 
       WHERE unclaimed_since IS NOT NULL AND id IN (SELECT id FROM sync_remote_ids)
     `).run()
 
-    // A released row goes only when no target claims it any more.
-    const pruned = db.prepare(`
-      DELETE FROM synced_records
-      WHERE id IN (SELECT id FROM sync_released_ids)
-        AND id NOT IN (SELECT record_id FROM sync_record_claims)
-    `).run().changes
-    db.prepare(`
-      DELETE FROM records
-      WHERE origin = 'synced'
-        AND id IN (SELECT id FROM sync_released_ids)
-        AND id NOT IN (SELECT id FROM synced_records)
-    `).run()
-
-    recordNamespaceVerdict(db, target, owner, judgedAt)
+    // A released row goes only when no target claims it any more — and only
+    // when every known target has judged its namespace, so that "no
+    // claim" means "not carried" rather than "not looked at yet".
+    const released = (db.prepare(`SELECT id FROM sync_released_ids`).all() as Array<{ id: string }>).map(r => r.id)
+    // Recorded before settling: the released rows are judged by it too.
+    recordNamespaceVerdict(db, target, namespaceVerdictKey(owner), judgedAt)
+    let pruned = 0
+    if (options.released) for (const id of released) options.released.add(id)
+    else pruned = settleReleasedRows(db, target, released, knownTargets)
     db.exec(`DELETE FROM sync_released_ids`)
     db.exec(`DELETE FROM sync_remote_ids`)
     return pruned

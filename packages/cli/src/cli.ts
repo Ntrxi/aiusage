@@ -428,7 +428,7 @@ program
           console.log(`  WARNING: ${result.collisionCount} local record(s) share a sync id with another record and were not uploaded. Run "aiusage sync --repair" for details.`)
         }
         if (result.lingeringLegacyTarget) {
-          console.log(`  Note: this device still counts "${result.lingeringLegacyTarget}", the key clients up to 1.5.17 used for this configuration. Records synced before the upgrade are not pruned until that key syncs again.`)
+          console.log(`  Note: this device still counts "${result.lingeringLegacyTarget}", the key clients up to 1.5.17 used for this configuration. Until that key syncs again, records synced before the upgrade and records peers stop publishing are kept rather than pruned.`)
           console.log(`  If nothing syncs under it any more (no configuration uses the default branch/prefix/endpoint), release it: aiusage sync --repair --forget-target "${result.lingeringLegacyTarget}"`)
         }
       } else if (result.status === 'blocked_pending_consent') {

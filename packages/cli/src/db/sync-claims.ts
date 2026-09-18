@@ -104,6 +104,22 @@ export function recordNamespaceVerdict(db: Database.Database, target: string, ow
   `).run(target, owner, judgedAt)
 }
 
+/**
+ * Withdraw `target`'s verdict on `owner`'s namespace: its latest read of the
+ * namespace could not be verified, so what it concluded from an earlier read
+ * no longer describes what it carries. Lines of that read were upserted all
+ * the same; a row among them that `target` does not claim — unresolved
+ * already, or claimed by other targets only — would otherwise still count as
+ * "judged absent on `target`" and could be settled by another target's
+ * verdict, or deleted when its last claim is released, while `target`
+ * probably carries it. The claims stay, and the next reliable read records
+ * the verdict again. Withdrawing a verdict never deletes anything; it only
+ * makes rows wait.
+ */
+export function withdrawNamespaceVerdict(db: Database.Database, target: string, owner: string): void {
+  db.prepare(`DELETE FROM sync_namespace_verdicts WHERE target = ? AND device_instance_id = ?`).run(target, owner)
+}
+
 /** The sync tick at which each target last judged `owner`'s namespace, keyed by target. */
 export function getNamespaceVerdicts(db: Database.Database, owner: string): Map<string, number> {
   const rows = db.prepare(`SELECT target, judged_at FROM sync_namespace_verdicts WHERE device_instance_id = ?`).all(owner) as Array<{ target: string; judged_at: number }>
@@ -120,14 +136,27 @@ export function dropDanglingClaims(db: Database.Database): number {
   return db.prepare(`DELETE FROM sync_record_claims WHERE record_id NOT IN (SELECT id FROM synced_records)`).run().changes
 }
 
-/** True when `target` currently claims `recordId`. */
-export function hasClaim(db: Database.Database, target: string, recordId: string): boolean {
-  return db.prepare(`SELECT 1 FROM sync_record_claims WHERE target = ? AND record_id = ? LIMIT 1`).get(target, recordId) !== undefined
+/** True when `target` currently claims `recordId` — in `owner`'s namespace, when given, otherwise in any. */
+export function hasClaim(db: Database.Database, target: string, recordId: string, owner?: string): boolean {
+  if (owner === undefined) {
+    return db.prepare(`SELECT 1 FROM sync_record_claims WHERE target = ? AND record_id = ? LIMIT 1`).get(target, recordId) !== undefined
+  }
+  return db.prepare(`SELECT 1 FROM sync_record_claims WHERE target = ? AND device_instance_id = ? AND record_id = ? LIMIT 1`).get(target, owner, recordId) !== undefined
 }
 
-/** Drop a single claim. Returns true when no target claims the record any more. */
-export function releaseClaim(db: Database.Database, target: string, recordId: string): boolean {
-  db.prepare(`DELETE FROM sync_record_claims WHERE target = ? AND record_id = ?`).run(target, recordId)
+/**
+ * Drop `target`'s claim on `recordId` — the one held for `owner`'s namespace,
+ * when given, otherwise every one. The same id can be claimed for two
+ * namespaces of one target (two devices publishing the same parser-generated
+ * id), and a retraction by one owner says nothing about the other's copy.
+ * Returns true when no target claims the record any more.
+ */
+export function releaseClaim(db: Database.Database, target: string, recordId: string, owner?: string): boolean {
+  if (owner === undefined) {
+    db.prepare(`DELETE FROM sync_record_claims WHERE target = ? AND record_id = ?`).run(target, recordId)
+  } else {
+    db.prepare(`DELETE FROM sync_record_claims WHERE target = ? AND device_instance_id = ? AND record_id = ?`).run(target, owner, recordId)
+  }
   const remaining = db.prepare(`SELECT 1 FROM sync_record_claims WHERE record_id = ? LIMIT 1`).get(recordId)
   return remaining === undefined
 }

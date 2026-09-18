@@ -105,6 +105,19 @@ describe('CloudSyncOrchestrator tombstones', () => {
     expect(db.prepare(`SELECT COUNT(*) AS n FROM records WHERE origin = 'local'`).get()).toEqual({ n: 1 })
   })
 
+  it("a tombstone releases only its own device's claim: the same id still published by another device stays", async () => {
+    const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
+    // Two devices publish the same parser-generated id (the same tool data on
+    // both machines); the server keys records by device, so both rows exist.
+    pulled.records = [peerRecord('shared')]
+    pulled.tombstones = [{ id: 'shared', device_instance_id: 'device-c', deleted_at: '2026-09-06T00:00:00Z' }]
+    const result = await new CloudSyncOrchestrator(db, { deviceInstanceId: OWN }).sync()
+    expect(result).toMatchObject({ status: 'ok', prunedCount: 0 })
+    expect(db.prepare(`SELECT device_instance_id FROM synced_records WHERE id = 'shared'`).get()).toEqual({ device_instance_id: PEER })
+    expect(db.prepare(`SELECT target, device_instance_id FROM sync_record_claims WHERE record_id = 'shared'`).all()).toEqual([{ target: 'cloud', device_instance_id: PEER }])
+    expect(db.prepare(`SELECT COUNT(*) AS n FROM records WHERE id = 'shared' AND origin = 'synced'`).get()).toEqual({ n: 1 })
+  })
+
   it('a tombstone never deletes a row the cloud does not claim', async () => {
     const { CloudSyncOrchestrator } = await import('../../src/sync/cloud-orchestrator.js')
     // Unresolved (pulled before claims existed) and claimed by another target only.

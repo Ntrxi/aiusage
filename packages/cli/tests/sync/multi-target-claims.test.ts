@@ -5,7 +5,7 @@ import type { StatsRecord } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { deleteSyncedRecord, insertSyncedRecord } from '../../src/db/synced-records.js'
-import { getClaimingTargets, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
+import { getClaimingTargets, recordNamespaceVerdict, replaceNamespaceClaims } from '../../src/db/sync-claims.js'
 import { SyncOrchestrator } from '../../src/sync/index.js'
 import { mapStatsRecordToSyncRecord } from '../../src/sync/mapper.js'
 import { FakeSyncBackend } from './helpers/fake-backend.js'
@@ -191,7 +191,9 @@ describe('per-target record claims', () => {
     expect(syncedIds(dbB, X)).toContain(wire.id)
     expect(getClaimingTargets(dbB, wire.id)).toEqual(['cloud'])
 
-    // A cloud tombstone drops the last claim, so the row goes.
+    // A cloud tombstone drops the last claim, so the row goes (tombstones are
+    // applied after a complete pull, which is the cloud's verdict on X).
+    recordNamespaceVerdict(dbB, 'cloud', X, 99)
     expect(deleteSyncedRecord(dbB, 'cloud', wire.id)).toBe(true)
     expect(syncedIds(dbB, X)).not.toContain(wire.id)
 

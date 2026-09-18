@@ -44,6 +44,20 @@ one trailing slash) and a trailing slash on the endpoint is ignored, so two
 spellings of the same store get the same key. The S3 region is not part of the
 key: it selects the signing region, not the store.
 
+**Known limitation — the cloud key does not name the account.** The cloud
+credentials stored on a device (`device_id`, `device_secret`) carry no account
+identity and the API returns none, so every cloud account — and a server
+selected with `SITE_URL` — shares the key `cloud`, as it did before this
+release. Logging a device out and into *another* account is therefore seen as
+the same target whose content changed: the previous account's rows lose the
+cloud's claim exactly as after `aiusage clean --all` on the server and are
+pruned under the usual rules, and they come back in full (every cloud pull
+reads the whole generation) if the device logs into that account again.
+Nothing is lost remotely and locally parsed rows are never touched, but unlike
+two repositories the two accounts cannot be known targets side by side.
+Keying by account needs the server to expose an account identifier and is
+left as a follow-up.
+
 Clients up to 1.5.17 keyed GitHub by repository and S3 by bucket alone. A
 configuration whose key changed (a non-default branch, prefix or endpoint)
 adopts what was recorded under its old key the first time it syncs: consent,
@@ -64,7 +78,11 @@ was only ever this configuration's, it is a target that is never synced again
 (see *Migration* below): unresolved rows wait for a verdict it never records,
 and its claims keep every row they name — including the old Antigravity/Trae
 wire ids this release retires — because only a sync under the old key could
-release them. Nothing recorded locally can tell the two cases apart, so
+release them. And because a key without verdicts is a target that "has not
+looked yet" (invariant 6), **no** row whose last claim the new key releases
+is deleted while the old key is known: such rows become unresolved and
+`pruned` stays 0. `aiusage sync` says so after every successful sync and
+prints the command below. Nothing recorded locally can tell the two cases apart, so
 nothing expires the key on its own; `aiusage clean --all` is the only
 automatic path that drops claims, and it wipes everything. The explicit way
 out is `aiusage sync --repair --forget-target <old key>` (dry run; `--apply`
@@ -105,15 +123,43 @@ down.
    replaces that target's claims for a namespace and touches no other
    target's. A cloud tombstone releases the cloud's claim only; a row the
    cloud never claimed is not touched by it.
-6. **A row is deleted only when no target claims it**, and only in one of two
-   ways: the target that held its last claim released it because its verified
-   snapshot no longer contains the record, or the row is unresolved and every
-   known target has judged it absent (invariant 8). Locally parsed rows are
-   never deleted by sync.
+6. **A row is deleted only when no target claims it *and* every known target
+   has judged its namespace.** A target's claims are exactly what its last
+   reliable read of a namespace held, so "has a verdict and no claim" means
+   *did not carry the row when last read reliably*, while "has no verdict"
+   means *has not looked yet* — a target that has not been synced since the upgrade or since
+   `aiusage clean --all`, or whose last read of the namespace could not be
+   verified. A row therefore goes in one of two ways: the target that held
+   its last claim releases it because its verified snapshot no longer contains
+   the record and every known target has a verdict for the namespace (the
+   releasing target's own is the one it has just recorded);
+   or the row is unresolved and every known target has judged it absent
+   (invariant 8). A row whose last claim is released while some known target
+   has no verdict becomes unresolved instead, and that target's first verdict
+   either claims it or settles it. What a target has received since this
+   device last synced it cannot be known: a record published to A and B after
+   the last sync of B, pulled from A and then retracted from A only, is
+   deleted although B carries it, and returns with B's next sync. Waiting for
+   a fresh verdict from every known target on every release would close that
+   gap too, but it would stop all pruning for as long as any known target is
+   idle — and with one target configured at a time, a key that is never
+   synced again is the common case, not the exception. Locally parsed rows
+   are never deleted by sync. A row is judged under the namespace of the
+   device it is *attributed to* (`device_instance_id`), by the release and by
+   invariant 8 alike. When two devices publish the same id (the same tool
+   data parsed on two machines) there is one row, attributed to the newest
+   copy, with one claim per namespace; it survives as long as any claim does,
+   but once the last one is released only the attributed device's namespace
+   is consulted, for every known target including the releasing one (which
+   has no verdict on it if it could not verify that namespace in the same
+   sync, so the row waits). A copy a target carries under the *other*
+   device's namespace, and has never claimed, does not protect it (it returns
+   with that target's next reliable read).
 7. **Peers mirror namespaces exactly, per target.** After a reliable read of
    `data/<X>/` on target T, T's claims for X are exactly the ids the namespace
-   holds; rows X no longer publishes on T lose T's claim (and go if that was
-   the last one), together with their merged copies in `records`.
+   holds; rows X no longer publishes on T lose T's claim (and, if that was
+   the last one, go under invariant 6), together with their merged copies in
+   `records`.
 8. **Unresolved rows are settled by verdicts, never by a single target.**
    `sync_namespace_verdicts` records, per target and namespace owner, the
    *sync tick* at which the target last judged that namespace reliably — a
@@ -124,12 +170,23 @@ down.
    unresolved, and still none claims it. Ticks come from the sync clock: each
    sync run takes a tick one greater than any recorded so far, stamps the rows
    it upserts unresolved with it and records its verdicts under it, so the
-   sync that read a row can never be the one that judges it absent.
+   sync that read a row can never be the one that judges it absent. A row
+   that became unresolved by losing its last claim (invariant 6) carries tick
+   0: every verdict counts for it, because a verdict of any age from a target
+   without a claim already says the target did not carry it. A target's
+   verdict on a namespace stands only as long as its latest read of that
+   namespace was reliable: it is withdrawn when the target starts reading the
+   namespace again and recorded anew by a reliable reconciliation, so after
+   an unverifiable read — or a sync that failed part-way — what the target
+   concluded earlier cannot settle rows it has just been seen to hold. The
+   cloud backend does the same for the devices a pull returned, before it
+   applies the first row.
 9. **Only a verified authoritative snapshot can cause deletions.** A
    namespace whose files could not all be read, parsed and verified against
    its manifest is *skipped*: its lines are upserted (a new row is
    unresolved; an existing row is refreshed only by a newer version), no claim
-   is touched, nothing is pruned, no verdict is recorded. A backend that
+   is touched, nothing is pruned, no verdict is recorded and the target's
+   earlier verdict on it is withdrawn (invariant 8). A backend that
    cannot list or read at all aborts the sync before anything is reconciled.
 10. **"Absent", "authoritatively empty" and "unverifiable" are distinct
     states** of a namespace with no listed day file: no manifest means the
@@ -216,20 +273,31 @@ manifest tells the three states apart for a namespace with no day files
 Then, per namespace owner:
 
 * if the namespace was read **reliably**, the ids collected become this
-  target's claims for that owner (replacing the previous ones), rows whose
-  claim this released and that no target claims any more are deleted with
-  their merged copies, and the verdict `(target, owner, tick)` is recorded;
+  target's claims for that owner (replacing the previous ones) and the verdict
+  `(target, owner, tick)` is recorded. Rows whose claim this released and that
+  no target claims any more are deleted with their merged copies when every
+  known target has a verdict for the namespace; while one has not —
+  it has not established its claims yet and may carry exactly those rows —
+  they become unresolved (tick 0) and wait for it: its first reliable read
+  claims the ones it carries, and the others go in that same sync. Released
+  rows are settled once, after every reliable namespace of the sync has its
+  new claims, so an id that left one device's namespace and appeared in
+  another's (the same tool data parsed on two machines) is claimed for the
+  new one instead of being deleted in between;
 * if it was **not** (a file listed a moment ago but gone, a malformed line, a
   manifest that does not parse or whose digests do not match, a manifest
   naming files that are not there), the namespace is skipped: claims are left
-  as they were, nothing is pruned, no verdict is recorded. `aiusage sync`
-  reports the number of skipped namespaces.
+  as they were, nothing is pruned, no verdict is recorded, and the verdict
+  this target held from an earlier read is withdrawn — the lines just read
+  were upserted, so a row among them that this target does not claim must
+  not count as "judged absent here" until a reliable read says so again.
+  `aiusage sync` reports the number of skipped namespaces.
 
 Rows attributed to `unknown` (lines an old client wrote before `aiusage init`,
 mirrored before this release) can sit in any namespace of the target — a
 reliable read relabels them to its owner and claims them — so the target's
 verdict on them is recorded only in a sync during which every namespace on the
-target was read reliably.
+target was read reliably, and withdrawn by any sync in which one was not.
 
 Finally, unresolved rows whose namespace every known target has judged since
 they became unresolved, and that still no target claims, are deleted
@@ -364,8 +432,11 @@ Because reconciliation deletes local rows, the backends never mask errors:
   transaction, so claims, verdicts and deletions land for every reliable
   namespace or for none. The pull as a whole is therefore *additive-then-
   atomic*, not atomic: a sync that fails after upserting may leave new
-  unresolved rows behind, and the next successful sync settles them. The same
-  holds for the cloud backend.
+  unresolved rows behind, and the next successful sync settles them. The
+  verdicts this target held on the namespaces it had started to read stay
+  withdrawn until then, so no other target can settle, in the meantime, a row
+  the failed sync saw. The same holds for the cloud backend, which withdraws
+  its verdicts on the devices a pull returned before applying the first row.
 
 ## Bookkeeping tables
 
@@ -373,8 +444,8 @@ Because reconciliation deletes local rows, the backends never mask errors:
 | --- | --- |
 | `sync_record_state` | Which local records have been published to which target, and when. Drives the `uploaded: N` count and the cloud push; the file backends always publish the full snapshot regardless. |
 | `sync_record_claims` (v14) | For every sync target, the records of every foreign namespace this device mirrored from it. A pulled row is deleted only when no target claims it. The cloud backend records claims from every pull too, and a cloud tombstone releases only the cloud's claim. A claim never outlives its row: `sync --repair --apply` and `aiusage clean` drop the claims of the rows they delete. Only `aiusage clean --all` and `sync --repair --forget-target <key> --apply` drop claims wholesale; the latter for one key, turning the rows that lose their last claim into unresolved rows instead of deleting them. |
-| `synced_records.unclaimed_since` (v14) | The sync tick at which a row became unresolved (no target claims it); `NULL` once a target claims it. Rows that predate the column carry tick 0. Forgetting a target stamps the rows it was the last claimant of with the tick taken before the forget, so only a later sync can judge them. |
-| `sync_namespace_verdicts` (v14) | For every sync target and namespace owner, the sync tick at which the target last judged the namespace reliably. Unresolved rows are deleted only once every known target has a verdict for their namespace from a later tick. Cleared by `aiusage clean --all` and, for one key, by `--forget-target`; never copied when a target key is adopted. |
+| `synced_records.unclaimed_since` (v14) | The sync tick at which a row became unresolved (no target claims it); `NULL` once a target claims it. Rows that predate the column carry tick 0, and so do rows whose last claim was released while a known target had no verdict for their namespace: both wait for a verdict of any age from every known target. Forgetting a target stamps the rows it was the last claimant of with the tick taken before the forget, so only a later sync can judge them. |
+| `sync_namespace_verdicts` (v14) | For every sync target and namespace owner, the sync tick at which the target last judged the namespace reliably. Unresolved rows are deleted only once every known target has a verdict for their namespace from a later tick, and a released last claim deletes its row at once only when every known target has one. A target's verdict is withdrawn when it reads the namespace again and recorded anew only by a reliable reconciliation. Cleared by `aiusage clean --all` and, for one key, by `--forget-target`; never copied when a target key is adopted. |
 | `sync_retired_wire_ids` (v14) | Wire ids this device used to publish and never will again. Cleared by the next file-backend sync (the snapshot no longer contains them) or pushed as tombstones to the cloud backend. `--forget-target` drops the forgotten key's entries: nothing will sync under it, so nothing would ever tombstone them. |
 | `state.json` (`syncConsents`, `syncTargets`, `lastSyncTarget`) | The keys `knownSyncTargets` counts. Every key listed here must record a verdict before unresolved rows are pruned. A key is removed only by `--forget-target --apply`, after the database part committed, so a crash in between leaves the key known (nothing pruned early) and a re-run completes the forget. |
 
@@ -391,13 +462,17 @@ snapshot). The pushes that follow go out under the generation the pull
 observed, so a client that last synced before the server was cleared is not
 rejected as stale. A completed pull is reconciled exactly like a file-based
 target: every device the cloud claimed before is reconciled against what came
-back for it, and rows no target claims any more are removed.
+back for it, and rows no target claims any more are removed — at once when
+every known target has judged their namespace, otherwise once the missing ones have
+(invariant 6).
 When the server's data is cleared (`aiusage clean --all` advances the server's
 `sync_generation`) the next pull returns neither records nor tombstones for the
 old devices; their cloud claims are released and their rows go unless another
-target still claims them. A tombstone from a device's own retraction likewise
-releases only the cloud's claim, and never touches a row the cloud does not
-claim. A completed pull is also the cloud's verdict on every namespace —
+target still claims them, or a known target has not judged them yet. A
+tombstone from a device's own retraction likewise releases only the cloud's
+claim — the one it holds for the device the tombstone comes from, so the
+same id still published by another device keeps its claim and its row —
+under the same rule, and never touches a row the cloud does not claim. A completed pull is also the cloud's verdict on every namespace —
 including those it returned nothing for, and the legacy `unknown` rows — so
 unresolved rows are settled by the cloud exactly as by a file target.
 
@@ -412,7 +487,9 @@ which normalises numbers and rejects missing or invalid required fields
 is accepted only for the columns the server stores as nullable — `deviceName`
 (NULL for every record a client up to 1.5.17 pushed, since those sent
 `device`), `cost` and `costSource` — and takes the local default; rejecting
-it would fail every pull of an account with pre-upgrade data. A pull
+it would fail every pull of an account with pre-upgrade data. The optional
+fields (`platform`, `sourceFile`, `cwd`) are not required at all: absent or
+`null`, they are simply left out of the record. A pull
 containing a record that is malformed in any other way
 fails rather than silently omitting it, because a completed pull is
 reconciled against and an omission would read as absence. Ownership is not
@@ -477,6 +554,15 @@ Peers running an older version keep whatever rows they already have; they do
 not prune, and they never write manifests. Their namespaces are still read
 and reconciled (legacy mode). Upgrade every device for totals to converge.
 
+**Rolling a device back** to 1.5.17 or earlier after it has published a
+manifest is fail-safe but not transparent: the old client merges new lines
+into its day files and never refreshes the manifest, so upgraded peers find a
+digest mismatch, skip the namespace and stop receiving that device's new
+records (nothing of it is pruned either). Upgrading the device again
+republishes the snapshot with its manifest on the next sync. To stay on the
+old version, delete `data/<device>/manifest.json` from the target: the
+namespace is then read in legacy mode again.
+
 The cloud backend stores records per device as upserts. The migration records
 the retired Antigravity/Trae ids (and the sentinel ids of legacy `unknown`
 rows) and the next cloud sync pushes them as tombstones, which other devices
@@ -518,6 +604,11 @@ test that exercises it (all under `packages/cli/tests/`).
 | S3 `DeleteObjects` with per-object errors | 11 | `sync/s3-delete-all.test.ts` |
 | S3 GET without a body, malformed listings, missing or cyclic continuation tokens fail closed | 9, 11 | `sync/s3.test.ts` |
 | Same record on two targets; one target drops it; namespace disappears from one target only; cloud claim vs file target | 5, 6, 7 | `sync/multi-target-claims.test.ts` |
+| One id published by two devices: a retraction by one releases only that device's claim; the row is judged under the device it is attributed to by the release and the settling step alike; a release in one namespace does not delete it while the releasing target could not verify the attributed one | 5, 6, 8, 9 | `sync/sync-invariants.test.ts` — *one id published by two devices*, *a shared id whose attributed namespace the releasing target could not verify*, `sync/cloud-orchestrator-tombstones.test.ts` |
+| An id that moves from one device's namespace to another's within one sync is kept and claimed for the new one, whatever the reconciliation order; no claim outlives its row | 6, 7 | `sync/sync-invariants.test.ts` — *an id that moves from one device namespace to another within one sync* |
+| A failed cloud sync withdraws the cloud's verdicts on the devices the pull returned | 8, 11 | `sync/cloud-orchestrator-claims.test.ts` |
+| A fresh database synced with A only; a record (or the whole namespace) leaves A while B still carries it: the row survives unresolved and B claims it without re-insertion; gone from B too, B's first verdict settles it; with every target judged, the release deletes at once; the same for a cloud tombstone and a cloud generation reset | 6, 8 | `sync/sync-invariants.test.ts` — *releasing the last claim while a known target has not judged the namespace*, `sync/cloud-orchestrator-claims.test.ts` |
+| An unresolved row seen again in an unverifiable snapshot of A, or by a sync of A that then failed, is not settled by B's verdict on the strength of A's earlier one | 8, 9, 11 | `sync/sync-invariants.test.ts` — *an unresolved row seen again in an unverifiable snapshot*, *a sync that fails after reading a namespace* |
 | Cloud generation reset, pages spanning two generations, tombstones for unclaimed rows | 5, 6, 11 | `sync/cloud-orchestrator-claims.test.ts`, `sync/cloud-orchestrator-tombstones.test.ts` |
 | Cloud wire shape, required fields, malformed envelopes and tombstones, bigint cursor progress; failed later pages leave rows and claims unchanged | 9, 11 | `sync/cloud-dto.test.ts` |
 | Two branches / prefixes of one store never share claims; legacy key adoption copies claims but not verdicts; the old key stays a known target so the changed configuration never settles rows the unchanged one carries | 5, 8 | `sync/target-identity.test.ts` |
