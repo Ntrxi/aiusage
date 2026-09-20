@@ -33,43 +33,19 @@ jobs:
 
       - name: Bump patch version
         id: version
-        run: |
-          CURRENT=$(node -p "require('./packages/cli/package.json').version")
-          IFS='.' read -r major minor patch <<< "$CURRENT"
-          NEW="${major}.${minor}.$((patch + 1))"
-          echo "version=${NEW}" >> $GITHUB_OUTPUT
-          echo "Bumping ${CURRENT} → ${NEW}"
-          node -e "
-            const fs = require('fs');
-            ['packages/core/package.json', 'packages/cli/package.json'].forEach(f => {
-              const pkg = JSON.parse(fs.readFileSync(f, 'utf-8'));
-              pkg.version = '${NEW}';
-              fs.writeFileSync(f, JSON.stringify(pkg, null, 2) + '\n');
-            });
-          "
-
-      - name: Update CHANGELOG
         env:
           DESCRIPTION: ${{ github.event.inputs.description }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          node -e "
-            const fs = require('fs');
-            const date = new Date().toISOString().slice(0, 10);
-            const version = process.env.VERSION;
-            const description = process.env.DESCRIPTION;
-            const entry = '## [' + version + '] - ' + date + '\n\n' + description + '\n\n---\n\n';
-            const changelog = fs.readFileSync('CHANGELOG.md', 'utf-8');
-            const updated = changelog.replace(/^(# Changelog\n)/, '\$1\n' + entry);
-            fs.writeFileSync('CHANGELOG.md', updated);
-          "
+          NEW=$(node scripts/prepare-patch-release.mjs)
+          echo "version=${NEW}" >> $GITHUB_OUTPUT
+          echo "Prepared ${NEW}"
 
       - name: Commit, tag and push
         run: |
           VERSION=${{ steps.version.outputs.version }}
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add packages/core/package.json packages/cli/package.json CHANGELOG.md
+          git add packages/*/package.json CHANGELOG.md CHANGELOG.zh-CN.md
           git commit -m "chore: bump version to ${VERSION}"
           git tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin main
