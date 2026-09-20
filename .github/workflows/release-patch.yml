@@ -12,6 +12,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       packages: write
 
@@ -50,3 +51,15 @@ jobs:
           git tag -a "v${VERSION}" -m "v${VERSION}"
           git push origin main
           git push origin "v${VERSION}"
+
+      # A tag pushed with GITHUB_TOKEN does not emit another workflow run.
+      # Dispatch the tag-based release workflows explicitly so npm, Docker,
+      # the site image and the GitHub Release are always produced.
+      - name: Trigger release workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh workflow run npm-publish.yml --ref "v${VERSION}" -f version="${VERSION}"
+          gh workflow run docker.yml --ref "v${VERSION}"
+          gh workflow run site-docker.yml --ref "v${VERSION}"
