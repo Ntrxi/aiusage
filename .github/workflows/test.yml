@@ -68,3 +68,32 @@ jobs:
         run: |
           pnpm --filter @juliantanx/aiusage test
           pnpm --filter @juliantanx/aiusage-widget test
+
+  test-site:
+    name: Site (Node.js 20)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build core
+        run: pnpm --filter @aiusage/core build
+
+      - name: Test site
+        run: pnpm --filter @aiusage/site test
+
+      - name: Build site
+        run: pnpm --filter @aiusage/site build
