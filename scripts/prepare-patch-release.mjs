@@ -29,6 +29,27 @@ for (const file of packageFiles) {
   }
 }
 
+const siteVersionFiles = [
+  {
+    file: 'packages/site/src/routes/docs/+page.svelte',
+    current: `<span class="meta-tag">v${currentVersion}</span>`,
+    next: `<span class="meta-tag">v${nextVersion}</span>`,
+  },
+  {
+    file: 'packages/site/src/routes/+layout.svelte',
+    current: `softwareVersion: '${currentVersion}'`,
+    next: `softwareVersion: '${nextVersion}'`,
+  },
+]
+
+for (const { file, current, next } of siteVersionFiles) {
+  const content = readFileSync(file, 'utf8')
+  if (!content.includes(current)) {
+    throw new Error(`${file} does not contain the expected version ${currentVersion}`)
+  }
+  if (!checkOnly) writeFileSync(file, content.replace(current, next))
+}
+
 function promoteUnreleased(file, marker, summary = '') {
   const changelog = readFileSync(file, 'utf8')
   const markerIndex = changelog.indexOf(marker)
