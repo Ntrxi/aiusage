@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.5.18] - 2026-09-20
+
+Fix multi-device sync correctness across GitHub, S3/R2, and Cloud.
+
 ### Fixed
 - **Multi-device sync lost and duplicated records** — two machines sharing one GitHub or S3 sync target could report different totals, a phantom `unknown` device could appear, and ids retired by a local rebuild or by an id-generation change lived on remotely and on every peer. Root causes and fixes:
   - *Antigravity (and Trae) wire-id collisions*: records were published under `sha256(device, sourceFile, lineOffset)`, but several Antigravity usage events share one generation index and every Trae session shares offset 0, so on one machine 972 local records became 929 remote ones. Both tools now publish under their parser-generated `record.id`.
