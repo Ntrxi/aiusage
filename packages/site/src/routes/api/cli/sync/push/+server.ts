@@ -134,8 +134,10 @@ export const POST: RequestHandler = async ({ request }) => {
         }
 
         const id = nanoid()
+        const updatedAt = record.updatedAt || Date.now()
         try {
-          const result = await tx`
+          // Plain INSERT first: a returned row means the record is new.
+          const created = await tx`
             INSERT INTO cloud_usage_records (
               id, user_id, device_id, device_instance_id, sync_generation,
               record_id, ts, tool, model, provider,
@@ -150,38 +152,46 @@ export const POST: RequestHandler = async ({ request }) => {
               ${record.cost ?? null}, ${record.costSource || null}, ${record.sessionKey || ''},
               ${record.sourceFile || ''}, ${record.cwd || ''},
               ${record.deviceName || null}, ${record.platform || null},
-              ${record.updatedAt || Date.now()}, NOW()
+              ${updatedAt}, NOW()
             )
-            ON CONFLICT (user_id, sync_generation, device_instance_id, record_id)
-            DO UPDATE SET
-              ts = EXCLUDED.ts,
-              tool = EXCLUDED.tool,
-              model = EXCLUDED.model,
-              provider = EXCLUDED.provider,
-              input_tokens = EXCLUDED.input_tokens,
-              output_tokens = EXCLUDED.output_tokens,
-              cache_read_tokens = EXCLUDED.cache_read_tokens,
-              cache_write_tokens = EXCLUDED.cache_write_tokens,
-              thinking_tokens = EXCLUDED.thinking_tokens,
-              cost = EXCLUDED.cost,
-              cost_source = EXCLUDED.cost_source,
-              session_key = EXCLUDED.session_key,
-              source_file = EXCLUDED.source_file,
-              cwd = EXCLUDED.cwd,
-              device_name = EXCLUDED.device_name,
-              platform = EXCLUDED.platform,
-              updated_at = EXCLUDED.updated_at,
+            ON CONFLICT (user_id, sync_generation, device_instance_id, record_id) DO NOTHING
+            RETURNING id
+          `
+          if (created.length > 0) {
+            inserted++
+            continue
+          }
+
+          // The row already exists: apply the record only if it is newer.
+          // No returned row means it was older/equal and nothing changed.
+          const changed = await tx`
+            UPDATE cloud_usage_records SET
+              ts = ${record.ts || 0},
+              tool = ${record.tool},
+              model = ${record.model},
+              provider = ${record.provider || ''},
+              input_tokens = ${record.inputTokens || 0},
+              output_tokens = ${record.outputTokens || 0},
+              cache_read_tokens = ${record.cacheReadTokens || 0},
+              cache_write_tokens = ${record.cacheWriteTokens || 0},
+              thinking_tokens = ${record.thinkingTokens || 0},
+              cost = ${record.cost ?? null},
+              cost_source = ${record.costSource || null},
+              session_key = ${record.sessionKey || ''},
+              source_file = ${record.sourceFile || ''},
+              cwd = ${record.cwd || ''},
+              device_name = ${record.deviceName || null},
+              platform = ${record.platform || null},
+              updated_at = ${updatedAt},
               server_updated_at = NOW(),
               deleted_at = NULL
-            WHERE EXCLUDED.updated_at > cloud_usage_records.updated_at
-            RETURNING (xmax = 0) AS inserted
+            WHERE user_id = ${userId} AND sync_generation = ${serverGeneration}
+              AND device_instance_id = ${deviceInstanceId} AND record_id = ${record.id}
+              AND updated_at < ${updatedAt}
+            RETURNING id
           `
-          // No row comes back when the conflict WHERE rejects an older/equal record.
-          // xmax is 0 only for a freshly inserted row; a conflict update sets it.
-          const row = result[0] as { inserted: boolean } | undefined
-          if (!row) skipped++
-          else if (row.inserted) inserted++
-          else updated++
+          if (changed.length > 0) updated++
+          else skipped++
         } catch {
           skipped++
         }

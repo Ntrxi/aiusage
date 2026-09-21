@@ -1,35 +1,36 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // In-memory stand-in for cloud_usage_records, keyed by record_id -> updated_at.
-// The fake mirrors what Postgres returns for the route's UPSERT ... RETURNING:
-// one row with inserted=true for a new row, inserted=false for a conflict update,
-// and no row at all when the conflict WHERE rejects an older/equal record.
+// The fake mirrors what Postgres returns for the route's two statements:
+// INSERT ... ON CONFLICT DO NOTHING RETURNING yields a row only for a new record,
+// and the follow-up UPDATE ... RETURNING yields a row only for a newer record.
 const db = vi.hoisted(() => ({
   rows: new Map<string, number>(),
-  upsertQueries: [] as string[],
+  recordQueries: [] as string[],
 }))
 
 vi.mock('$lib/server/db/pool.js', () => {
-  // Positions of record_id / updated_at in the UPSERT's VALUES list.
+  // Positions of record_id / updated_at in the INSERT's VALUES list.
+  // The UPDATE ends with `record_id = ... AND updated_at < ...`, so they come last.
   const RECORD_ID_PARAM = 5
   const UPDATED_AT_PARAM = 22
 
   const sql = (strings: TemplateStringsArray, ...params: unknown[]) => {
     const text = strings.join('?')
     if (text.includes('INSERT INTO cloud_usage_records')) {
-      db.upsertQueries.push(text)
+      db.recordQueries.push(text)
       const recordId = params[RECORD_ID_PARAM] as string
-      const updatedAt = params[UPDATED_AT_PARAM] as number
+      if (db.rows.has(recordId)) return Promise.resolve([])
+      db.rows.set(recordId, params[UPDATED_AT_PARAM] as number)
+      return Promise.resolve([{ id: 'row' }])
+    }
+    if (text.includes('UPDATE cloud_usage_records') && text.includes('RETURNING')) {
+      db.recordQueries.push(text)
+      const [recordId, updatedAt] = params.slice(-2) as [string, number]
       const current = db.rows.get(recordId)
-      if (current === undefined) {
-        db.rows.set(recordId, updatedAt)
-        return Promise.resolve([{ inserted: true }])
-      }
-      if (updatedAt > current) {
-        db.rows.set(recordId, updatedAt)
-        return Promise.resolve([{ inserted: false }])
-      }
-      return Promise.resolve([])
+      if (current === undefined || current >= updatedAt) return Promise.resolve([])
+      db.rows.set(recordId, updatedAt)
+      return Promise.resolve([{ id: 'row' }])
     }
     if (text.includes('FROM cloud_device_instances')) {
       return Promise.resolve([{ id: 'instance_1', sync_generation: 1 }])
@@ -90,7 +91,7 @@ async function push(records: unknown[], tombstones: unknown[] = []) {
 describe('POST /api/cli/sync/push result counters', () => {
   beforeEach(() => {
     db.rows.clear()
-    db.upsertQueries.length = 0
+    db.recordQueries.length = 0
   })
 
   it('counts newly created rows as inserted', async () => {
@@ -127,9 +128,18 @@ describe('POST /api/cli/sync/push result counters', () => {
     expect(body).toMatchObject({ inserted: 1, updated: 1, skipped: 3 })
   })
 
-  it('asks the database which outcome the UPSERT had', async () => {
-    await push([record('r1', 100)])
-    expect(db.upsertQueries).toHaveLength(1)
-    expect(db.upsertQueries[0]).toMatch(/RETURNING \(xmax = 0\) AS inserted/)
+  it('only runs the guarded UPDATE when the INSERT hit an existing row', async () => {
+    db.rows.set('existing', 100)
+    await push([record('fresh', 100), record('existing', 200)])
+    expect(db.recordQueries).toHaveLength(3)
+    expect(db.recordQueries[0]).toMatch(/DO NOTHING\s+RETURNING id/)
+    expect(db.recordQueries[1]).toMatch(/DO NOTHING\s+RETURNING id/)
+    expect(db.recordQueries[2]).toMatch(/AND updated_at < \?\s+RETURNING id/)
+  })
+
+  it('does not rely on PostgreSQL system columns', async () => {
+    db.rows.set('existing', 100)
+    await push([record('fresh', 100), record('existing', 200)])
+    expect(db.recordQueries.join(' ')).not.toMatch(/xmax/i)
   })
 })
