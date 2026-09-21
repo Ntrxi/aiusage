@@ -135,7 +135,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
         const id = nanoid()
         try {
-          await tx`
+          const result = await tx`
             INSERT INTO cloud_usage_records (
               id, user_id, device_id, device_instance_id, sync_generation,
               record_id, ts, tool, model, provider,
@@ -174,8 +174,14 @@ export const POST: RequestHandler = async ({ request }) => {
               server_updated_at = NOW(),
               deleted_at = NULL
             WHERE EXCLUDED.updated_at > cloud_usage_records.updated_at
+            RETURNING (xmax = 0) AS inserted
           `
-          inserted++
+          // No row comes back when the conflict WHERE rejects an older/equal record.
+          // xmax is 0 only for a freshly inserted row; a conflict update sets it.
+          const row = result[0] as { inserted: boolean } | undefined
+          if (!row) skipped++
+          else if (row.inserted) inserted++
+          else updated++
         } catch {
           skipped++
         }
