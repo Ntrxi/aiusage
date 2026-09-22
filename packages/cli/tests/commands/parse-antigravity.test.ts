@@ -1000,6 +1000,22 @@ describe('parse-antigravity', () => {
       expect(full.records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([5, 30])
     })
 
+    it('covers a step by exactly one window when a generation links a lower step index', () => {
+      // Without a response identity the two copies of step 6 could not be
+      // merged, so the window boundary must not move back below it.
+      insertStep(30, stepMetadata({ ts: 30_000, usage: usage({ input: 30, totalOutput: 3, responseId: 'r30' }) }))
+      insertGeneration(0, generationMetadata({ model: 'gemini-3.8-flash', stepIndices: [30] }))
+      insertStep(5, stepMetadata({ ts: 5_000, usage: usage({ input: 5, totalOutput: 1 }) }))
+      insertGeneration(1, generationMetadata({ model: 'gemini-3.8-flash', stepIndices: [5] }))
+      insertStep(6, stepMetadata({ ts: 6_000, usage: usage({ input: 6, totalOutput: 1 }) }))
+      insertGeneration(2, generationMetadata({ model: 'gemini-3.8-flash', stepIndices: [6] }))
+
+      const records = parse().records
+
+      expect(records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([5, 6, 30])
+      expect(new Set(records.map((record) => record.id)).size).toBe(3)
+    })
+
     it('ignores a placeholder slug or step name that contradicts an unknown explicit id', () => {
       insertGeneration(0, generationMetadata({
         model: 'MODEL_PLACEHOLDER_M318',

@@ -740,11 +740,14 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // The conversation's structure — the steps each generation's window covers —
   // is fixed before any name is resolved and never depends on the import
   // cursor: every generation is walked exactly as a full import walks it.
+  // The window boundary only ever advances, so a step belongs to exactly one
+  // window even when a generation links a lower step index than its
+  // predecessor (its linked steps then sit in an earlier window).
   interface Window { generation: GenerationMetadata; stepIndices: number[]; linkedTs?: number }
   const windows: Window[] = []
   let previousStep = -1
   for (const generation of generations) {
-    const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
+    const lastStep = Math.max(previousStep, ...generation.stepIndices)
     windows.push({
       generation,
       stepIndices: [...steps.keys()].filter((index) => index > previousStep && index <= lastStep),
