@@ -827,6 +827,113 @@ describe('parse-antigravity', () => {
       expect(full.records.map((record) => [record.id, record.model])).toEqual(incremental.records.map((record) => [record.id, record.model]))
     })
 
+    it('re-emits earlier id-less usage when the last named generation is processed after being held back', () => {
+      insertGeneration(0, generationMetadata({ usage: usage({ input: 10, totalOutput: 1, responseId: 'r0' }) }))
+      const [first] = parse().records
+      expect(first).toMatchObject({ model: 'antigravity-unknown' })
+
+      insertGeneration(1, generationMetadata({ model: 'gemini-2.5-pro', usage: usage({ input: 20, totalOutput: 2, responseId: 'r1' }) }))
+      // The latest generation names a model but has no usage yet: held back.
+      insertGeneration(2, generationMetadata({ model: 'gemini-3.8-flash' }))
+      const heldBack = parse(1)
+      expect(heldBack.nextIndex).toBe(2)
+      expect(heldBack.records.map((record) => [record.inputTokens, record.model])).toEqual([[20, 'gemini-2.5-pro']])
+
+      db.prepare('UPDATE gen_metadata SET data = ? WHERE idx = 2').run(generationMetadata({
+        model: 'gemini-3.8-flash',
+        usage: usage({ input: 30, totalOutput: 3, responseId: 'r2' }),
+      }))
+      const incremental = parse(2)
+      const full = parse()
+
+      // The id-less usage takes its name from the last named generation, so it
+      // is corrected once that generation is processed, as a full import would.
+      expect(incremental.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [incremental.records[1].id, 'gemini-3.8-flash']])
+      expect(full.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [heldBack.records[0].id, 'gemini-2.5-pro'], [incremental.records[1].id, 'gemini-3.8-flash']])
+    })
+
+    it('merges a new copy of an earlier response with the earlier copy as a full import would', () => {
+      // The earlier step copy runs the helper model; a later generation stores
+      // the same response under an id it names. A full import keeps the step
+      // copy whole, so the incremental import must write that same record.
+      insertStep(1, stepMetadata({ ts: 1_000, usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'shared' }) }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+      const [first] = parse().records
+      expect(first).toMatchObject({ model: 'antigravity-model-1050', inputTokens: 70 })
+
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-8.8-flash',
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 90, totalOutput: 8, responseId: 'shared' }),
+      }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.records.map((record) => [record.id, record.model, record.inputTokens])).toEqual([[first.id, 'antigravity-model-1050', 70]])
+      expect(full.records.map((record) => [record.id, record.model, record.inputTokens])).toEqual([[first.id, 'antigravity-model-1050', 70]])
+    })
+
+    it('gives a step its placeholder-derived id so a conflicting copy is not merged into it', () => {
+      insertStep(1, stepMetadata({ ts: 1_000, modelName: 'MODEL_PLACEHOLDER_M318', usage: usage({ input: 70, totalOutput: 6, responseId: 'shared' }) }))
+      insertGeneration(0, generationMetadata({
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 90, totalOutput: 8, responseId: 'shared' }),
+        stepIndices: [1],
+      }))
+
+      const records = parse().records
+
+      expect(records).toHaveLength(1)
+      expect(records[0]).toMatchObject({ model: 'gemini-3.8-flash', inputTokens: 70, outputTokens: 6 })
+    })
+
+    it('attributes an id to the same row whether the import is full or incremental', () => {
+      // A step an earlier import covered and a generation this import adds both
+      // store a name beside the id; a full import lets the generation name it
+      // (generations precede steps), so an incremental import must too.
+      insertStep(1, stepMetadata({ ts: 1_000, modelId: UNKNOWN_ID, modelName: 'gemini-9.9-flash', usage: usage({ input: 10, totalOutput: 1, responseId: 'r0' }) }))
+      insertGeneration(0, generationMetadata({ model: 'gemini-2.5-pro', modelId: 246, stepIndices: [1] }))
+      expect(parse().nextIndex).toBe(1)
+
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-8.8-flash',
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 2, responseId: 'r1' }),
+      }))
+      insertStep(3, stepMetadata({ ts: 3_000, usage: usage({ modelId: UNKNOWN_ID, input: 40, totalOutput: 4, responseId: 'r3' }) }))
+      insertGeneration(2, generationMetadata({ model: 'gemini-7.7-pro', modelId: 777, stepIndices: [3] }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      const byId = (records: typeof full.records) => new Map(records.map((record) => [record.id, record.model]))
+      expect(incremental.records.find((record) => record.inputTokens === 40)).toMatchObject({ model: 'gemini-8.8-flash' })
+      for (const [id, model] of byId(incremental.records)) expect(byId(full.records).get(id)).toBe(model)
+    })
+
+    it('re-emits earlier usage named by a step even when the cursor later moves back below it', () => {
+      insertStep(20, stepMetadata({ ts: 20_000, usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 2, responseId: 'r20' }) }))
+      insertStep(30, stepMetadata({ ts: 30_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'r30' }) }))
+      insertGeneration(0, generationMetadata({ stepIndices: [30] }))
+      expect(parse().records.map((record) => record.model)).toEqual([`antigravity-model-${UNKNOWN_ID}`, `antigravity-model-${UNKNOWN_ID}`])
+
+      insertStep(31, stepMetadata({ ts: 31_000, modelId: UNKNOWN_ID, modelName: 'gemini-9.9-flash', usage: usage({ input: 31, totalOutput: 3, responseId: 'r31' }) }))
+      insertGeneration(1, generationMetadata({ stepIndices: [31] }))
+      insertStep(5, stepMetadata({ ts: 5_000, usage: usage({ input: 5, totalOutput: 1, responseId: 'r5' }) }))
+      insertGeneration(2, generationMetadata({ stepIndices: [5], usage: usage({ input: 2, totalOutput: 1, responseId: 'r2' }) }))
+      insertStep(6, stepMetadata({ ts: 6_000, usage: usage({ input: 6, totalOutput: 1, responseId: 'r6' }) }))
+      insertGeneration(3, generationMetadata({ stepIndices: [6] }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.records.filter((record) => [20, 30].includes(record.inputTokens)).map((record) => record.model))
+        .toEqual(['gemini-9.9-flash', 'gemini-9.9-flash'])
+      const byId = (records: typeof full.records) => new Map(records.map((record) => [record.id, record.model]))
+      for (const [id, model] of byId(incremental.records)) expect(byId(full.records).get(id)).toBe(model)
+    })
+
     it('keeps the copy a full import keeps when re-emitting a response two earlier rows stored under different ids', () => {
       // The step copy (helper id) and the generation copy (another unknown id)
       // share a response; a full import keeps the step copy. Naming the
