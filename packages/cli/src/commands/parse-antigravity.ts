@@ -398,15 +398,15 @@ function describedBy(named: NamedModel | undefined, modelId: number | undefined)
 }
 
 /**
- * The readable model an event inherits, if any: first an owner (its step, its
- * generation, or the last named generation) whose id equals the event's; then
- * a name that rows elsewhere in this database pair with the event's id; then
- * an owner that carries no id of its own, which can only be assumed to agree.
- * An owner with a different id never lends its name — Antigravity's helper
- * model runs inside conversations driven by another model (#68).
+ * The readable model an event with `modelId` inherits, if any: first an owner
+ * (its step, its generation, or the last named generation) whose id equals the
+ * event's; then a name that rows elsewhere in this database pair with the
+ * event's id; then an owner that carries no id of its own, which can only be
+ * assumed to agree. An owner with a different id never lends its name —
+ * Antigravity's helper model runs inside conversations driven by another
+ * model (#68).
  */
-function inheritedModel(event: UsageEvent, owners: Array<NamedModel | undefined>, learned: Map<number, string>): string | undefined {
-  const modelId = event.usage.modelId
+function inheritedModel(modelId: number | undefined, owners: Array<NamedModel | undefined>, learned: ReadonlyMap<number, string>): string | undefined {
   if (modelId != null) {
     const exact = owners.find((owner) => owner?.model && owner.modelId === modelId)
     if (exact) return exact.model
@@ -522,8 +522,21 @@ function modelForEvent(event: UsageEvent): string {
   return knownModelName(modelId) ?? `antigravity-model-${modelId}`
 }
 
+const NO_LEARNED_MODELS: ReadonlyMap<number, string> = new Map()
+
+function namedModel(event: UsageEvent): NamedModel {
+  return { model: event.model, modelId: event.usage.modelId }
+}
+
 function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
-  target.usage.modelId ??= duplicate.usage.modelId
+  // Two copies of one response can disagree on the model id (a step copy on
+  // the helper model, the generation copy on the conversation's model). The
+  // merged event keeps the first id seen and only a readable name that
+  // describes that id: taking the other copy's name would bill the usage to
+  // the wrong model, the misattribution #68 removes.
+  const modelId = target.usage.modelId ?? duplicate.usage.modelId
+  target.model = inheritedModel(modelId, [namedModel(target), namedModel(duplicate)], NO_LEARNED_MODELS)
+  target.usage.modelId = modelId
   target.usage.inputTokens = Math.max(target.usage.inputTokens, duplicate.usage.inputTokens)
   target.usage.totalOutputTokens = Math.max(target.usage.totalOutputTokens, duplicate.usage.totalOutputTokens)
   target.usage.cacheWriteTokens = Math.max(target.usage.cacheWriteTokens, duplicate.usage.cacheWriteTokens)
@@ -531,7 +544,6 @@ function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
   target.usage.thinkingTokens = Math.max(target.usage.thinkingTokens, duplicate.usage.thinkingTokens)
   target.usage.outputTokens = Math.max(target.usage.outputTokens, duplicate.usage.outputTokens)
   target.usage.identities = [...new Set([...target.usage.identities, ...duplicate.usage.identities])]
-  target.model ??= duplicate.model
   target.owner ??= duplicate.owner
   target.ts = target.ts == null ? duplicate.ts : duplicate.ts == null ? target.ts : Math.min(target.ts, duplicate.ts)
   if (duplicate.sourceKey < target.sourceKey) target.sourceKey = duplicate.sourceKey
@@ -686,7 +698,7 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     previousStep = lastStep
     if (rowEvents.length === 0) continue
     for (const event of rowEvents) {
-      event.model ??= inheritedModel(event, [event.owner, current, lastNamed], learned)
+      event.model ??= inheritedModel(event.usage.modelId, [event.owner, current, lastNamed], learned)
     }
     events.push(...rowEvents)
   }

@@ -601,6 +601,77 @@ describe('parse-antigravity', () => {
       expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
     })
 
+    it('does not let deduplication borrow the readable model of a copy with another id', () => {
+      // The step and generation rows describe the same response but disagree on
+      // its model id; the merged record must not bill the helper model's usage
+      // to Gemini 3.1 Pro just because the generation copy names it.
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'shared', providerMessageId: 'provider-1' }),
+      }))
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        usage: usage({ modelId: 1016, input: 90, totalOutput: 6, responseId: 'shared', providerMessageId: 'provider-1' }),
+        stepIndices: [1],
+      }))
+
+      const result = parse()
+
+      expect(result.errors).toEqual([])
+      expect(result.records).toHaveLength(1)
+      expect(result.records[0]).toMatchObject({ model: 'antigravity-model-1050', provider: 'unknown', costSource: 'unknown', inputTokens: 90 })
+    })
+
+    it('lets deduplication adopt the readable model of a copy whose id is compatible', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        usage: usage({ input: 70, totalOutput: 6, responseId: 'shared' }),
+      }))
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        usage: usage({ modelId: 1016, input: 90, totalOutput: 6, responseId: 'shared' }),
+        stepIndices: [1],
+      }))
+
+      const result = parse()
+
+      expect(result.errors).toEqual([])
+      expect(result.records).toHaveLength(1)
+      expect(result.records[0]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google', inputTokens: 90 })
+    })
+
+    it('prefers the copy whose readable model is paired with the merged id over an id-less assumption', () => {
+      // The step copy carries no id and inherits the conversation model as a
+      // last resort; the generation copy of the same response names its own id.
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        usage: usage({ input: 70, totalOutput: 6, responseId: 'shared' }),
+      }))
+      insertStep(2, stepMetadata({
+        ts: 2_000,
+        modelId: 1050,
+        modelName: 'gemini-3.5-flash',
+        usage: usage({ modelId: 1050, input: 90, totalOutput: 6, responseId: 'shared' }),
+      }))
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        usage: usage({ modelId: 1016, input: 5_000, totalOutput: 400, responseId: 'main' }),
+        stepIndices: [1, 2],
+      }))
+
+      const records = parse().records.sort((a, b) => a.inputTokens - b.inputTokens)
+
+      expect(records).toHaveLength(2)
+      expect(records[0]).toMatchObject({ model: 'gemini-3.5-flash', inputTokens: 90 })
+      expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', inputTokens: 5_000 })
+    })
+
     it('inherits the step model only for events whose id matches the step', () => {
       insertStep(1, stepMetadata({
         ts: 1_000,
