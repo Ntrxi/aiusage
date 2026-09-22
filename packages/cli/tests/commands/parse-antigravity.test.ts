@@ -554,6 +554,30 @@ describe('parse-antigravity', () => {
       expect(records).toEqual(['gemini-3.5-flash-high', 'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-4-flash-a'])
     })
 
+    it('lets a slug refine the row\'s identity but not generalise it or name a routing slot in its family', () => {
+      insertGeneration(0, generationMetadata({
+        // Less specific than the id's model: Lite must not be billed as Flash.
+        model: 'gemini-2.5-flash',
+        modelId: 330,
+        usage: usage({ modelId: 330, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        // A routing slot of the same family still defers to the exact id reference.
+        model: 'gemini-3.5-flash-a',
+        placeholder: 'MODEL_PLACEHOLDER_M132',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+      insertGeneration(2, generationMetadata({
+        model: 'gemini-2.5-flash-thinking',
+        modelId: 312,
+        usage: usage({ modelId: 312, input: 20, totalOutput: 5, responseId: 'r2' }),
+      }))
+
+      const records = parse().records.map((record) => record.model)
+
+      expect(records).toEqual(['gemini-2.5-flash-lite', 'gemini-3.5-flash-high', 'gemini-2.5-flash-thinking'])
+    })
+
     it('resolves a step\'s model with the same precedence as a generation', () => {
       // A routing alias or an opaque string beside a known id never outranks the
       // id, and never becomes the name every event with that id inherits.

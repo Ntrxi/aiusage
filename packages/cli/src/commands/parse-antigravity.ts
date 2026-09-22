@@ -329,25 +329,29 @@ function geminiLabelSlug(label: string | undefined): string | undefined {
   return ['gemini', version, ...family.trim().split(' ')].join('-')
 }
 
+/** Routing-slot names Antigravity mints (`gemini-default`, `gemini-pro-agent`, `gemini-3-flash-a`), whatever the current table knows. */
+const ROUTING_SLOT_SHAPE = /-(?:default|agent(?:-[a-z])?|[a-z])$/i
+
 /** A machine-readable model name Antigravity assigned (`gemini-3.8-flash`, `gemini-3.8-flash-high`), as opposed to a routing alias or placeholder. */
 function isVersionedModelName(value: string): boolean {
-  return /\d/.test(value) && !isPlaceholder(value) && routingAlias(value) == null
+  return /\d/.test(value) && !isPlaceholder(value) && routingAlias(value) == null && !ROUTING_SLOT_SHAPE.test(value)
 }
 
 const EFFORT_SUFFIX = /-(?:extra-low|low|medium|high)$/
 
 /**
- * Whether two model names denote the same model family: one name's segments
- * prefix the other's once effort qualifiers are dropped, so
- * `gemini-3.5-flash-high` matches `gemini-3.5-flash-medium` and
- * `gemini-3.7-flash-safety-le` matches `gemini-3.7-flash`, while
- * `gemini-3-flash-d` does not match `gemini-3.5-flash-high`.
+ * Whether `own` names the same model as `identity`, at most more precisely:
+ * once effort qualifiers are dropped, the identity's segments prefix the
+ * name's. `gemini-3.5-flash-high` refines `gemini-3.5-flash-medium` and
+ * `gemini-3.7-flash-safety-le` refines `gemini-3.7-flash`; `gemini-3-flash-d`
+ * does not refine `gemini-3.5-flash-high`, and neither does the less specific
+ * `gemini-2.5-flash` refine `gemini-2.5-flash-lite`.
  */
-function sameModelFamily(a: string, b: string): boolean {
-  const [shorter, longer] = [a, b]
+function refinesModel(own: string, identity: string): boolean {
+  const [ownSegments, identitySegments] = [own, identity]
     .map((name) => name.toLowerCase().replace(EFFORT_SUFFIX, '').split('-'))
-    .sort((x, y) => x.length - y.length)
-  return shorter.every((segment, index) => segment === longer[index])
+  return ownSegments.length >= identitySegments.length
+    && identitySegments.every((segment, index) => segment === ownSegments[index])
 }
 
 /** A versioned model name of a known provider; gates values whose storage layout is inferred rather than observed. */
@@ -381,10 +385,12 @@ interface ModelCandidates {
  *     `gemini-3.5-flash-high`) — when it agrees with the row's identity, so
  *     it refines the identity with an effort or variant qualifier but never
  *     contradicts it: Antigravity also mints routing-slot names that look
- *     versioned (`gemini-3-flash-d`), and only the ones in the routing table
- *     are recognised as such;
+ *     versioned (`gemini-3-flash-d`), and not all of them are in the routing
+ *     table;
  *  2. the row's identity from the placeholder or the label;
- *  3. the known numeric-id table;
+ *  3. the known numeric-id table — which also means that a slug on a row
+ *     whose only identity is a known id defers to the table, so an entry that
+ *     is wrong (rather than merely missing) would be sticky for such rows;
  *  4. the executor model, canonical or verbatim when versioned
  *     (`gemini-3.8-flash-high`) — it names the executor, which is not always
  *     the row's own model, so it never outranks the row's slug, label or id;
@@ -408,7 +414,7 @@ function resolveModel(candidates: ModelCandidates): Pick<NamedModel, 'model' | '
   const stated = canonicalModel(placeholder) ?? canonicalModel(label) ?? geminiLabelSlug(label)
   const known = modelId != null ? knownModelName(modelId) : undefined
   const identity = stated ?? known
-  return (own && (identity == null || sameModelFamily(own, identity)) ? stored(own) : undefined)
+  return (own && (identity == null || refinesModel(own, identity)) ? stored(own) : undefined)
     ?? stored(stated)
     ?? inferred(known)
     ?? stored(canonicalModel(executor) ?? versioned(executor))
