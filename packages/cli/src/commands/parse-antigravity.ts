@@ -582,8 +582,10 @@ function mergeIdentities(target: UsageEvent, duplicate: UsageEvent): void {
 
 /**
  * Folds a second copy of the same response into `target`. Copies that agree on
- * the model id (or where one carries none) merge field by field, and the
- * readable name paired with that id wins over one assumed from an id-less row.
+ * the model id (or where one carries none) merge field by field; when the
+ * merged event has an id, only a readable name paired with that id is kept —
+ * a name an id-less copy inherited from its surroundings would attach another
+ * id's model — and only when neither copy has an id does any name do.
  * Copies that disagree on the id (a step copy on the helper model, the
  * generation copy on the conversation's model) cannot both be right and
  * nothing in the database says which is: the copy seen first is kept whole,
@@ -604,8 +606,9 @@ function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
     { model: target.model, modelId: targetId },
     { model: duplicate.model, modelId: duplicateId },
   ]
-  target.model = copies.find((copy) => copy.model && copy.modelId === modelId)?.model
-    ?? copies.find((copy) => copy.model)?.model
+  target.model = modelId == null
+    ? copies.find((copy) => copy.model)?.model
+    : copies.find((copy) => copy.model && copy.modelId === modelId)?.model
   target.usage.modelId = modelId
   target.usage.inputTokens = Math.max(target.usage.inputTokens, duplicate.usage.inputTokens)
   target.usage.totalOutputTokens = Math.max(target.usage.totalOutputTokens, duplicate.usage.totalOutputTokens)
@@ -809,19 +812,32 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // the earlier ones in place and an incremental import ends where a full
   // import would.
   const lastNamed = [...settled].reverse().find((window) => window.generation.model)?.generation
-  const events: UsageEvent[] = []
+  // The generation an event is named after when its own row does not name
+  // it: the last named generation at or before the one whose window covers
+  // it — or, for a step some generation links explicitly, at or before that
+  // generation, since a step linked by a later generation sits in an earlier
+  // window (see above).
+  const currentAt = new Map<number, NamedModel | undefined>()
+  const linkedBy = new Map<number, GenerationMetadata>()
   let current: NamedModel | undefined
-  for (const { generation, stepIndices, linkedTs } of settled) {
+  for (const { generation } of settled) {
     if (generation.model) current = generation
-    const rowEvents: UsageEvent[] = [
-      ...stepIndices.flatMap((index) => steps.get(index)!.events.map((event) => ({ ...event, fresh: processedSteps.has(index) }))),
-      ...generation.events.map((event) => ({ ...event, ts: event.ts ?? linkedTs, fresh: generation.index >= firstIndex })),
+    currentAt.set(generation.index, current)
+    for (const index of generation.stepIndices) if (!linkedBy.has(index)) linkedBy.set(index, generation)
+  }
+  const events: UsageEvent[] = []
+  for (const { generation, stepIndices, linkedTs } of settled) {
+    const rowEvents: Array<[UsageEvent, NamedModel | undefined]> = [
+      ...stepIndices.flatMap((index) => steps.get(index)!.events.map((event): [UsageEvent, NamedModel | undefined] =>
+        [{ ...event, fresh: processedSteps.has(index) }, currentAt.get((linkedBy.get(index) ?? generation).index)])),
+      ...generation.events.map((event): [UsageEvent, NamedModel | undefined] =>
+        [{ ...event, ts: event.ts ?? linkedTs, fresh: generation.index >= firstIndex }, currentAt.get(generation.index)]),
     ]
-    for (const event of rowEvents) {
-      event.model = inheritedModel(event.usage.modelId, event.owner, [current, lastNamed], learned)
-      event.namedByLast = event.model != null && inheritedModel(event.usage.modelId, event.owner, [current], learned) !== event.model
+    for (const [event, context] of rowEvents) {
+      event.model = inheritedModel(event.usage.modelId, event.owner, [context, lastNamed], learned)
+      event.namedByLast = event.model != null && inheritedModel(event.usage.modelId, event.owner, [context], learned) !== event.model
+      events.push(event)
     }
-    events.push(...rowEvents)
   }
 
   // Ids first named by a row this import processed. Usage imported earlier
