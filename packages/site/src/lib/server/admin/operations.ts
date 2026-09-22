@@ -248,16 +248,29 @@ export async function syncPricingFromLitellm(adminUserId: string): Promise<{ add
     // gemini-3.1-pro → gemini-3.1-pro-preview, issue #69). Added only when the
     // target price exists, no price is registered under the alias name itself
     // (an alias would shadow it) and no alias of that name exists yet; an
-    // alias seeded here is removed once a real price appears under its name.
+    // alias seeded here is removed once a real price appears under its name
+    // and follows the curated list when its target changes. Only rows with
+    // origin 'builtin' and source 'aiusage' are touched (the LiteLLM aliases
+    // above carry source 'litellm').
     for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
       await tx`
         DELETE FROM model_price_aliases
-        WHERE alias = ${alias} AND model_key = ${modelKey} AND origin = 'builtin' AND source = 'aiusage'
+        WHERE alias = ${alias} AND origin = 'builtin' AND source = 'aiusage'
           AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${alias} AND status = 'active')
       `
+      const retargeted = await tx`
+        UPDATE model_price_aliases
+        SET model_key = ${modelKey},
+            provider = (SELECT provider FROM model_prices WHERE model_key = ${modelKey}),
+            updated_at = NOW()
+        WHERE alias = ${alias} AND origin = 'builtin' AND source = 'aiusage' AND model_key <> ${modelKey}
+          AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${modelKey} AND status = 'active')
+        RETURNING alias
+      `
+      if (retargeted.length > 0) aliasesUpdated++
       const inserted = await tx`
         INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled)
-        SELECT ${alias}, model_key, 'exact', provider, 100, 'aiusage', 'builtin', TRUE
+        SELECT ${alias}::text, model_key, 'exact', provider, 100, 'aiusage', 'builtin', TRUE
         FROM model_prices
         WHERE model_key = ${modelKey} AND status = 'active'
           AND NOT EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${alias} AND status = 'active')

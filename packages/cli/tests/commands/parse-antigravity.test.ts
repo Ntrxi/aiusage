@@ -472,6 +472,64 @@ describe('parse-antigravity', () => {
       expect(records[1]).toMatchObject({ model: `antigravity-model-${UNKNOWN_ID + 1}`, provider: 'unknown' })
     })
 
+    it('ranks the executor model below the row\'s own label and known id', () => {
+      // The executor (field 3 → 28) is not always the chat model: real rows pair
+      // a routing-alias slug with a Flash executor. It must neither name the
+      // generation nor be learned for the generation's id.
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        executorModel: 'gemini-3.6-flash-high',
+        usage: usage({ modelId: 1016, input: 5_000, totalOutput: 400, responseId: 'r0' }),
+      }))
+      insertStep(2, stepMetadata({ ts: 2_000, usage: usage({ modelId: 1016, input: 30, totalOutput: 3, responseId: 'r1' }) }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: UNKNOWN_ID,
+        executorModel: 'gemini-3.6-flash-high',
+        usage: usage({ modelId: UNKNOWN_ID, input: 40, totalOutput: 4, responseId: 'r2' }),
+        stepIndices: [2],
+      }))
+
+      const records = parse().records.map((record) => [record.inputTokens, record.model])
+
+      // Without a label or known id, the executor still beats the routing alias.
+      expect(records).toEqual([[5_000, 'gemini-3.1-pro'], [30, 'gemini-3.1-pro'], [40, 'gemini-3.6-flash-high']])
+    })
+
+    it('prefers the row\'s own versioned slug over its placeholder', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3.5-flash-high',
+        placeholder: 'MODEL_PLACEHOLDER_M20',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+
+      expect(parse().records[0]).toMatchObject({ model: 'gemini-3.5-flash-high', provider: 'google', costSource: 'pricing' })
+    })
+
+    it('resolves a step\'s model with the same precedence as a generation', () => {
+      // A routing alias or an opaque string beside a known id never outranks the
+      // id, and never becomes the name every event with that id inherits.
+      insertStep(1, stepMetadata({ ts: 1_000, modelId: 1318, modelName: 'gemini-default', usage: usage({ input: 10, totalOutput: 1, responseId: 'r0' }) }))
+      insertStep(2, stepMetadata({ ts: 2_000, modelId: 1318, modelName: 'AUTO', usage: usage({ input: 20, totalOutput: 2, responseId: 'r1' }) }))
+      insertStep(3, stepMetadata({ ts: 3_000, usage: usage({ modelId: 1318, input: 30, totalOutput: 3, responseId: 'r2' }) }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1, 2, 3] }))
+
+      const records = parse().records.map((record) => [record.inputTokens, record.model])
+
+      expect(records).toEqual([[10, 'gemini-3.8-flash'], [20, 'gemini-3.8-flash'], [30, 'gemini-3.8-flash']])
+    })
+
+    it('prefers a known id over an owning row that stores no id', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3.8-flash',
+        usage: usage({ modelId: 246, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+
+      expect(parse().records[0]).toMatchObject({ model: 'gemini-2.5-pro', provider: 'google' })
+    })
+
     it('resolves MODEL_PLACEHOLDER labels through the numeric id table', () => {
       // No numeric id anywhere: only the placeholder can name these rows.
       insertGeneration(0, generationMetadata({
@@ -675,7 +733,7 @@ describe('parse-antigravity', () => {
       expect(incremental).toEqual([[30, 'gemini-3.8-flash']])
     })
 
-    it('learns a name stored beside the id before one inferred from the executor_metadata table', () => {
+    it('names a row from a table only until another row stores a name beside the same id', () => {
       db.prepare('INSERT INTO executor_metadata (idx, data) VALUES (?, ?)').run(0, executorMetadata('gemini-3.8-flash-high'))
       insertGeneration(0, generationMetadata({
         modelId: UNKNOWN_ID,
@@ -699,10 +757,11 @@ describe('parse-antigravity', () => {
 
       const records = parse().records.map((record) => [record.inputTokens, record.model])
 
-      // Generation 0 keeps the executor model it was named from; the id-only step
-      // usage takes the name a step row stores beside the id, not the inferred one.
+      // The step row stores a name beside the id, so the id carries that one name
+      // throughout the database, including on the generation that was only
+      // named from the executor_metadata table.
       expect(records).toEqual([
-        [10, 'gemini-3.8-flash-high'],
+        [10, 'gemini-3.8-flash'],
         [20, 'gemini-3.8-flash'],
         [30, 'gemini-3.8-flash'],
         [40, 'gemini-2.5-pro'],

@@ -52,14 +52,14 @@ interface UsageEvent {
 interface NamedModel {
   model?: string
   modelId?: number
+  /** The name came from a table (the numeric-id table, `executor_metadata`) rather than from a name the row stores. */
+  inferred?: boolean
 }
 
 interface GenerationMetadata extends NamedModel {
   index: number
   stepIndices: number[]
   events: UsageEvent[]
-  /** The model was inferred from the `executor_metadata` table rather than read from the row. */
-  inferred: boolean
 }
 
 interface StepMetadata extends NamedModel {
@@ -205,6 +205,8 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'gpt-oss 120b': 'gpt-oss-120b-medium',
   'model_openai_gpt_oss_120b_medium': 'gpt-oss-120b-medium',
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
+  'claude-4.5-sonnet': 'claude-sonnet-4-5',
+  'claude-4.5-haiku': 'claude-haiku-4-5',
   'gemini-3-flash': 'gemini-3-flash-preview',
   'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
 }
@@ -338,13 +340,6 @@ function isModelShaped(value: string): boolean {
   return value.length <= 64 && /^[a-z][a-z0-9._-]*$/i.test(value) && inferProvider(value.toLowerCase()) !== 'unknown' && isVersionedModelName(value)
 }
 
-/** Canonical name when known, otherwise the name as Antigravity wrote it (never a bare placeholder). */
-function normalizeModel(value: string | undefined): string | undefined {
-  const model = cleanModel(value)
-  if (!model) return undefined
-  return canonicalModel(model) ?? geminiLabelSlug(model) ?? routingAlias(model) ?? (isPlaceholder(model) ? undefined : model)
-}
-
 interface ModelCandidates {
   modelId?: number
   /** Model slug Antigravity selected (chat model field 19): a versioned name, a routing alias or a placeholder. */
@@ -360,18 +355,22 @@ interface ModelCandidates {
 }
 
 /**
- * Names a generation from the metadata Antigravity stores with it. Precedence:
- *  1. a readable name that maps to a known canonical model — the placeholder
- *     first, as an exact id reference (`MODEL_PLACEHOLDER_M<n>` through the id
- *     table), then the slug, executor model and display label (`(Thinking)`
- *     variants, labels, name normalisations);
- *  2. the slug or executor model verbatim when it is a versioned model name
- *     Antigravity assigned (`gemini-3.8-flash`, `gemini-3.8-flash-high`);
- *  3. the display label slugified (`Gemini 3.8 Flash (High)` → `gemini-3.8-flash`);
+ * Names a row (a generation, or a step) from the metadata Antigravity stores
+ * with it. Precedence:
+ *  1. the slug when it maps to a known canonical model (`(Thinking)` variants,
+ *     name normalisations), else verbatim when it is a versioned model name
+ *     Antigravity assigned (`gemini-3.8-flash`, `gemini-3.5-flash-high`);
+ *  2. the placeholder as an exact id reference (`MODEL_PLACEHOLDER_M<n>`
+ *     through the id table);
+ *  3. the display label when it maps to a known canonical model, else
+ *     slugified (`Gemini 3.8 Flash (High)` → `gemini-3.8-flash`);
  *  4. the known numeric-id table;
- *  5. a routing alias (`gemini-default`), whose target moves between releases;
- *  6. the `executor_metadata` table's value when it is model-shaped;
- *  7. any remaining readable name verbatim (never a bare placeholder).
+ *  5. the executor model, canonical or verbatim when versioned
+ *     (`gemini-3.8-flash-high`) — it names the executor, which is not always
+ *     the row's own model, so it never outranks the row's slug, label or id;
+ *  6. a routing alias (`gemini-default`), whose target moves between releases;
+ *  7. the `executor_metadata` table's value when it is model-shaped;
+ *  8. any remaining readable name verbatim (never a bare placeholder).
  * A numeric id nobody knows never displaces a readable name; the caller falls
  * back to `antigravity-model-<id>` only when nothing readable exists (#68).
  */
@@ -380,17 +379,21 @@ function resolveModel(candidates: ModelCandidates): string | undefined {
   const slug = cleanModel(candidates.slug)
   const executor = cleanModel(candidates.executor)
   const tableExecutor = cleanModel(candidates.tableExecutor)
-  const machineNames = [slug, executor].filter((name): name is string => name != null)
-  for (const name of [placeholder, slug, executor, label]) {
-    const canonical = canonicalModel(name)
-    if (canonical) return canonical
-  }
-  return machineNames.find(isVersionedModelName)
-    ?? geminiLabelSlug(label)
+  const versioned = (name: string | undefined): string | undefined => name && isVersionedModelName(name) ? name : undefined
+  return canonicalModel(slug) ?? versioned(slug)
+    ?? canonicalModel(placeholder)
+    ?? canonicalModel(label) ?? geminiLabelSlug(label)
     ?? (modelId != null ? knownModelName(modelId) : undefined)
-    ?? machineNames.map(routingAlias).find(Boolean)
+    ?? canonicalModel(executor) ?? versioned(executor)
+    ?? [slug, executor].map(routingAlias).find(Boolean)
     ?? (tableExecutor && isModelShaped(tableExecutor) ? tableExecutor : undefined)
-    ?? [...machineNames, cleanModel(label)].find((name): name is string => name != null && !isPlaceholder(name))
+    ?? [slug, executor, cleanModel(label)].find((name): name is string => name != null && !isPlaceholder(name))
+}
+
+/** The row's model, flagged when it came from a table rather than from a name the row stores. */
+function namedFrom(candidates: ModelCandidates): Pick<NamedModel, 'model' | 'inferred'> {
+  const model = resolveModel(candidates)
+  return { model, inferred: model != null && model !== resolveModel({ ...candidates, modelId: undefined, tableExecutor: undefined }) }
 }
 
 /** The readable model of `named` when it can describe an event with `modelId`: the ids match, or either side has none. */
@@ -404,18 +407,19 @@ function describedBy(named: NamedModel | undefined, modelId: number | undefined)
  * (the step or generation row it was read from) or a surrounding generation
  * (the current one, then the last named one) whose id equals the event's;
  * then a name that rows elsewhere in this database pair with the event's id;
- * then the owner alone when it carries no id, since a row can only be assumed
- * to agree with the usage stored inside it. An event without an id takes the
- * first readable name among owner and context. A row with a different id, or
- * a surrounding generation with none, never lends its name — Antigravity's
- * helper model runs inside conversations driven by another model (#68).
+ * then the known-id table; then the owner alone when it carries no id, since
+ * a row can only be assumed to agree with the usage stored inside it. An
+ * event without an id takes the first readable name among owner and context.
+ * A row with a different id, or a surrounding generation with none, never
+ * lends its name — Antigravity's helper model runs inside conversations
+ * driven by another model (#68).
  */
 function inheritedModel(modelId: number | undefined, owner: NamedModel | undefined, context: Array<NamedModel | undefined>, learned: ReadonlyMap<number, string>): string | undefined {
   const rows = [owner, ...context]
   if (modelId == null) return rows.find((row) => row?.model)?.model
   const exact = rows.find((row) => row?.model && row.modelId === modelId)
   if (exact) return exact.model
-  return learned.get(modelId) ?? describedBy(owner, modelId)
+  return learned.get(modelId) ?? knownModelName(modelId) ?? describedBy(owner, modelId)
 }
 
 function modelEnum(chatModel: ProtoField[]): string | undefined {
@@ -470,48 +474,47 @@ function parseGeneration(index: number, data: Buffer, tableExecutor?: string): G
   const slug = firstString(chatModel, [19])
   const placeholder = modelEnum(chatModel)
   const modelId = (firstVarint(chatModel, 3) || undefined) ?? placeholderModelId(placeholder) ?? placeholderModelId(slug)
-  const candidates: ModelCandidates = {
-    modelId,
-    slug,
-    executor: firstString(firstMessage(metadata, 3), [28]),
-    placeholder,
-    label: firstString(chatModel, [21, 22]),
-  }
-  const model = resolveModel({ ...candidates, tableExecutor })
   const ts = generationTimestamp(chatModel)
-  const owner: NamedModel = { model, modelId }
-  return {
+  const generation: GenerationMetadata = {
     index,
     modelId,
-    model,
-    inferred: model != null && model !== resolveModel(candidates),
-    stepIndices: repeatedVarints(metadata, 2),
-    // A usage row stored inside the chat model belongs to that model; give it
-    // the generation's id when it carries none (a placeholder-derived id too).
-    events: usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts).map((event) => {
-      event.usage.modelId ??= modelId
-      return { ...event, owner }
+    ...namedFrom({
+      modelId,
+      slug,
+      executor: firstString(firstMessage(metadata, 3), [28]),
+      tableExecutor,
+      placeholder,
+      label: firstString(chatModel, [21, 22]),
     }),
+    stepIndices: repeatedVarints(metadata, 2),
+    events: [],
   }
+  // A usage row stored inside the chat model belongs to that model; give it
+  // the generation's id when it carries none (a placeholder-derived id too).
+  generation.events = usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts).map((event) => {
+    event.usage.modelId ??= modelId
+    return { ...event, owner: generation }
+  })
+  return generation
 }
 
 function parseStep(index: number, data: Buffer): StepMetadata {
   const metadata = readFields(data)
   const modelInfo = firstMessage(metadata, 24)
   const modelId = firstVarint(modelInfo, 1) || undefined
-  const model = normalizeModel(firstString(modelInfo, [12, 8]))
   const ts = timestampFromFields(firstMessage(metadata, 8))
     ?? timestampFromFields(firstMessage(metadata, 1))
-  const owner: NamedModel = { model, modelId }
-  return {
+  const step: StepMetadata = {
     ts,
     modelId,
-    model,
-    events: usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
-      event.usage.modelId ??= modelId
-      return { ...event, owner }
-    }),
+    ...namedFrom({ modelId, slug: firstString(modelInfo, [12]), label: firstString(modelInfo, [8]) }),
+    events: [],
   }
+  step.events = usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
+    event.usage.modelId ??= modelId
+    return { ...event, owner: step }
+  })
+  return step
 }
 
 /** The model an event is billed to: its inherited readable name, else the known-id table, else a placeholder. */
@@ -558,7 +561,6 @@ function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
   target.usage.thinkingTokens = Math.max(target.usage.thinkingTokens, duplicate.usage.thinkingTokens)
   target.usage.outputTokens = Math.max(target.usage.outputTokens, duplicate.usage.outputTokens)
   mergeIdentities(target, duplicate)
-  target.owner ??= duplicate.owner
   target.ts = target.ts == null ? duplicate.ts : duplicate.ts == null ? target.ts : Math.min(target.ts, duplicate.ts)
   if (duplicate.sourceKey < target.sourceKey) target.sourceKey = duplicate.sourceKey
   target.lineOffset = Math.min(target.lineOffset, duplicate.lineOffset)
@@ -687,15 +689,18 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // Numeric ids this database pairs with readable names: an event whose id is
   // named only elsewhere in the database (a helper model, a retry on another
   // model) is named from those rows rather than from the hard-coded table.
-  // Names a row stores beside its id are learned first, in row order, so a
-  // name only inferred from the executor_metadata table never outranks them.
+  // Names a row stores beside its id are learned first, in row order; a name a
+  // row took from a table only for ids nothing else names. A row named only
+  // from a table then takes the stored name, so one id carries one name
+  // throughout the database.
   const learned = new Map<number, string>()
   const learn = (named: NamedModel): void => {
     if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)
   }
-  for (const generation of generations) if (!generation.inferred) learn(generation)
-  for (const step of steps.values()) learn(step)
-  for (const generation of generations) if (generation.inferred) learn(generation)
+  const namedRows: NamedModel[] = [...generations, ...steps.values()]
+  for (const row of namedRows) if (!row.inferred) learn(row)
+  for (const row of namedRows) if (row.inferred) learn(row)
+  for (const row of namedRows) if (row.inferred && row.modelId != null) row.model = learned.get(row.modelId) ?? row.model
 
   const events: UsageEvent[] = []
   let current: NamedModel | undefined = generations

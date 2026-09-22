@@ -87,6 +87,28 @@ describe('curated pricing aliases (issue #69)', () => {
     expect(resolvePrice('gemini-3.1-pro')).toMatchObject({ input: 1, output: 5 })
   })
 
+  it('retargets an alias it seeded when the curated target changes, leaving other aliases alone', () => {
+    insertPrice('gemini-3.1-pro-preview', 2, 12)
+    insertPrice('gemini-3-pro-preview', 1, 6)
+    const now = Date.now()
+    const insertAlias = db.prepare(`
+      INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled, created_at, updated_at)
+      VALUES (?, ?, 'exact', 'google', 100, ?, ?, 1, ?, ?)
+    `)
+    // Seeded by an earlier release that pointed the alias elsewhere.
+    insertAlias.run('gemini-3.1-pro', 'gemini-3-pro-preview', 'aiusage', 'builtin', now, now)
+    // A user binding and a LiteLLM-synced alias with the same shape are never touched.
+    insertAlias.run('gemini-3.1-pro-high', 'gemini-3-pro-preview', 'manual', 'user', now, now)
+    insertAlias.run('gemini-3.1-pro-low', 'gemini-3-pro-preview', 'litellm', 'builtin', now, now)
+
+    expect(ensureCuratedPricingAliases(db)).toBe(3)
+
+    expect(aliasRow('gemini-3.1-pro')).toMatchObject({ model_key: 'gemini-3.1-pro-preview', origin: 'builtin', source: 'aiusage' })
+    expect(aliasRow('gemini-3.1-pro-high')).toMatchObject({ model_key: 'gemini-3-pro-preview', origin: 'user' })
+    expect(aliasRow('gemini-3.1-pro-low')).toMatchObject({ model_key: 'gemini-3-pro-preview', source: 'litellm' })
+    expect(resolvePriceFromRegistry(db, 'gemini-3.1-pro')).toMatchObject({ input: 2, output: 12 })
+  })
+
   it('does not resurrect a disabled alias', () => {
     insertPrice('gemini-3.1-pro-preview', 2, 12)
     const now = Date.now()
