@@ -454,30 +454,109 @@ describe('parse-antigravity', () => {
       expect(record.cost).toBeGreaterThan(0)
     })
 
-    it('falls back to the executor_metadata table for the same generation index', () => {
+    it('falls back to a model-shaped value in the executor_metadata table for the same generation index', () => {
       db.prepare('INSERT INTO executor_metadata (idx, data) VALUES (?, ?)').run(0, executorMetadata('gemini-3.8-flash-high'))
+      db.prepare('INSERT INTO executor_metadata (idx, data) VALUES (?, ?)').run(1, executorMetadata('C:/Users/dev/session-42.log'))
       insertGeneration(0, generationMetadata({
         modelId: UNKNOWN_ID,
-        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5 }),
+        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        modelId: UNKNOWN_ID + 1,
+        usage: usage({ modelId: UNKNOWN_ID + 1, input: 20, totalOutput: 5, responseId: 'r1' }),
       }))
 
-      expect(parse().records[0]).toMatchObject({ model: 'gemini-3.8-flash-high', provider: 'google' })
+      const records = parse().records
+
+      expect(records[0]).toMatchObject({ model: 'gemini-3.8-flash-high', provider: 'google' })
+      expect(records[1]).toMatchObject({ model: `antigravity-model-${UNKNOWN_ID + 1}`, provider: 'unknown' })
     })
 
     it('resolves MODEL_PLACEHOLDER labels through the numeric id table', () => {
+      // No numeric id anywhere: only the placeholder can name these rows.
       insertGeneration(0, generationMetadata({
         placeholder: 'MODEL_PLACEHOLDER_M318',
-        usage: usage({ modelId: 1318, input: 20, totalOutput: 5, responseId: 'r0' }),
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
       }))
       insertGeneration(1, generationMetadata({
-        placeholder: 'MODEL_PLACEHOLDER_M16',
-        usage: usage({ modelId: 1016, input: 20, totalOutput: 5, responseId: 'r1' }),
+        model: 'MODEL_PLACEHOLDER_M16',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r1' }),
       }))
 
       const records = parse().records
 
       expect(records.map((record) => record.model)).toEqual(['gemini-3.8-flash', 'gemini-3.1-pro'])
       expect(records.map((record) => record.provider)).toEqual(['google', 'google'])
+    })
+
+    it('never reports an unknown placeholder verbatim and derives its numeric id instead', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'MODEL_PLACEHOLDER_M999',
+        placeholder: 'MODEL_PLACEHOLDER_M999',
+        usage: usage({ input: 20, totalOutput: 5 }),
+      }))
+
+      expect(parse().records[0]).toMatchObject({ model: 'antigravity-model-1999', provider: 'unknown', costSource: 'unknown' })
+    })
+
+    it('lets the row\'s own label or known id outrank a routing alias', () => {
+      // A routing alias points at whatever Antigravity's default slot serves today;
+      // the label and the numeric id describe what actually ran.
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-default',
+        label: 'Gemini 3.8 Flash (High)',
+        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-default',
+        modelId: 1318,
+        usage: usage({ modelId: 1318, input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+      insertGeneration(2, generationMetadata({
+        model: 'gemini-default',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r2' }),
+      }))
+
+      const records = parse().records
+
+      expect(records.map((record) => record.model)).toEqual(['gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-medium'])
+    })
+
+    it('resolves renamed Claude 4.5 ids to priceable model names', () => {
+      insertGeneration(0, generationMetadata({ usage: usage({ modelId: 333, input: 20, totalOutput: 5, responseId: 'r0' }) }))
+      insertGeneration(1, generationMetadata({ usage: usage({ modelId: 340, input: 20, totalOutput: 5, responseId: 'r1' }) }))
+
+      const records = parse().records
+
+      expect(records.map((record) => [record.model, record.provider])).toEqual([
+        ['claude-sonnet-4-5', 'anthropic'],
+        ['claude-haiku-4-5', 'anthropic'],
+      ])
+    })
+
+    it('prefers a name the database pairs with the id over an owner that has no id', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3.8-flash',
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      // A generation that names its model but stores no id runs the helper model on a step.
+      insertStep(3, stepMetadata({ ts: 3_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'helper' }) }))
+      insertStep(4, stepMetadata({ ts: 4_000, usage: usage({ modelId: 1050, input: 40, totalOutput: 4, responseId: 'unnamed' }) }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-3.1-pro',
+        usage: usage({ input: 20, totalOutput: 2, responseId: 'r1' }),
+        stepIndices: [3, 4],
+      }))
+
+      const records = parse().records
+
+      expect(records.map((record) => [record.inputTokens, record.model])).toEqual([
+        [10, 'gemini-3.8-flash'],
+        [30, 'gemini-3.8-flash'],
+        [40, 'gemini-3.1-pro'],
+        [20, 'gemini-3.1-pro'],
+      ])
     })
 
     it('names a numeric id from the rows of the same database that spell it out', () => {
@@ -591,17 +670,17 @@ describe('parse-antigravity', () => {
       expect(parse().records[0]).toMatchObject({ model: 'gemini-3.8-flash', provider: 'google' })
     })
 
-    it('slugifies Gemini display labels and routing defaults when no slug is stored', () => {
+    it('slugifies Gemini display labels without their effort qualifier when no slug is stored', () => {
       insertGeneration(0, generationMetadata({
         label: 'Gemini 3.5 Flash (Medium)',
         usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5, responseId: 'r0' }),
       }))
       insertGeneration(1, generationMetadata({
-        model: 'gemini-default',
-        usage: usage({ modelId: 1020, input: 20, totalOutput: 5, responseId: 'r1' }),
+        label: 'Gemini 4 Pro',
+        usage: usage({ modelId: UNKNOWN_ID + 1, input: 20, totalOutput: 5, responseId: 'r1' }),
       }))
 
-      expect(parse().records.map((record) => record.model)).toEqual(['gemini-3.5-flash-medium', 'gemini-3.5-flash-medium'])
+      expect(parse().records.map((record) => record.model)).toEqual(['gemini-3.5-flash', 'gemini-4-pro'])
     })
 
     it('keeps record ids stable when the model attribution changes', () => {

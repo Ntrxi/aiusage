@@ -9,14 +9,14 @@ describe('curated pricing aliases (issue #69)', () => {
   const runtimeBase = getBasePriceTable()
   const runtimeOverrides = getUserOverrides()
 
-  function insertPrice(modelKey: string, input: number, output: number): void {
+  function insertPrice(modelKey: string, input: number, output: number, status = 'active'): void {
     const now = Date.now()
     db.prepare(`
       INSERT INTO model_prices (
         model_key, provider, input, output, cache_read, cache_write, currency, source, source_model_id,
         source_url, origin, status, last_synced_at, created_at, updated_at
-      ) VALUES (?, 'gemini', ?, ?, NULL, NULL, 'USD', 'litellm', ?, NULL, 'builtin', 'active', ?, ?, ?)
-    `).run(modelKey, input, output, modelKey, now, now, now)
+      ) VALUES (?, 'gemini', ?, ?, NULL, NULL, 'USD', 'litellm', ?, NULL, 'builtin', ?, ?, ?, ?)
+    `).run(modelKey, input, output, modelKey, status, now, now, now)
   }
 
   function aliasRow(alias: string): { model_key: string; origin: string; source: string } | undefined {
@@ -53,6 +53,35 @@ describe('curated pricing aliases (issue #69)', () => {
     expect(aliasRow('gemini-3.1-pro-low')).toMatchObject({ model_key: 'gemini-3.1-pro-preview' })
     expect(aliasRow('gemini-3-pro')).toBeUndefined()
     expect(ensureCuratedPricingAliases(db)).toBe(0)
+  })
+
+  it('ignores inactive target prices', () => {
+    insertPrice('gemini-3.1-pro-preview', 2, 12, 'retired')
+
+    expect(ensureCuratedPricingAliases(db)).toBe(0)
+    expect(aliasRow('gemini-3.1-pro')).toBeUndefined()
+  })
+
+  it('does not shadow a real price registered under the alias name', () => {
+    insertPrice('gemini-3.1-pro-preview', 2, 12)
+    insertPrice('gemini-3.1-pro', 1, 5)
+
+    expect(ensureCuratedPricingAliases(db)).toBe(2)
+    expect(aliasRow('gemini-3.1-pro')).toBeUndefined()
+    expect(aliasRow('gemini-3.1-pro-high')).toMatchObject({ model_key: 'gemini-3.1-pro-preview' })
+    expect(resolvePriceFromRegistry(db, 'gemini-3.1-pro')).toMatchObject({ input: 1, output: 5 })
+  })
+
+  it('does not resurrect a disabled alias', () => {
+    insertPrice('gemini-3.1-pro-preview', 2, 12)
+    const now = Date.now()
+    db.prepare(`
+      INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled, created_at, updated_at)
+      VALUES ('gemini-3.1-pro', 'gemini-3.1-pro-preview', 'exact', 'gemini', 100, 'aiusage', 'builtin', 0, ?, ?)
+    `).run(now, now)
+
+    expect(ensureCuratedPricingAliases(db)).toBe(2)
+    expect(db.prepare('SELECT enabled FROM model_price_aliases WHERE alias = ?').get('gemini-3.1-pro')).toEqual({ enabled: 0 })
   })
 
   it('never overrides an alias that already exists', () => {

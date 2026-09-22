@@ -494,24 +494,29 @@ function upsertBuiltinAlias(db: Database.Database, alias: string, modelKey: stri
 /**
  * Seeds the curated aliases from `CURATED_PRICE_ALIASES` as builtin aliases.
  * An alias is added only when its target price exists (the aliases table
- * references model_prices) and only when no alias of that name exists yet, so
- * a user binding or a real registry key that LiteLLM later adds always wins.
- * Runs on every database open and after each pricing sync; returns the number
- * of aliases added. Existing $0 records are repaired by recalculating pricing.
+ * references model_prices), when no price is registered under the alias name
+ * itself (aliases are resolved before exact keys, so seeding one would shadow
+ * a real key LiteLLM adds later) and when no alias of that name exists yet, so
+ * a user binding always wins. Runs on every database open and after each
+ * pricing sync; returns the number of aliases added. Existing $0 records are
+ * repaired by recalculating pricing.
  */
 export function ensureCuratedPricingAliases(db: Database.Database): number {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled, created_at, updated_at)
-    SELECT ?, model_key, 'exact', provider, 100, 'aiusage', 'builtin', 1, ?, ?
+    SELECT @alias, model_key, 'exact', provider, 100, 'aiusage', 'builtin', 1, @now, @now
     FROM model_prices
-    WHERE model_key = ? AND status = 'active'
+    WHERE model_key = @modelKey AND status = 'active'
+      AND NOT EXISTS (SELECT 1 FROM model_prices WHERE model_key = @alias AND status = 'active')
   `)
-  const now = Date.now()
-  let added = 0
-  for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
-    added += insert.run(alias, now, now, modelKey).changes
-  }
-  return added
+  const seed = db.transaction((now: number): number => {
+    let added = 0
+    for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
+      added += insert.run({ alias, modelKey, now }).changes
+    }
+    return added
+  })
+  return seed(Date.now())
 }
 
 export async function syncPricingFromLitellm(db: Database.Database): Promise<PricingSyncSummary> {

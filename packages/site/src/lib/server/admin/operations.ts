@@ -246,13 +246,15 @@ export async function syncPricingFromLitellm(adminUserId: string): Promise<{ add
 
     // Curated aliases for model names no pricing source lists verbatim (e.g.
     // gemini-3.1-pro → gemini-3.1-pro-preview, issue #69). Added only when the
-    // target price exists and no alias of that name exists yet.
+    // target price exists, no price is registered under the alias name itself
+    // (an alias would shadow it) and no alias of that name exists yet.
     for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
       const inserted = await tx`
         INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled)
         SELECT ${alias}, model_key, 'exact', provider, 100, 'aiusage', 'builtin', TRUE
         FROM model_prices
         WHERE model_key = ${modelKey} AND status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${alias} AND status = 'active')
         ON CONFLICT (alias) DO NOTHING
         RETURNING alias
       `

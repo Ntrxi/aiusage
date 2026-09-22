@@ -39,12 +39,10 @@ interface ModelUsage {
 
 interface UsageEvent {
   usage: ModelUsage
-  /**
-   * Readable model that describes this event: read from the event's own
-   * metadata, or inherited from its generation when the generation's numeric
-   * model id matches the event's (or either side carries no id).
-   */
+  /** Readable model that describes this event; see `inheritedModel`. */
   model?: string
+  /** The step this event was read from, when it was read from a step. */
+  owner?: NamedModel
   ts?: number
   sourceKey: string
   lineOffset: number
@@ -203,20 +201,19 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'claude 3.5 haiku': 'claude-3-5-haiku',
   'claude 3 opus': 'claude-3-opus',
   'gpt-oss 120b': 'gpt-oss-120b-medium',
-  'model_placeholder_m26': 'claude-opus-4-6',
-  'model_placeholder_m35': 'claude-sonnet-4-6',
-  'model_placeholder_m16': 'gemini-3.1-pro',
-  'model_placeholder_m36': 'gemini-3.1-pro',
-  'model_placeholder_m37': 'gemini-3.1-pro',
-  'model_placeholder_m18': 'gemini-3-flash-preview',
-  'model_placeholder_m47': 'gemini-3-flash-preview',
-  'model_placeholder_m84': 'gemini-3-flash-preview',
-  'model_placeholder_m20': 'gemini-3.5-flash-medium',
-  'model_placeholder_m132': 'gemini-3.5-flash-high',
-  'model_placeholder_m133': 'gemini-3.5-flash-high',
-  'model_placeholder_m187': 'gemini-3.5-flash-extra-low',
   'model_openai_gpt_oss_120b_medium': 'gpt-oss-120b-medium',
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
+  'gemini-3-flash': 'gemini-3-flash-preview',
+  'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
+}
+
+/**
+ * Routing names Antigravity uses for "whatever model the default or agent slot
+ * points at right now". Their target moves between Antigravity releases, so
+ * they are consulted only when a row carries nothing more specific: no known
+ * canonical name, no versioned model name, no display label, no known id.
+ */
+const ANTIGRAVITY_ROUTING_ALIASES: Record<string, string> = {
   'gemini-default': 'gemini-3.5-flash-medium',
   'gemini-pro-default': 'gemini-3.1-pro',
   'gemini-pro-agent': 'gemini-3.1-pro',
@@ -226,19 +223,23 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'gemini-3-flash-a': 'gemini-3.5-flash-high',
   'gemini-3-flash-b': 'gemini-3.5-flash-high',
   'gemini-3-flash-c': 'gemini-3-flash-preview',
-  'gemini-3-flash': 'gemini-3-flash-preview',
-  'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
 }
 
 /**
- * Numeric model ids observed in Antigravity databases, kept only as a fallback
- * for rows that carry no readable model. Antigravity's `MODEL_PLACEHOLDER_M<n>`
- * labels denote the model with id `1000 + n`, so the two tables bridge each other.
- * Effort-qualified Gemini 3.x Pro names (`-high`, `-low`) are kept as the model
- * identity; pricing maps them onto the same registry entry (issue #69).
+ * Antigravity's `MODEL_PLACEHOLDER_M<n>` labels denote the model with numeric
+ * id `1000 + n` (true for every pair observed), so placeholders resolve through
+ * the numeric-id table and also supply the id when a row stores none.
  */
 const PLACEHOLDER_ID_OFFSET = 1000
+const PLACEHOLDER_PATTERN = /^model_placeholder_m(\d+)$/i
 
+/**
+ * Numeric model ids observed in Antigravity databases. Consulted after a row's
+ * own readable model names (see `resolveModel`) and as the fallback for usage
+ * events that carry an id but inherit no readable name. Effort-qualified names
+ * Antigravity assigns itself (`gemini-3.5-flash-high`, `gemini-3.1-pro-low`)
+ * are kept as the model identity; pricing maps them onto one registry entry (#69).
+ */
 const KNOWN_MODEL_IDS: Record<number, string> = {
   246: 'gemini-2.5-pro',
   312: 'gemini-2.5-flash',
@@ -273,81 +274,148 @@ const KNOWN_MODEL_IDS: Record<number, string> = {
   1318: 'gemini-3.8-flash',
 }
 
+function lookup(table: Record<string, string>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined
+}
+
 function cleanModel(value: string | undefined): string | undefined {
   if (!value?.trim()) return undefined
   const model = (value.includes('/') ? value.split('/').pop() : value)?.trim()
   return model || undefined
 }
 
-function aliasFor(key: string): string | undefined {
-  const alias = ANTIGRAVITY_MODEL_ALIASES[key]
-  if (alias) return alias
-  const placeholder = /^model_placeholder_m(\d+)$/.exec(key)
-  return placeholder ? KNOWN_MODEL_IDS[PLACEHOLDER_ID_OFFSET + Number(placeholder[1])] : undefined
+function isPlaceholder(value: string): boolean {
+  return PLACEHOLDER_PATTERN.test(value)
 }
 
-/** The canonical model a display label, routing alias or placeholder stands for, if known. */
+function placeholderModelId(value: string | undefined): number | undefined {
+  const match = value ? PLACEHOLDER_PATTERN.exec(value.trim()) : null
+  return match ? PLACEHOLDER_ID_OFFSET + Number(match[1]) : undefined
+}
+
+function knownModelName(modelId: number): string | undefined {
+  return KNOWN_MODEL_IDS[modelId]
+}
+
+/** The canonical model a display label, `(Thinking)` variant or placeholder stands for, if known. */
 function canonicalModel(value: string | undefined): string | undefined {
   const model = cleanModel(value)
   if (!model) return undefined
   const key = model.toLowerCase()
+  const placeholderId = placeholderModelId(key)
+  if (placeholderId != null) return knownModelName(placeholderId)
   const base = key.replace(/\s*\([^)]*\)\s*$/, '').trim()
-  return aliasFor(key) ?? aliasFor(base)
+  return lookup(ANTIGRAVITY_MODEL_ALIASES, key) ?? lookup(ANTIGRAVITY_MODEL_ALIASES, base)
 }
 
-/** `Gemini 3.5 Flash (Medium)` → `gemini-3.5-flash-medium`; anything else is left alone. */
-function geminiLabelSlug(label: string): string | undefined {
-  const match = /^gemini (\d+(?:\.\d+)?)((?: [a-z]+)+?)(?: \(([a-z ]+)\))?$/.exec(label.toLowerCase())
+function routingAlias(value: string | undefined): string | undefined {
+  const model = cleanModel(value)
+  return model ? lookup(ANTIGRAVITY_ROUTING_ALIASES, model.toLowerCase()) : undefined
+}
+
+/**
+ * `Gemini 3.5 Flash (Medium)` → `gemini-3.5-flash`. The parenthetical effort
+ * qualifier is dropped because Antigravity's own slug for the same row does not
+ * carry it (`gemini-3.6-flash` is labelled `Gemini 3.6 Flash (High)`). Labels
+ * of any other shape are left alone.
+ */
+function geminiLabelSlug(label: string | undefined): string | undefined {
+  const match = label ? /^gemini (\d+(?:\.\d+)?)((?: [a-z]+)+?)(?: \([a-z ]+\))?$/.exec(label.trim().toLowerCase()) : null
   if (!match) return undefined
-  const [, version, family, effort = ''] = match
-  return ['gemini', version, ...family.trim().split(' '), ...effort.split(' ').filter(Boolean)].join('-')
+  const [, version, family] = match
+  return ['gemini', version, ...family.trim().split(' ')].join('-')
 }
 
-/** Canonical name when known, otherwise the name as Antigravity wrote it. */
+/** A machine-readable model name Antigravity assigned (`gemini-3.8-flash`, `gemini-3.8-flash-high`), as opposed to a routing alias or placeholder. */
+function isVersionedModelName(value: string): boolean {
+  return /\d/.test(value) && !isPlaceholder(value) && routingAlias(value) == null
+}
+
+/** A versioned model name of a known provider; gates values whose storage layout is inferred rather than observed. */
+function isModelShaped(value: string): boolean {
+  return value.length <= 64 && /^[a-z][a-z0-9._-]*$/i.test(value) && inferProvider(value) !== 'unknown' && isVersionedModelName(value)
+}
+
+/** Canonical name when known, otherwise the name as Antigravity wrote it (never a bare placeholder). */
 function normalizeModel(value: string | undefined): string | undefined {
   const model = cleanModel(value)
   if (!model) return undefined
-  return canonicalModel(model) ?? geminiLabelSlug(model) ?? model
-}
-
-function knownModelName(modelId: number): string | undefined {
-  return KNOWN_MODEL_IDS[modelId] ?? ANTIGRAVITY_MODEL_ALIASES[`model_placeholder_m${modelId - PLACEHOLDER_ID_OFFSET}`]
+  return canonicalModel(model) ?? geminiLabelSlug(model) ?? routingAlias(model) ?? (isPlaceholder(model) ? undefined : model)
 }
 
 interface ModelCandidates {
   modelId?: number
-  /** Model slug Antigravity selected, e.g. `gemini-3.8-flash`, or a routing alias such as `gemini-pro-default`. */
+  /** Model slug Antigravity selected (chat model field 19): a versioned name, a routing alias or a placeholder. */
   slug?: string
-  /** Executor model, usually effort-qualified, e.g. `gemini-3.8-flash-high`. */
+  /** Executor model embedded in the generation row (field 3 → 28), usually effort-qualified. */
   executor?: string
-  /** `MODEL_PLACEHOLDER_M<n>` from the chat model's `model_enum` entry. */
+  /** Executor model from the `executor_metadata` table; its layout is inferred, not observed, so it ranks low. */
+  tableExecutor?: string
+  /** `MODEL_PLACEHOLDER_M<n>` from the chat model's `model_enum` entry (field 20). */
   placeholder?: string
-  /** Display label, e.g. `Gemini 3.8 Flash (High)`. */
+  /** Display label such as `Gemini 3.8 Flash (High)` (field 21). */
   label?: string
 }
 
 /**
- * Names a generation or step from the metadata Antigravity stores with it.
- * Precedence: a readable name that maps to a known canonical model; a slug or
- * executor model that looks like a real model name (it carries a version
- * number — routing aliases such as `gemini-default` do not); a Gemini display
- * label; the known numeric-id table; any remaining readable name verbatim.
+ * Names a generation from the metadata Antigravity stores with it. Precedence:
+ *  1. a readable name that maps to a known canonical model (display label,
+ *     `(Thinking)` variant, `MODEL_PLACEHOLDER_M<n>` through the id table);
+ *  2. the slug or executor model verbatim when it is a versioned model name
+ *     Antigravity assigned (`gemini-3.8-flash`, `gemini-3.8-flash-high`);
+ *  3. the display label slugified (`Gemini 3.8 Flash (High)` → `gemini-3.8-flash`);
+ *  4. the known numeric-id table;
+ *  5. a routing alias (`gemini-default`), whose target moves between releases;
+ *  6. the `executor_metadata` table's value when it is model-shaped;
+ *  7. any remaining readable name verbatim (never a bare placeholder).
  * A numeric id nobody knows never displaces a readable name; the caller falls
- * back to `antigravity-model-<id>` only when nothing readable exists (issue #68).
+ * back to `antigravity-model-<id>` only when nothing readable exists (#68).
  */
 function resolveModel(candidates: ModelCandidates): string | undefined {
-  const { modelId, slug, executor, placeholder, label } = candidates
-  return [slug, executor, placeholder, label].map(canonicalModel).find(Boolean)
-    ?? [slug, executor].map(cleanModel).find((name): name is string => name != null && /\d/.test(name))
-    ?? geminiLabelSlug(cleanModel(label) ?? '')
+  const { modelId, placeholder, label } = candidates
+  const slug = cleanModel(candidates.slug)
+  const executor = cleanModel(candidates.executor)
+  const tableExecutor = cleanModel(candidates.tableExecutor)
+  const machineNames = [slug, executor].filter((name): name is string => name != null)
+  for (const name of [slug, executor, placeholder, label, tableExecutor]) {
+    const canonical = canonicalModel(name)
+    if (canonical) return canonical
+  }
+  return machineNames.find(isVersionedModelName)
+    ?? geminiLabelSlug(label)
     ?? (modelId != null ? knownModelName(modelId) : undefined)
-    ?? [slug, executor, label].map(cleanModel).find(Boolean)
+    ?? machineNames.map(routingAlias).find(Boolean)
+    ?? (tableExecutor && isModelShaped(tableExecutor) ? tableExecutor : undefined)
+    ?? [...machineNames, cleanModel(label)].find((name): name is string => name != null && !isPlaceholder(name))
 }
 
 /** The readable model of `named` when it can describe an event with `modelId`: the ids match, or either side has none. */
 function describedBy(named: NamedModel | undefined, modelId: number | undefined): string | undefined {
   if (!named?.model) return undefined
   return modelId == null || named.modelId == null || named.modelId === modelId ? named.model : undefined
+}
+
+/**
+ * The readable model an event inherits, if any: first an owner (its step, its
+ * generation, or the last named generation) whose id equals the event's; then
+ * a name that rows elsewhere in this database pair with the event's id; then
+ * an owner that carries no id of its own, which can only be assumed to agree.
+ * An owner with a different id never lends its name — Antigravity's helper
+ * model runs inside conversations driven by another model (#68).
+ */
+function inheritedModel(event: UsageEvent, owners: Array<NamedModel | undefined>, learned: Map<number, string>): string | undefined {
+  const modelId = event.usage.modelId
+  if (modelId != null) {
+    const exact = owners.find((owner) => owner?.model && owner.modelId === modelId)
+    if (exact) return exact.model
+    const learnedName = learned.get(modelId)
+    if (learnedName) return learnedName
+  }
+  for (const owner of owners) {
+    const model = describedBy(owner, modelId)
+    if (model) return model
+  }
+  return undefined
 }
 
 function modelEnum(chatModel: ProtoField[]): string | undefined {
@@ -396,15 +464,18 @@ function usageEvents(fields: ProtoField[], usageField: number, retryField: numbe
   return events.filter((event) => tokenBearing(event.usage))
 }
 
-function parseGeneration(index: number, data: Buffer, executorModel?: string): GenerationMetadata {
+function parseGeneration(index: number, data: Buffer, tableExecutor?: string): GenerationMetadata {
   const metadata = readFields(data)
   const chatModel = firstMessage(metadata, 1)
-  const modelId = firstVarint(chatModel, 3) || undefined
+  const slug = firstString(chatModel, [19])
+  const placeholder = modelEnum(chatModel)
+  const modelId = (firstVarint(chatModel, 3) || undefined) ?? placeholderModelId(placeholder) ?? placeholderModelId(slug)
   const model = resolveModel({
     modelId,
-    slug: firstString(chatModel, [19]),
-    executor: firstString(firstMessage(metadata, 3), [28]) ?? executorModel,
-    placeholder: modelEnum(chatModel),
+    slug,
+    executor: firstString(firstMessage(metadata, 3), [28]),
+    tableExecutor,
+    placeholder,
     label: firstString(chatModel, [21, 22]),
   })
   const ts = generationTimestamp(chatModel)
@@ -413,7 +484,12 @@ function parseGeneration(index: number, data: Buffer, executorModel?: string): G
     modelId,
     model,
     stepIndices: repeatedVarints(metadata, 2),
-    events: usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts),
+    // A usage row stored inside the chat model belongs to that model; give it
+    // the generation's id when it carries none (a placeholder-derived id too).
+    events: usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts).map((event) => {
+      event.usage.modelId ??= modelId
+      return event
+    }),
   }
 }
 
@@ -424,30 +500,24 @@ function parseStep(index: number, data: Buffer): StepMetadata {
   const model = normalizeModel(firstString(modelInfo, [12, 8]))
   const ts = timestampFromFields(firstMessage(metadata, 8))
     ?? timestampFromFields(firstMessage(metadata, 1))
-  const step: NamedModel = { model, modelId }
+  const owner: NamedModel = { model, modelId }
   return {
     ts,
     modelId,
     model,
-    // An event that carries its own, different model id (a retry on another
-    // model, a helper model) must not inherit the step's readable name.
     events: usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
       event.usage.modelId ??= modelId
-      return { ...event, model: describedBy(step, event.usage.modelId) }
+      return { ...event, owner }
     }),
   }
 }
 
-/**
- * The model an event is billed to. A readable name that describes the event
- * wins; a numeric id is then resolved through the names this database itself
- * pairs with it, then the known-id table, and only then becomes a placeholder.
- */
-function modelForEvent(event: UsageEvent, learned: Map<number, string>): string {
+/** The model an event is billed to: its inherited readable name, else the known-id table, else a placeholder. */
+function modelForEvent(event: UsageEvent): string {
   if (event.model) return event.model
   const modelId = event.usage.modelId
   if (modelId == null) return 'antigravity-unknown'
-  return learned.get(modelId) ?? knownModelName(modelId) ?? `antigravity-model-${modelId}`
+  return knownModelName(modelId) ?? `antigravity-model-${modelId}`
 }
 
 function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
@@ -460,6 +530,7 @@ function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
   target.usage.outputTokens = Math.max(target.usage.outputTokens, duplicate.usage.outputTokens)
   target.usage.identities = [...new Set([...target.usage.identities, ...duplicate.usage.identities])]
   target.model ??= duplicate.model
+  target.owner ??= duplicate.owner
   target.ts = target.ts == null ? duplicate.ts : duplicate.ts == null ? target.ts : Math.min(target.ts, duplicate.ts)
   if (duplicate.sourceKey < target.sourceKey) target.sourceKey = duplicate.sourceKey
   target.lineOffset = Math.min(target.lineOffset, duplicate.lineOffset)
@@ -583,8 +654,8 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   }
 
   // Numeric ids this database pairs with readable names: an event whose id is
-  // known only here (a helper model, a retry on another model) is named from
-  // the rows that spell it out rather than from the hard-coded table.
+  // named only elsewhere in the database (a helper model, a retry on another
+  // model) is named from those rows rather than from the hard-coded table.
   const learned = new Map<number, string>()
   const learn = (named: NamedModel): void => {
     if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)
@@ -613,14 +684,14 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     previousStep = lastStep
     if (rowEvents.length === 0) continue
     for (const event of rowEvents) {
-      event.model ??= describedBy(current, event.usage.modelId) ?? describedBy(lastNamed, event.usage.modelId)
+      event.model ??= inheritedModel(event, [event.owner, current, lastNamed], learned)
     }
     events.push(...rowEvents)
   }
 
   const sessionId = basename(dbPath).replace(/\.db$/i, '') || 'unknown'
   const records = deduplicateEvents(events).map((event, index): StatsRecord => {
-    const model = modelForEvent(event, learned)
+    const model = modelForEvent(event)
     const provider = inferProvider(model)
     const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, thinkingTokens } = event.usage
     const tokenArgs = { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, thinkingTokens }
