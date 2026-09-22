@@ -540,7 +540,10 @@ describe('parse-antigravity', () => {
         modelId: UNKNOWN_ID,
         usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
       }))
-      // A generation that names its model but stores no id runs the helper model on a step.
+      // A generation that names its model but stores no id runs two other ids on
+      // its steps: one the database names elsewhere, one it never names. Neither
+      // step usage is billed to the generation's model; only the generation's own
+      // id-less usage is.
       insertStep(3, stepMetadata({ ts: 3_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'helper' }) }))
       insertStep(4, stepMetadata({ ts: 4_000, usage: usage({ modelId: 1050, input: 40, totalOutput: 4, responseId: 'unnamed' }) }))
       insertGeneration(1, generationMetadata({
@@ -554,7 +557,7 @@ describe('parse-antigravity', () => {
       expect(records.map((record) => [record.inputTokens, record.model])).toEqual([
         [10, 'gemini-3.8-flash'],
         [30, 'gemini-3.8-flash'],
-        [40, 'gemini-3.1-pro'],
+        [40, 'antigravity-model-1050'],
         [20, 'gemini-3.1-pro'],
       ])
     })
@@ -601,10 +604,11 @@ describe('parse-antigravity', () => {
       expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
     })
 
-    it('does not let deduplication borrow the readable model of a copy with another id', () => {
+    it('does not let deduplication borrow the readable model or counters of a copy with another id', () => {
       // The step and generation rows describe the same response but disagree on
-      // its model id; the merged record must not bill the helper model's usage
-      // to Gemini 3.1 Pro just because the generation copy names it.
+      // its model id. The step copy is seen first and is kept whole: neither the
+      // generation copy's name nor its larger token counts may be billed to the
+      // helper model's id.
       insertStep(1, stepMetadata({
         ts: 1_000,
         usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'shared', providerMessageId: 'provider-1' }),
@@ -613,7 +617,7 @@ describe('parse-antigravity', () => {
         model: 'gemini-pro-default',
         modelId: 1016,
         label: 'Gemini 3.1 Pro (High)',
-        usage: usage({ modelId: 1016, input: 90, totalOutput: 6, responseId: 'shared', providerMessageId: 'provider-1' }),
+        usage: usage({ modelId: 1016, input: 90, totalOutput: 8, cacheRead: 5, responseId: 'shared', providerMessageId: 'provider-1' }),
         stepIndices: [1],
       }))
 
@@ -621,7 +625,88 @@ describe('parse-antigravity', () => {
 
       expect(result.errors).toEqual([])
       expect(result.records).toHaveLength(1)
-      expect(result.records[0]).toMatchObject({ model: 'antigravity-model-1050', provider: 'unknown', costSource: 'unknown', inputTokens: 90 })
+      expect(result.records[0]).toMatchObject({
+        model: 'antigravity-model-1050',
+        provider: 'unknown',
+        costSource: 'unknown',
+        inputTokens: 70,
+        outputTokens: 6,
+        cacheReadTokens: 0,
+      })
+    })
+
+    it('keeps the generation copy whole when a later step repeats its response under another id', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        usage: usage({ modelId: 1016, input: 5_000, totalOutput: 400, responseId: 'shared' }),
+      }))
+      insertStep(3, stepMetadata({
+        ts: 3_000,
+        usage: usage({ modelId: 1050, input: 9_000, totalOutput: 900, responseId: 'shared' }),
+      }))
+      insertGeneration(1, generationMetadata({ stepIndices: [3] }))
+
+      const result = parse()
+
+      expect(result.errors).toEqual([])
+      expect(result.records).toHaveLength(1)
+      expect(result.records[0]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google', inputTokens: 5_000, outputTokens: 400 })
+    })
+
+    it('names an id from steps an earlier import already covered', () => {
+      // A step before the cursor is the only row that names the id; an
+      // incremental import must attribute later usage exactly like a full one.
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+      insertStep(2, stepMetadata({ ts: 2_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'r1' }) }))
+      insertGeneration(1, generationMetadata({ stepIndices: [2] }))
+
+      const full = parse().records.map((record) => [record.inputTokens, record.model])
+      const incremental = parse(1).records.map((record) => [record.inputTokens, record.model])
+
+      expect(full).toEqual([[10, 'gemini-3.8-flash'], [30, 'gemini-3.8-flash']])
+      expect(incremental).toEqual([[30, 'gemini-3.8-flash']])
+    })
+
+    it('learns a name stored beside the id before one inferred from the executor_metadata table', () => {
+      db.prepare('INSERT INTO executor_metadata (idx, data) VALUES (?, ?)').run(0, executorMetadata('gemini-3.8-flash-high'))
+      insertGeneration(0, generationMetadata({
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      // A later generation on another model runs the unknown id on two steps:
+      // one names it, one carries only the id.
+      insertStep(3, stepMetadata({
+        ts: 3_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ input: 20, totalOutput: 2, responseId: 'r1' }),
+      }))
+      insertStep(4, stepMetadata({ ts: 4_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'r2' }) }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-2.5-pro',
+        modelId: 246,
+        usage: usage({ modelId: 246, input: 40, totalOutput: 4, responseId: 'r3' }),
+        stepIndices: [3, 4],
+      }))
+
+      const records = parse().records.map((record) => [record.inputTokens, record.model])
+
+      // Generation 0 keeps the executor model it was named from; the id-only step
+      // usage takes the name a step row stores beside the id, not the inferred one.
+      expect(records).toEqual([
+        [10, 'gemini-3.8-flash-high'],
+        [20, 'gemini-3.8-flash'],
+        [30, 'gemini-3.8-flash'],
+        [40, 'gemini-2.5-pro'],
+      ])
     })
 
     it('lets deduplication adopt the readable model of a copy whose id is compatible', () => {

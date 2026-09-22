@@ -41,7 +41,7 @@ interface UsageEvent {
   usage: ModelUsage
   /** Readable model that describes this event; see `inheritedModel`. */
   model?: string
-  /** The step this event was read from, when it was read from a step. */
+  /** The step or generation row this event was read from. */
   owner?: NamedModel
   ts?: number
   sourceKey: string
@@ -58,6 +58,8 @@ interface GenerationMetadata extends NamedModel {
   index: number
   stepIndices: number[]
   events: UsageEvent[]
+  /** The model was inferred from the `executor_metadata` table rather than read from the row. */
+  inferred: boolean
 }
 
 interface StepMetadata extends NamedModel {
@@ -398,26 +400,22 @@ function describedBy(named: NamedModel | undefined, modelId: number | undefined)
 }
 
 /**
- * The readable model an event with `modelId` inherits, if any: first an owner
- * (its step, its generation, or the last named generation) whose id equals the
- * event's; then a name that rows elsewhere in this database pair with the
- * event's id; then an owner that carries no id of its own, which can only be
- * assumed to agree. An owner with a different id never lends its name —
- * Antigravity's helper model runs inside conversations driven by another
- * model (#68).
+ * The readable model an event with `modelId` inherits, if any: first its owner
+ * (the step or generation row it was read from) or a surrounding generation
+ * (the current one, then the last named one) whose id equals the event's;
+ * then a name that rows elsewhere in this database pair with the event's id;
+ * then the owner alone when it carries no id, since a row can only be assumed
+ * to agree with the usage stored inside it. An event without an id takes the
+ * first readable name among owner and context. A row with a different id, or
+ * a surrounding generation with none, never lends its name — Antigravity's
+ * helper model runs inside conversations driven by another model (#68).
  */
-function inheritedModel(modelId: number | undefined, owners: Array<NamedModel | undefined>, learned: ReadonlyMap<number, string>): string | undefined {
-  if (modelId != null) {
-    const exact = owners.find((owner) => owner?.model && owner.modelId === modelId)
-    if (exact) return exact.model
-    const learnedName = learned.get(modelId)
-    if (learnedName) return learnedName
-  }
-  for (const owner of owners) {
-    const model = describedBy(owner, modelId)
-    if (model) return model
-  }
-  return undefined
+function inheritedModel(modelId: number | undefined, owner: NamedModel | undefined, context: Array<NamedModel | undefined>, learned: ReadonlyMap<number, string>): string | undefined {
+  const rows = [owner, ...context]
+  if (modelId == null) return rows.find((row) => row?.model)?.model
+  const exact = rows.find((row) => row?.model && row.modelId === modelId)
+  if (exact) return exact.model
+  return learned.get(modelId) ?? describedBy(owner, modelId)
 }
 
 function modelEnum(chatModel: ProtoField[]): string | undefined {
@@ -472,25 +470,27 @@ function parseGeneration(index: number, data: Buffer, tableExecutor?: string): G
   const slug = firstString(chatModel, [19])
   const placeholder = modelEnum(chatModel)
   const modelId = (firstVarint(chatModel, 3) || undefined) ?? placeholderModelId(placeholder) ?? placeholderModelId(slug)
-  const model = resolveModel({
+  const candidates: ModelCandidates = {
     modelId,
     slug,
     executor: firstString(firstMessage(metadata, 3), [28]),
-    tableExecutor,
     placeholder,
     label: firstString(chatModel, [21, 22]),
-  })
+  }
+  const model = resolveModel({ ...candidates, tableExecutor })
   const ts = generationTimestamp(chatModel)
+  const owner: NamedModel = { model, modelId }
   return {
     index,
     modelId,
     model,
+    inferred: model != null && model !== resolveModel(candidates),
     stepIndices: repeatedVarints(metadata, 2),
     // A usage row stored inside the chat model belongs to that model; give it
     // the generation's id when it carries none (a placeholder-derived id too).
     events: usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts).map((event) => {
       event.usage.modelId ??= modelId
-      return event
+      return { ...event, owner }
     }),
   }
 }
@@ -522,20 +522,34 @@ function modelForEvent(event: UsageEvent): string {
   return knownModelName(modelId) ?? `antigravity-model-${modelId}`
 }
 
-const NO_LEARNED_MODELS: ReadonlyMap<number, string> = new Map()
-
-function namedModel(event: UsageEvent): NamedModel {
-  return { model: event.model, modelId: event.usage.modelId }
+function mergeIdentities(target: UsageEvent, duplicate: UsageEvent): void {
+  target.usage.identities = [...new Set([...target.usage.identities, ...duplicate.usage.identities])]
 }
 
+/**
+ * Folds a second copy of the same response into `target`. Copies that agree on
+ * the model id (or where one carries none) merge field by field, and the
+ * readable name paired with that id wins over one assumed from an id-less row.
+ * Copies that disagree on the id (a step copy on the helper model, the
+ * generation copy on the conversation's model) cannot both be right and
+ * nothing in the database says which is: the copy seen first is kept whole,
+ * and the other contributes only its identities, so neither its name nor its
+ * token counts are billed to the first copy's model (#68).
+ */
 function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
-  // Two copies of one response can disagree on the model id (a step copy on
-  // the helper model, the generation copy on the conversation's model). The
-  // merged event keeps the first id seen and only a readable name that
-  // describes that id: taking the other copy's name would bill the usage to
-  // the wrong model, the misattribution #68 removes.
-  const modelId = target.usage.modelId ?? duplicate.usage.modelId
-  target.model = inheritedModel(modelId, [namedModel(target), namedModel(duplicate)], NO_LEARNED_MODELS)
+  const targetId = target.usage.modelId
+  const duplicateId = duplicate.usage.modelId
+  if (targetId != null && duplicateId != null && targetId !== duplicateId) {
+    mergeIdentities(target, duplicate)
+    return
+  }
+  const modelId = targetId ?? duplicateId
+  const copies: NamedModel[] = [
+    { model: target.model, modelId: targetId },
+    { model: duplicate.model, modelId: duplicateId },
+  ]
+  target.model = copies.find((copy) => copy.model && copy.modelId === modelId)?.model
+    ?? copies.find((copy) => copy.model)?.model
   target.usage.modelId = modelId
   target.usage.inputTokens = Math.max(target.usage.inputTokens, duplicate.usage.inputTokens)
   target.usage.totalOutputTokens = Math.max(target.usage.totalOutputTokens, duplicate.usage.totalOutputTokens)
@@ -543,7 +557,7 @@ function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
   target.usage.cacheReadTokens = Math.max(target.usage.cacheReadTokens, duplicate.usage.cacheReadTokens)
   target.usage.thinkingTokens = Math.max(target.usage.thinkingTokens, duplicate.usage.thinkingTokens)
   target.usage.outputTokens = Math.max(target.usage.outputTokens, duplicate.usage.outputTokens)
-  target.usage.identities = [...new Set([...target.usage.identities, ...duplicate.usage.identities])]
+  mergeIdentities(target, duplicate)
   target.owner ??= duplicate.owner
   target.ts = target.ts == null ? duplicate.ts : duplicate.ts == null ? target.ts : Math.min(target.ts, duplicate.ts)
   if (duplicate.sourceKey < target.sourceKey) target.sourceKey = duplicate.sourceKey
@@ -653,16 +667,19 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   let previousStep = Math.max(-1, ...generations
     .filter((generation) => generation.index < firstIndex)
     .flatMap((generation) => generation.stepIndices))
+  // Every step is parsed, including those an earlier import already covered:
+  // the names they pair with model ids below must not depend on the cursor,
+  // or an incremental import would attribute usage differently from a full one.
   const steps = new Map<number, StepMetadata>()
   if (hasTable(db, 'steps')) {
     const stepRows = db.prepare('SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx').all() as Array<{ idx: number; metadata: Buffer }>
     for (const row of stepRows) {
       const index = Number(row.idx)
-      if (index <= previousStep || !Buffer.isBuffer(row.metadata)) continue
+      if (!Buffer.isBuffer(row.metadata)) continue
       try {
         steps.set(index, parseStep(index, row.metadata))
       } catch (error) {
-        errors.push(`step metadata ${index}: ${error instanceof Error ? error.message : error}`)
+        if (index > previousStep) errors.push(`step metadata ${index}: ${error instanceof Error ? error.message : error}`)
       }
     }
   }
@@ -670,12 +687,15 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // Numeric ids this database pairs with readable names: an event whose id is
   // named only elsewhere in the database (a helper model, a retry on another
   // model) is named from those rows rather than from the hard-coded table.
+  // Names a row stores beside its id are learned first, in row order, so a
+  // name only inferred from the executor_metadata table never outranks them.
   const learned = new Map<number, string>()
   const learn = (named: NamedModel): void => {
     if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)
   }
-  for (const generation of generations) learn(generation)
+  for (const generation of generations) if (!generation.inferred) learn(generation)
   for (const step of steps.values()) learn(step)
+  for (const generation of generations) if (generation.inferred) learn(generation)
 
   const events: UsageEvent[] = []
   let current: NamedModel | undefined = generations
@@ -698,7 +718,7 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     previousStep = lastStep
     if (rowEvents.length === 0) continue
     for (const event of rowEvents) {
-      event.model ??= inheritedModel(event.usage.modelId, [event.owner, current, lastNamed], learned)
+      event.model ??= inheritedModel(event.usage.modelId, event.owner, [current, lastNamed], learned)
     }
     events.push(...rowEvents)
   }
