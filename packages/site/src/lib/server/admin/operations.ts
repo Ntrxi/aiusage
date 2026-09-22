@@ -1,7 +1,7 @@
 import { sql } from '../db/pool.js'
 import { nanoid } from 'nanoid'
-import { CURATED_PRICE_ALIASES } from '@aiusage/core'
 import { invalidateLeaderboardCache } from '../leaderboard/query.js'
+import { ensureCuratedPricingAliases } from '../pricing/curated-aliases.js'
 
 export async function banUser(adminUserId: string, targetUserId: string, reason: string): Promise<void> {
   await sql`UPDATE users SET status = 'banned', banned_at = NOW(), ban_reason = ${reason}, updated_at = NOW() WHERE id = ${targetUserId}`
@@ -244,41 +244,11 @@ export async function syncPricingFromLitellm(adminUserId: string): Promise<{ add
       }
     }
 
-    // Curated aliases for model names no pricing source lists verbatim (e.g.
-    // gemini-3.1-pro → gemini-3.1-pro-preview, issue #69). Added only when the
-    // target price exists, no price is registered under the alias name itself
-    // (an alias would shadow it) and no alias of that name exists yet; an
-    // alias seeded here is removed once a real price appears under its name
-    // and follows the curated list when its target changes. Only rows with
-    // origin 'builtin' and source 'aiusage' are touched (the LiteLLM aliases
-    // above carry source 'litellm').
-    for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
-      await tx`
-        DELETE FROM model_price_aliases
-        WHERE alias = ${alias} AND origin = 'builtin' AND source = 'aiusage'
-          AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${alias} AND status = 'active')
-      `
-      const retargeted = await tx`
-        UPDATE model_price_aliases
-        SET model_key = ${modelKey},
-            provider = (SELECT provider FROM model_prices WHERE model_key = ${modelKey}),
-            updated_at = NOW()
-        WHERE alias = ${alias} AND origin = 'builtin' AND source = 'aiusage' AND model_key <> ${modelKey}
-          AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${modelKey} AND status = 'active')
-        RETURNING alias
-      `
-      if (retargeted.length > 0) aliasesUpdated++
-      const inserted = await tx`
-        INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled)
-        SELECT ${alias}::text, model_key, 'exact', provider, 100, 'aiusage', 'builtin', TRUE
-        FROM model_prices
-        WHERE model_key = ${modelKey} AND status = 'active'
-          AND NOT EXISTS (SELECT 1 FROM model_prices WHERE model_key = ${alias} AND status = 'active')
-        ON CONFLICT (alias) DO NOTHING
-        RETURNING alias
-      `
-      if (inserted.length > 0) aliasesAdded++
-    }
+    // Curated aliases for model names no pricing source lists verbatim; they
+    // are also applied on startup (runMigrations).
+    const curated = await ensureCuratedPricingAliases(tx)
+    aliasesAdded += curated.added
+    aliasesUpdated += curated.updated
   })
 
   await logAdminAction(adminUserId, 'sync_pricing', 'model_prices', 'active', `Synced from LiteLLM: ${added} added, ${updated} updated, ${skipped} skipped, ${aliasesAdded} aliases added, ${aliasesUpdated} aliases updated`)
