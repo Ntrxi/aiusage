@@ -424,13 +424,16 @@ function parseStep(index: number, data: Buffer): StepMetadata {
   const model = normalizeModel(firstString(modelInfo, [12, 8]))
   const ts = timestampFromFields(firstMessage(metadata, 8))
     ?? timestampFromFields(firstMessage(metadata, 1))
+  const step: NamedModel = { model, modelId }
   return {
     ts,
     modelId,
     model,
+    // An event that carries its own, different model id (a retry on another
+    // model, a helper model) must not inherit the step's readable name.
     events: usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
       event.usage.modelId ??= modelId
-      return { ...event, model }
+      return { ...event, model: describedBy(step, event.usage.modelId) }
     }),
   }
 }

@@ -522,6 +522,63 @@ describe('parse-antigravity', () => {
       expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
     })
 
+    it('inherits the step model only for events whose id matches the step', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: 1016,
+        modelName: 'gemini-3.1-pro',
+        // The step's own usage carries no id and inherits the step's; the helper
+        // model's usage names a different id and must not be billed as Gemini 3.1 Pro.
+        usage: usage({ input: 5_000, totalOutput: 400, responseId: 'main' }),
+      }))
+      insertStep(2, stepMetadata({
+        ts: 2_000,
+        modelId: 1016,
+        modelName: 'gemini-3.1-pro',
+        usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'helper' }),
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1, 2] }))
+
+      const records = parse().records.sort((a, b) => a.inputTokens - b.inputTokens)
+
+      expect(records).toHaveLength(2)
+      expect(records[0]).toMatchObject({ model: 'antigravity-model-1050', provider: 'unknown', costSource: 'unknown' })
+      expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
+    })
+
+    it('does not let a retry on another model inherit the step model', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: 1016,
+        modelName: 'gemini-3.1-pro',
+        usage: usage({ modelId: 1016, input: 5_000, totalOutput: 400, responseId: 'main' }),
+        retries: [usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'retry' })],
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+
+      const records = parse().records.sort((a, b) => a.inputTokens - b.inputTokens)
+
+      expect(records).toHaveLength(2)
+      expect(records[0]).toMatchObject({ model: 'antigravity-model-1050', provider: 'unknown', inputTokens: 70 })
+      expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google', inputTokens: 5_000 })
+    })
+
+    it('inherits the readable step model when the usage id matches the step id', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ modelId: UNKNOWN_ID, input: 12, totalOutput: 3, responseId: 'main' }),
+        retries: [usage({ modelId: UNKNOWN_ID, input: 8, totalOutput: 2, responseId: 'retry' })],
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+
+      const records = parse().records
+
+      expect(records).toHaveLength(2)
+      expect(records.map((record) => record.model)).toEqual(['gemini-3.8-flash', 'gemini-3.8-flash'])
+    })
+
     it('does not let an unknown step model id override the step model name', () => {
       insertStep(1, stepMetadata({
         ts: 1_000,
