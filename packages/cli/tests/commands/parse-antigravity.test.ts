@@ -837,7 +837,10 @@ describe('parse-antigravity', () => {
       insertGeneration(2, generationMetadata({ model: 'gemini-3.8-flash' }))
       const heldBack = parse(1)
       expect(heldBack.nextIndex).toBe(2)
-      expect(heldBack.records.map((record) => [record.inputTokens, record.model])).toEqual([[20, 'gemini-2.5-pro']])
+      // Until then the last named generation is generation 1, which names the
+      // id-less usage for now, exactly as a full import would.
+      expect(heldBack.records.map((record) => [record.inputTokens, record.model])).toEqual([[10, 'gemini-2.5-pro'], [20, 'gemini-2.5-pro']])
+      expect(parse().records.map((record) => [record.inputTokens, record.model])).toEqual([[10, 'gemini-2.5-pro'], [20, 'gemini-2.5-pro']])
 
       db.prepare('UPDATE gen_metadata SET data = ? WHERE idx = 2').run(generationMetadata({
         model: 'gemini-3.8-flash',
@@ -849,7 +852,7 @@ describe('parse-antigravity', () => {
       // The id-less usage takes its name from the last named generation, so it
       // is corrected once that generation is processed, as a full import would.
       expect(incremental.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [incremental.records[1].id, 'gemini-3.8-flash']])
-      expect(full.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [heldBack.records[0].id, 'gemini-2.5-pro'], [incremental.records[1].id, 'gemini-3.8-flash']])
+      expect(full.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [heldBack.records[1].id, 'gemini-2.5-pro'], [incremental.records[1].id, 'gemini-3.8-flash']])
     })
 
     it('merges a new copy of an earlier response with the earlier copy as a full import would', () => {
@@ -930,6 +933,10 @@ describe('parse-antigravity', () => {
 
       expect(incremental.records.filter((record) => [20, 30].includes(record.inputTokens)).map((record) => record.model))
         .toEqual(['gemini-9.9-flash', 'gemini-9.9-flash'])
+      // Step 5 was written for generation 2 but falls into generation 0's
+      // window; it is still new to this import and must be recorded.
+      expect(incremental.records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([2, 5, 6, 20, 30, 31])
+      expect(full.records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([2, 5, 6, 20, 30, 31])
       const byId = (records: typeof full.records) => new Map(records.map((record) => [record.id, record.model]))
       for (const [id, model] of byId(incremental.records)) expect(byId(full.records).get(id)).toBe(model)
     })
@@ -962,13 +969,17 @@ describe('parse-antigravity', () => {
       expect(parse().records[0]).toMatchObject({ model: `antigravity-model-${UNKNOWN_ID}` })
 
       // The latest generation names the id but carries no usage yet, so it is
-      // held back for a later parse; nothing is corrected until then.
+      // held back for a later parse; nothing is corrected until then, and a
+      // full import of the same database agrees.
       insertGeneration(1, generationMetadata({ model: 'gemini-3.8-flash', modelId: UNKNOWN_ID }))
 
       const result = parse(1)
+      const full = parse()
 
       expect(result.records).toEqual([])
       expect(result.nextIndex).toBe(1)
+      expect(full.records.map((record) => record.model)).toEqual([`antigravity-model-${UNKNOWN_ID}`])
+      expect(full.nextIndex).toBe(1)
     })
 
     it('ignores a placeholder slug or step name that contradicts an unknown explicit id', () => {

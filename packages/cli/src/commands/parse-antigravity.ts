@@ -705,7 +705,6 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   const executorModels = readExecutorModels(db)
   const generations: GenerationMetadata[] = []
   const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx').all() as Array<{ idx: number; data: Buffer }>
-  const latestGenerationIndex = Math.max(-1, ...rows.map((row) => Number(row.idx)).filter(Number.isFinite))
   for (const row of rows) {
     const index = Number(row.idx)
     try {
@@ -738,6 +737,30 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     }
   }
 
+  // The conversation's structure — the steps each generation's window covers —
+  // is fixed before any name is resolved and never depends on the import
+  // cursor: every generation is walked exactly as a full import walks it.
+  interface Window { generation: GenerationMetadata; stepIndices: number[]; linkedTs?: number }
+  const windows: Window[] = []
+  let previousStep = -1
+  for (const generation of generations) {
+    const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
+    windows.push({
+      generation,
+      stepIndices: [...steps.keys()].filter((index) => index > previousStep && index <= lastStep),
+      linkedTs: generation.stepIndices.map((index) => steps.get(index)?.ts).find((ts) => ts != null),
+    })
+    previousStep = lastStep
+  }
+  // The latest generation is still being written while it carries no usage:
+  // it is left for a later import, and so that a full import agrees with the
+  // one that imports it later, neither it nor the steps it covers name
+  // anything yet.
+  const latest = windows[windows.length - 1]
+  const hasUsage = (window: Window): boolean => window.generation.events.length > 0
+    || window.stepIndices.some((index) => steps.get(index)!.events.length > 0)
+  const settled = latest != null && !hasUsage(latest) ? windows.slice(0, -1) : windows
+
   // Numeric ids this database pairs with readable names: an event whose id is
   // named only elsewhere in the database (a helper model, a retry on another
   // model) is named from those rows rather than from the hard-coded table.
@@ -749,8 +772,8 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // variant slug next to a plain one, keep their own names.)
   interface ParsedRow { named: NamedModel; kind: 'generation' | 'step'; index: number }
   const parsedRows: ParsedRow[] = [
-    ...generations.map((generation): ParsedRow => ({ named: generation, kind: 'generation', index: generation.index })),
-    ...[...steps.entries()].map(([index, step]): ParsedRow => ({ named: step, kind: 'step', index })),
+    ...settled.map((window): ParsedRow => ({ named: window.generation, kind: 'generation', index: window.generation.index })),
+    ...settled.flatMap((window) => window.stepIndices.map((index): ParsedRow => ({ named: steps.get(index)!, kind: 'step', index }))),
   ]
   const learned = new Map<number, string>()
   const namedBy = new Map<number, ParsedRow>()
@@ -765,54 +788,47 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   }
   for (const row of parsedRows) if (row.named.inferred && row.named.modelId != null) row.named.model = learned.get(row.named.modelId) ?? row.named.model
 
-  // Every generation is walked as a full import would walk it, so the step
-  // windows, the current generation and the names events inherit never depend
-  // on the import cursor. Events read from rows this import processes are
-  // marked fresh; the rest are emitted only when this import changes what a
-  // full import would record for them (see `touched` below). Record ids do
-  // not depend on the model, so re-emitted rows replace the earlier ones in
-  // place and an incremental import ends where a full import would.
-  const lastNamed = [...generations].reverse().find((generation) => generation.model)
+  // Rows this import processes: the generations from the cursor on, the steps
+  // their windows cover, and the steps they link — a step written for a new
+  // generation falls into an earlier generation's window when the new one
+  // links lower step indices than its predecessor, and a full import records
+  // it there.
+  const processedGenerations = settled.filter((window) => window.generation.index >= firstIndex)
+  const processedSteps = new Set(processedGenerations.flatMap((window) => [...window.stepIndices, ...window.generation.stepIndices]))
+  const lastProcessed = processedGenerations[processedGenerations.length - 1]
+  if (lastProcessed) nextIndex = lastProcessed.generation.index + 1
+
+  // Events are named as a full import names them. Those read from rows this
+  // import processes are marked fresh; the rest are emitted only when this
+  // import changes what a full import would record for them (see `touched`
+  // below). Record ids do not depend on the model, so re-emitted rows replace
+  // the earlier ones in place and an incremental import ends where a full
+  // import would.
+  const lastNamed = [...settled].reverse().find((window) => window.generation.model)?.generation
   const events: UsageEvent[] = []
-  const processedSteps = new Set<number>()
   let current: NamedModel | undefined
-  let previousStep = -1
-  for (const generation of generations) {
+  for (const { generation, stepIndices, linkedTs } of settled) {
     if (generation.model) current = generation
-    const processed = generation.index >= firstIndex
-    const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
-    const linkedTs = generation.stepIndices.map((index) => steps.get(index)?.ts).find((ts) => ts != null)
-    const stepIndices = [...steps.keys()].filter((index) => index > previousStep && index <= lastStep)
-    const rowEvents = [
-      ...stepIndices.flatMap((index) => steps.get(index)!.events),
-      ...generation.events.map((event) => ({ ...event, ts: event.ts ?? linkedTs })),
+    const rowEvents: UsageEvent[] = [
+      ...stepIndices.flatMap((index) => steps.get(index)!.events.map((event) => ({ ...event, fresh: processedSteps.has(index) }))),
+      ...generation.events.map((event) => ({ ...event, ts: event.ts ?? linkedTs, fresh: generation.index >= firstIndex })),
     ]
-    if (processed) {
-      if (rowEvents.length === 0 && generation.index === latestGenerationIndex) break
-      nextIndex = generation.index + 1
-      for (const index of stepIndices) processedSteps.add(index)
-    }
-    previousStep = lastStep
     for (const event of rowEvents) {
-      event.fresh = processed
       event.model = inheritedModel(event.usage.modelId, event.owner, [current, lastNamed], learned)
       event.namedByLast = event.model != null && inheritedModel(event.usage.modelId, event.owner, [current], learned) !== event.model
     }
     events.push(...rowEvents)
   }
 
-  // Ids first named by a row this import processed — not one an earlier
-  // import covered, nor a row held back above as unfinished. Usage imported
-  // earlier under such an id was recorded as antigravity-model-<id> or under
-  // the id table's name, and a full import would name it from that row; a
-  // name the id table already gave is nothing new.
-  const processedNow = (row: ParsedRow): boolean => row.kind === 'generation'
-    ? row.index >= firstIndex && row.index < nextIndex
-    : processedSteps.has(row.index)
+  // Ids first named by a row this import processed. Usage imported earlier
+  // under such an id was recorded as antigravity-model-<id> or under the id
+  // table's name, and a full import would name it from that row; a name the
+  // id table already gave is nothing new.
+  const processedNow = (row: ParsedRow): boolean => row.kind === 'generation' ? row.index >= firstIndex : processedSteps.has(row.index)
   const newlyNamed = new Set([...namedBy]
     .filter(([modelId, row]) => processedNow(row) && learned.get(modelId) !== knownModelName(modelId))
     .map(([modelId]) => modelId))
-  const lastNamedNow = lastNamed != null && processedNow({ named: lastNamed, kind: 'generation', index: lastNamed.index })
+  const lastNamedNow = lastNamed != null && lastNamed.index >= firstIndex
   // A record is written when a row this import processed contributes to it
   // (including a new copy of a response an earlier import recorded, which is
   // merged with the earlier copies exactly as a full import merges them), when
