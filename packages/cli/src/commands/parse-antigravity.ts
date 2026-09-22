@@ -752,13 +752,14 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     })
     previousStep = lastStep
   }
-  // The latest generation is still being written while it carries no usage:
-  // it is left for a later import, and so that a full import agrees with the
-  // one that imports it later, neither it nor the steps it covers name
-  // anything yet.
+  // The latest generation is still being written while it carries no usage,
+  // in its own row, in the steps its window covers or in the steps it links
+  // (one of which an earlier window may cover): it is left for a later
+  // import, and so that a full import agrees with the one that imports it
+  // later, neither it nor the steps it covers name anything yet.
   const latest = windows[windows.length - 1]
   const hasUsage = (window: Window): boolean => window.generation.events.length > 0
-    || window.stepIndices.some((index) => steps.get(index)!.events.length > 0)
+    || [...window.stepIndices, ...window.generation.stepIndices].some((index) => (steps.get(index)?.events.length ?? 0) > 0)
   const settled = latest != null && !hasUsage(latest) ? windows.slice(0, -1) : windows
 
   // Numeric ids this database pairs with readable names: an event whose id is

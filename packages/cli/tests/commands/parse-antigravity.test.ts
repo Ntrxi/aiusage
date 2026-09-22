@@ -982,6 +982,24 @@ describe('parse-antigravity', () => {
       expect(full.nextIndex).toBe(1)
     })
 
+    it('imports a latest generation whose only usage is in a step an earlier window covers', () => {
+      insertStep(30, stepMetadata({ ts: 30_000, usage: usage({ input: 30, totalOutput: 3, responseId: 'r30' }) }))
+      insertGeneration(0, generationMetadata({ model: 'gemini-3.8-flash', stepIndices: [30] }))
+      expect(parse().nextIndex).toBe(1)
+
+      // The new generation links a lower step index, so its own window is
+      // empty; the step it links still carries its usage and must import now.
+      insertStep(5, stepMetadata({ ts: 5_000, usage: usage({ input: 5, totalOutput: 1, responseId: 'r5' }) }))
+      insertGeneration(1, generationMetadata({ model: 'gemini-3.8-flash', stepIndices: [5] }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.nextIndex).toBe(2)
+      expect(incremental.records.map((record) => [record.inputTokens, record.model])).toEqual([[5, 'gemini-3.8-flash']])
+      expect(full.records.map((record) => record.inputTokens).sort((a, b) => a - b)).toEqual([5, 30])
+    })
+
     it('ignores a placeholder slug or step name that contradicts an unknown explicit id', () => {
       insertGeneration(0, generationMetadata({
         model: 'MODEL_PLACEHOLDER_M318',
