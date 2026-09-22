@@ -806,9 +806,81 @@ describe('parse-antigravity', () => {
       expect(incremental.errors).toEqual([])
       expect(incremental.nextIndex).toBe(2)
       expect(incremental.records.map((record) => [record.inputTokens, record.model])).toEqual([[10, 'gemini-3.8-flash'], [30, 'gemini-3.8-flash']])
-      // The corrected record replaces the placeholder one: same id, new model.
+      // The corrected record replaces the placeholder one: same id, new model,
+      // and the same timestamp (a row-index fallback here) as a full import.
       expect(incremental.records[0].id).toBe(first.id)
+      expect(incremental.records[0].ts).toBe(first.ts)
+      expect(full.records.map((record) => [record.id, record.model, record.ts])).toEqual(incremental.records.map((record) => [record.id, record.model, record.ts]))
+    })
+
+    it('re-emits earlier id-less usage once the database gets its first named generation', () => {
+      insertGeneration(0, generationMetadata({ usage: usage({ input: 10, totalOutput: 1, responseId: 'r0' }) }))
+      const [first] = parse().records
+      expect(first).toMatchObject({ model: 'antigravity-unknown' })
+
+      insertGeneration(1, generationMetadata({ model: 'gemini-3.8-flash', usage: usage({ input: 30, totalOutput: 3, responseId: 'r1' }) }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.records.map((record) => [record.id, record.model])).toEqual([[first.id, 'gemini-3.8-flash'], [incremental.records[1].id, 'gemini-3.8-flash']])
       expect(full.records.map((record) => [record.id, record.model])).toEqual(incremental.records.map((record) => [record.id, record.model]))
+    })
+
+    it('keeps the copy a full import keeps when re-emitting a response two earlier rows stored under different ids', () => {
+      // The step copy (helper id) and the generation copy (another unknown id)
+      // share a response; a full import keeps the step copy. Naming the
+      // generation's id later must not swap the record to the generation copy.
+      insertStep(1, stepMetadata({ ts: 1_000, usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'shared' }) }))
+      insertGeneration(0, generationMetadata({
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 90, totalOutput: 8, responseId: 'shared' }),
+        stepIndices: [1],
+      }))
+      const [first] = parse().records
+      expect(first).toMatchObject({ model: 'antigravity-model-1050', inputTokens: 70 })
+
+      insertStep(3, stepMetadata({ ts: 3_000, modelId: UNKNOWN_ID, modelName: 'gemini-3.8-flash', usage: usage({ input: 30, totalOutput: 3, responseId: 'r1' }) }))
+      insertGeneration(1, generationMetadata({ stepIndices: [3] }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.records.map((record) => [record.model, record.inputTokens])).toEqual([['gemini-3.8-flash', 30]])
+      expect(full.records.map((record) => [record.id, record.model, record.inputTokens])).toEqual([[first.id, 'antigravity-model-1050', 70], [incremental.records[0].id, 'gemini-3.8-flash', 30]])
+    })
+
+    it('does not re-emit earlier usage for a name only an unfinished latest generation gives', () => {
+      insertGeneration(0, generationMetadata({ usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }) }))
+      expect(parse().records[0]).toMatchObject({ model: `antigravity-model-${UNKNOWN_ID}` })
+
+      // The latest generation names the id but carries no usage yet, so it is
+      // held back for a later parse; nothing is corrected until then.
+      insertGeneration(1, generationMetadata({ model: 'gemini-3.8-flash', modelId: UNKNOWN_ID }))
+
+      const result = parse(1)
+
+      expect(result.records).toEqual([])
+      expect(result.nextIndex).toBe(1)
+    })
+
+    it('ignores a placeholder slug or step name that contradicts an unknown explicit id', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'MODEL_PLACEHOLDER_M318',
+        modelId: UNKNOWN_ID,
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertStep(2, stepMetadata({
+        ts: 2_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'MODEL_PLACEHOLDER_M318',
+        usage: usage({ input: 30, totalOutput: 3, responseId: 'r1' }),
+      }))
+      insertGeneration(1, generationMetadata({ stepIndices: [2] }))
+
+      const records = parse().records.map((record) => record.model)
+
+      expect(records).toEqual([`antigravity-model-${UNKNOWN_ID}`, `antigravity-model-${UNKNOWN_ID}`])
     })
 
     it('does not re-emit earlier usage whose id was already named before this import', () => {
