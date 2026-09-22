@@ -52,7 +52,15 @@ interface UsageEvent {
 interface NamedModel {
   model?: string
   modelId?: number
-  /** The name came from a table (the numeric-id table, a routing alias, `executor_metadata`) rather than from a name the row stores. */
+  /**
+   * The name came from a table (the numeric-id table, a routing alias,
+   * `executor_metadata`) rather than from a name the row stores. A name
+   * reached through the row's own `MODEL_PLACEHOLDER_M<n>` counts as stored:
+   * the placeholder is the row's exact statement of what it ran, and an id
+   * does not determine a variant (real rows store both `gemini-3.7-flash` and
+   * `gemini-3.7-flash-safety-le` beside one id), so the plain name is what an
+   * id-only event elsewhere should inherit.
+   */
   inferred?: boolean
 }
 
@@ -500,8 +508,14 @@ function parseGeneration(index: number, data: Buffer, tableExecutor?: string): G
   const metadata = readFields(data)
   const chatModel = firstMessage(metadata, 1)
   const slug = firstString(chatModel, [19])
-  const placeholder = modelEnum(chatModel)
-  const modelId = (firstVarint(chatModel, 3) || undefined) ?? placeholderModelId(placeholder) ?? placeholderModelId(slug)
+  const storedPlaceholder = modelEnum(chatModel)
+  const explicitId = firstVarint(chatModel, 3) || undefined
+  const placeholderId = placeholderModelId(storedPlaceholder)
+  // The placeholder matched the row's explicit id on every row observed. One
+  // that contradicts it is ignored rather than allowed to name usage that is
+  // stamped with the other id.
+  const placeholder = explicitId != null && placeholderId != null && placeholderId !== explicitId ? undefined : storedPlaceholder
+  const modelId = explicitId ?? placeholderId ?? placeholderModelId(slug)
   const ts = generationTimestamp(chatModel)
   const generation: GenerationMetadata = {
     index,
@@ -694,9 +708,10 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   }
 
   const selected = generations.filter((generation) => generation.index >= firstIndex)
-  let previousStep = Math.max(-1, ...generations
+  const importedStep = Math.max(-1, ...generations
     .filter((generation) => generation.index < firstIndex)
     .flatMap((generation) => generation.stepIndices))
+  let previousStep = importedStep
   // Every step is parsed, including those an earlier import already covered:
   // the names they pair with model ids below must not depend on the cursor,
   // or an incremental import would attribute usage differently from a full one.
@@ -723,30 +738,64 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // (Rows that store different names beside one id, such as a variant slug
   // next to a plain one, keep their own names.)
   const learned = new Map<number, string>()
-  const learn = (named: NamedModel): void => {
-    if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)
+  // Ids first named by a row this import added: usage imported earlier under
+  // such an id was recorded as antigravity-model-<id> and is re-emitted below.
+  const newlyNamed = new Set<number>()
+  const learn = (named: NamedModel, addedNow: boolean): void => {
+    if (named.modelId == null || !named.model || learned.has(named.modelId)) return
+    learned.set(named.modelId, named.model)
+    if (addedNow) newlyNamed.add(named.modelId)
   }
-  const namedRows: NamedModel[] = [...generations, ...steps.values()]
-  for (const row of namedRows) if (!row.inferred) learn(row)
-  for (const row of namedRows) if (row.inferred) learn(row)
-  for (const row of namedRows) if (row.inferred && row.modelId != null) row.model = learned.get(row.modelId) ?? row.model
+  const namedRows: Array<[NamedModel, boolean]> = [
+    ...generations.map((generation): [NamedModel, boolean] => [generation, generation.index >= firstIndex]),
+    ...[...steps.entries()].map(([index, step]): [NamedModel, boolean] => [step, index > importedStep]),
+  ]
+  for (const [row, addedNow] of namedRows) if (!row.inferred) learn(row, addedNow)
+  for (const [row, addedNow] of namedRows) if (row.inferred) learn(row, addedNow)
+  for (const [row] of namedRows) if (row.inferred && row.modelId != null) row.model = learned.get(row.modelId) ?? row.model
 
-  const events: UsageEvent[] = []
-  let current: NamedModel | undefined = generations
-    .filter((generation) => generation.index < firstIndex && generation.model)
-    .pop()
-  const lastNamed: NamedModel | undefined = [...generations].reverse().find((generation) => generation.model)
-
-  for (const generation of selected) {
-    if (generation.model) current = generation
-    const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
+  const rowEventsOf = (generation: GenerationMetadata, previousStep: number, lastStep: number): UsageEvent[] => {
     const linkedTs = generation.stepIndices.map((index) => steps.get(index)?.ts).find((ts) => ts != null)
-    const rowEvents = [
+    return [
       ...[...steps.entries()]
         .filter(([index]) => index > previousStep && index <= lastStep)
         .flatMap(([, step]) => step.events),
       ...generation.events.map((event) => ({ ...event, ts: event.ts ?? linkedTs })),
     ]
+  }
+
+  const events: UsageEvent[] = []
+  const lastNamed: NamedModel | undefined = [...generations].reverse().find((generation) => generation.model)
+
+  if (newlyNamed.size > 0) {
+    // Rows this import added name ids that earlier usage carried unnamed. That
+    // usage is re-emitted so its records — whose ids do not depend on the
+    // model — are replaced in place, and an incremental import ends where a
+    // full import would.
+    let earlierStep = -1
+    let earlierCurrent: NamedModel | undefined
+    for (const generation of generations) {
+      if (generation.index >= firstIndex) break
+      if (generation.model) earlierCurrent = generation
+      const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : earlierStep
+      const rowEvents = rowEventsOf(generation, earlierStep, lastStep)
+        .filter((event) => event.usage.modelId != null && newlyNamed.has(event.usage.modelId))
+      earlierStep = Math.max(earlierStep, lastStep)
+      for (const event of rowEvents) {
+        event.model ??= inheritedModel(event.usage.modelId, event.owner, [earlierCurrent, lastNamed], learned)
+      }
+      events.push(...rowEvents)
+    }
+  }
+
+  let current: NamedModel | undefined = generations
+    .filter((generation) => generation.index < firstIndex && generation.model)
+    .pop()
+
+  for (const generation of selected) {
+    if (generation.model) current = generation
+    const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
+    const rowEvents = rowEventsOf(generation, previousStep, lastStep)
     if (rowEvents.length === 0 && generation.index === latestGenerationIndex) break
     nextIndex = generation.index + 1
     previousStep = lastStep

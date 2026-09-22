@@ -783,6 +783,61 @@ describe('parse-antigravity', () => {
       expect(result.records[0]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google', inputTokens: 5_000, outputTokens: 400 })
     })
 
+    it('re-emits usage imported earlier once a later row names its id', () => {
+      // Generation 0 runs an id nothing names yet; the first import records it
+      // as a placeholder. A later generation's step then stores the name.
+      insertGeneration(0, generationMetadata({
+        usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      const [first] = parse().records
+      expect(first).toMatchObject({ model: `antigravity-model-${UNKNOWN_ID}`, provider: 'unknown' })
+
+      insertStep(3, stepMetadata({
+        ts: 3_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ input: 30, totalOutput: 3, responseId: 'r1' }),
+      }))
+      insertGeneration(1, generationMetadata({ stepIndices: [3] }))
+
+      const incremental = parse(1)
+      const full = parse()
+
+      expect(incremental.errors).toEqual([])
+      expect(incremental.nextIndex).toBe(2)
+      expect(incremental.records.map((record) => [record.inputTokens, record.model])).toEqual([[10, 'gemini-3.8-flash'], [30, 'gemini-3.8-flash']])
+      // The corrected record replaces the placeholder one: same id, new model.
+      expect(incremental.records[0].id).toBe(first.id)
+      expect(full.records.map((record) => [record.id, record.model])).toEqual(incremental.records.map((record) => [record.id, record.model]))
+    })
+
+    it('does not re-emit earlier usage whose id was already named before this import', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+      insertStep(2, stepMetadata({ ts: 2_000, modelId: UNKNOWN_ID, modelName: 'gemini-3.8-flash', usage: usage({ input: 30, totalOutput: 3, responseId: 'r1' }) }))
+      insertGeneration(1, generationMetadata({ stepIndices: [2] }))
+
+      expect(parse(1).records.map((record) => [record.inputTokens, record.model])).toEqual([[30, 'gemini-3.8-flash']])
+    })
+
+    it('ignores a placeholder that contradicts the row\'s explicit id', () => {
+      insertGeneration(0, generationMetadata({
+        modelId: 1016,
+        placeholder: 'MODEL_PLACEHOLDER_M318',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+
+      const [record] = parse().records
+
+      // The usage is stamped with id 1016, so it is billed as that id's model, not as Flash.
+      expect(record).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
+    })
+
     it('names an id from steps an earlier import already covered', () => {
       // A step before the cursor is the only row that names the id; an
       // incremental import must attribute later usage exactly like a full one.
