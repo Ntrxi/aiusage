@@ -72,6 +72,21 @@ describe('curated pricing aliases (issue #69)', () => {
     expect(resolvePriceFromRegistry(db, 'gemini-3.1-pro')).toMatchObject({ input: 1, output: 5 })
   })
 
+  it('removes an alias it seeded once a real price appears under that name', () => {
+    insertPrice('gemini-3.1-pro-preview', 2, 12)
+    expect(ensureCuratedPricingAliases(db)).toBe(3)
+    expect(resolvePriceFromRegistry(db, 'gemini-3.1-pro')).toMatchObject({ input: 2, output: 12 })
+
+    insertPrice('gemini-3.1-pro', 1, 5)
+    expect(ensureCuratedPricingAliases(db)).toBe(0)
+
+    expect(aliasRow('gemini-3.1-pro')).toBeUndefined()
+    expect(aliasRow('gemini-3.1-pro-high')).toMatchObject({ model_key: 'gemini-3.1-pro-preview' })
+    expect(resolvePriceFromRegistry(db, 'gemini-3.1-pro')).toMatchObject({ input: 1, output: 5 })
+    loadPricingRuntime(db)
+    expect(resolvePrice('gemini-3.1-pro')).toMatchObject({ input: 1, output: 5 })
+  })
+
   it('does not resurrect a disabled alias', () => {
     insertPrice('gemini-3.1-pro-preview', 2, 12)
     const now = Date.now()

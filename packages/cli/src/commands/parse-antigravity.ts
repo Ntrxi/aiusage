@@ -333,7 +333,7 @@ function isVersionedModelName(value: string): boolean {
 
 /** A versioned model name of a known provider; gates values whose storage layout is inferred rather than observed. */
 function isModelShaped(value: string): boolean {
-  return value.length <= 64 && /^[a-z][a-z0-9._-]*$/i.test(value) && inferProvider(value) !== 'unknown' && isVersionedModelName(value)
+  return value.length <= 64 && /^[a-z][a-z0-9._-]*$/i.test(value) && inferProvider(value.toLowerCase()) !== 'unknown' && isVersionedModelName(value)
 }
 
 /** Canonical name when known, otherwise the name as Antigravity wrote it (never a bare placeholder). */
@@ -359,8 +359,10 @@ interface ModelCandidates {
 
 /**
  * Names a generation from the metadata Antigravity stores with it. Precedence:
- *  1. a readable name that maps to a known canonical model (display label,
- *     `(Thinking)` variant, `MODEL_PLACEHOLDER_M<n>` through the id table);
+ *  1. a readable name that maps to a known canonical model — the placeholder
+ *     first, as an exact id reference (`MODEL_PLACEHOLDER_M<n>` through the id
+ *     table), then the slug, executor model and display label (`(Thinking)`
+ *     variants, labels, name normalisations);
  *  2. the slug or executor model verbatim when it is a versioned model name
  *     Antigravity assigned (`gemini-3.8-flash`, `gemini-3.8-flash-high`);
  *  3. the display label slugified (`Gemini 3.8 Flash (High)` → `gemini-3.8-flash`);
@@ -377,7 +379,7 @@ function resolveModel(candidates: ModelCandidates): string | undefined {
   const executor = cleanModel(candidates.executor)
   const tableExecutor = cleanModel(candidates.tableExecutor)
   const machineNames = [slug, executor].filter((name): name is string => name != null)
-  for (const name of [slug, executor, placeholder, label, tableExecutor]) {
+  for (const name of [placeholder, slug, executor, label]) {
     const canonical = canonicalModel(name)
     if (canonical) return canonical
   }
