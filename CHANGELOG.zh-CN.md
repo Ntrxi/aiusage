@@ -7,6 +7,10 @@
 
 ## [未发布]
 
+### 修复
+- **Antigravity 用量被归到占位模型 ID** ([#68](https://github.com/juliantanx/aiusage/issues/68)) — 用量行的数字模型 ID 优先于旁边存储的可读模型名，因此解析器硬编码表中缺失的每个 ID（1050、1071、1264、1298、1299、1318……）都被导入为 `antigravity-model-<id>`，`provider=unknown`，费用为 $0，而且 Antigravity 每发布一个新模型该列表就会增长。解析器现在优先从可读元数据命名 generation——所选模型 slug、执行器模型（嵌在 generation 行中或 `executor_metadata` 表中）、`MODEL_PLACEHOLDER_M<n>` 标签（对应 ID `1000 + n`）以及显示名称——其次使用同一数据库中其他行为该 ID 给出的可读名称，再次才是硬编码表，只有在没有任何可读信息时才回退到占位名。ID 与所属 generation 不同的用量事件（Antigravity 的辅助模型）不再沿用 generation 的模型名。Claude 4.5 Sonnet/Haiku 的硬编码 ID 现在解析为可计价的 `claude-sonnet-4-5`/`claude-haiku-4-5`。Antigravity 解析在 `watermark.json` 中带有版本号：升级后会重新导入每个会话数据库一次；由于记录 ID 不依赖模型，修正后的模型、提供商和费用会原地替换旧行而不会产生重复。
+- **Gemini 3.x Pro 用量费用为 $0** ([#69](https://github.com/juliantanx/aiusage/issues/69)) — LiteLLM 仅以 `gemini-3.1-pro-preview` 收录 Gemini 3.1 Pro，而前缀匹配只对比注册表键更长的模型名有效，因此已正确识别为 `gemini-3.1-pro` 的记录仍保持 `costSource=unknown`。价格注册表现在会在目标价格存在时（每次打开数据库以及每次价格同步后）自动写入内置别名 `gemini-3.1-pro`、`gemini-3.1-pro-high`、`gemini-3.1-pro-low` → `gemini-3.1-pro-preview`（同理 `gemini-3-pro` 系列 → `gemini-3-pro-preview`，`gemini-3-flash` → `gemini-3-flash-preview`），且绝不覆盖用户或同步得到的别名；站点的价格同步也写入相同别名。记录的模型名保持不变——Antigravity 的按努力等级区分的变体保留其身份，不再被合并——通过“重新计算价格”（或 Antigravity 的一次性重新导入）即可修复现有的 $0 记录。
+
 ---
 
 ## [1.5.18] - 2026-09-20

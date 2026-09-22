@@ -39,20 +39,30 @@ interface ModelUsage {
 
 interface UsageEvent {
   usage: ModelUsage
+  /**
+   * Readable model that describes this event: read from the event's own
+   * metadata, or inherited from its generation when the generation's numeric
+   * model id matches the event's (or either side carries no id).
+   */
   model?: string
   ts?: number
   sourceKey: string
   lineOffset: number
 }
 
-interface GenerationMetadata {
-  index: number
+/** A readable model name together with the numeric model id it was stored next to. */
+interface NamedModel {
   model?: string
+  modelId?: number
+}
+
+interface GenerationMetadata extends NamedModel {
+  index: number
   stepIndices: number[]
   events: UsageEvent[]
 }
 
-interface StepMetadata {
+interface StepMetadata extends NamedModel {
   ts?: number
   events: UsageEvent[]
 }
@@ -206,6 +216,8 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'model_placeholder_m133': 'gemini-3.5-flash-high',
   'model_placeholder_m187': 'gemini-3.5-flash-extra-low',
   'model_openai_gpt_oss_120b_medium': 'gpt-oss-120b-medium',
+  'claude-opus-4-6-thinking': 'claude-opus-4-6',
+  'gemini-default': 'gemini-3.5-flash-medium',
   'gemini-pro-default': 'gemini-3.1-pro',
   'gemini-pro-agent': 'gemini-3.1-pro',
   'gemini-3-flash-agent': 'gemini-3.5-flash-high',
@@ -216,51 +228,133 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'gemini-3-flash-c': 'gemini-3-flash-preview',
   'gemini-3-flash': 'gemini-3-flash-preview',
   'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
-  'gemini-3.1-pro-high': 'gemini-3.1-pro',
-  'gemini-3.1-pro-low': 'gemini-3.1-pro',
-  'gemini-3-pro-high': 'gemini-3-pro',
-  'gemini-3-pro-low': 'gemini-3-pro',
 }
 
-function normalizeModel(value: string | undefined): string | undefined {
+/**
+ * Numeric model ids observed in Antigravity databases, kept only as a fallback
+ * for rows that carry no readable model. Antigravity's `MODEL_PLACEHOLDER_M<n>`
+ * labels denote the model with id `1000 + n`, so the two tables bridge each other.
+ * Effort-qualified Gemini 3.x Pro names (`-high`, `-low`) are kept as the model
+ * identity; pricing maps them onto the same registry entry (issue #69).
+ */
+const PLACEHOLDER_ID_OFFSET = 1000
+
+const KNOWN_MODEL_IDS: Record<number, string> = {
+  246: 'gemini-2.5-pro',
+  312: 'gemini-2.5-flash',
+  313: 'gemini-2.5-flash-thinking',
+  329: 'gemini-2.5-flash-thinking',
+  330: 'gemini-2.5-flash-lite',
+  281: 'claude-4-sonnet',
+  282: 'claude-4-sonnet',
+  290: 'claude-4-opus',
+  291: 'claude-4-opus',
+  333: 'claude-sonnet-4-5',
+  334: 'claude-sonnet-4-5',
+  340: 'claude-haiku-4-5',
+  341: 'claude-haiku-4-5',
+  342: 'gpt-oss-120b-medium',
+  1016: 'gemini-3.1-pro',
+  1018: 'gemini-3-flash-preview',
+  1020: 'gemini-3.5-flash-medium',
+  1026: 'claude-opus-4-6',
+  1035: 'claude-sonnet-4-6',
+  1036: 'gemini-3.1-pro',
+  1037: 'gemini-3.1-pro',
+  1047: 'gemini-3-flash-preview',
+  1071: 'gemini-3.6-flash',
+  1084: 'gemini-3-flash-preview',
+  1132: 'gemini-3.5-flash-high',
+  1133: 'gemini-3.5-flash-high',
+  1187: 'gemini-3.5-flash-extra-low',
+  1264: 'gemini-3.6-flash',
+  1298: 'gemini-3.7-flash',
+  1299: 'gemini-3.7-flash',
+  1318: 'gemini-3.8-flash',
+}
+
+function cleanModel(value: string | undefined): string | undefined {
   if (!value?.trim()) return undefined
   const model = (value.includes('/') ? value.split('/').pop() : value)?.trim()
+  return model || undefined
+}
+
+function aliasFor(key: string): string | undefined {
+  const alias = ANTIGRAVITY_MODEL_ALIASES[key]
+  if (alias) return alias
+  const placeholder = /^model_placeholder_m(\d+)$/.exec(key)
+  return placeholder ? KNOWN_MODEL_IDS[PLACEHOLDER_ID_OFFSET + Number(placeholder[1])] : undefined
+}
+
+/** The canonical model a display label, routing alias or placeholder stands for, if known. */
+function canonicalModel(value: string | undefined): string | undefined {
+  const model = cleanModel(value)
   if (!model) return undefined
   const key = model.toLowerCase()
   const base = key.replace(/\s*\([^)]*\)\s*$/, '').trim()
-  return ANTIGRAVITY_MODEL_ALIASES[key] ?? ANTIGRAVITY_MODEL_ALIASES[base] ?? model
+  return aliasFor(key) ?? aliasFor(base)
 }
 
-function modelNameFromId(modelId: number): string {
-  const known: Record<number, string> = {
-    246: 'gemini-2.5-pro',
-    312: 'gemini-2.5-flash',
-    313: 'gemini-2.5-flash-thinking',
-    329: 'gemini-2.5-flash-thinking',
-    330: 'gemini-2.5-flash-lite',
-    281: 'claude-4-sonnet',
-    282: 'claude-4-sonnet',
-    290: 'claude-4-opus',
-    291: 'claude-4-opus',
-    333: 'claude-4.5-sonnet',
-    334: 'claude-4.5-sonnet',
-    340: 'claude-4.5-haiku',
-    341: 'claude-4.5-haiku',
-    342: 'gpt-oss-120b-medium',
-    1016: 'gemini-3.1-pro',
-    1018: 'gemini-3-flash-preview',
-    1020: 'gemini-3.5-flash-medium',
-    1026: 'claude-opus-4-6',
-    1035: 'claude-sonnet-4-6',
-    1036: 'gemini-3.1-pro',
-    1037: 'gemini-3.1-pro',
-    1047: 'gemini-3-flash-preview',
-    1084: 'gemini-3-flash-preview',
-    1132: 'gemini-3.5-flash-high',
-    1133: 'gemini-3.5-flash-high',
-    1187: 'gemini-3.5-flash-extra-low',
+/** `Gemini 3.5 Flash (Medium)` → `gemini-3.5-flash-medium`; anything else is left alone. */
+function geminiLabelSlug(label: string): string | undefined {
+  const match = /^gemini (\d+(?:\.\d+)?)((?: [a-z]+)+?)(?: \(([a-z ]+)\))?$/.exec(label.toLowerCase())
+  if (!match) return undefined
+  const [, version, family, effort = ''] = match
+  return ['gemini', version, ...family.trim().split(' '), ...effort.split(' ').filter(Boolean)].join('-')
+}
+
+/** Canonical name when known, otherwise the name as Antigravity wrote it. */
+function normalizeModel(value: string | undefined): string | undefined {
+  const model = cleanModel(value)
+  if (!model) return undefined
+  return canonicalModel(model) ?? geminiLabelSlug(model) ?? model
+}
+
+function knownModelName(modelId: number): string | undefined {
+  return KNOWN_MODEL_IDS[modelId] ?? ANTIGRAVITY_MODEL_ALIASES[`model_placeholder_m${modelId - PLACEHOLDER_ID_OFFSET}`]
+}
+
+interface ModelCandidates {
+  modelId?: number
+  /** Model slug Antigravity selected, e.g. `gemini-3.8-flash`, or a routing alias such as `gemini-pro-default`. */
+  slug?: string
+  /** Executor model, usually effort-qualified, e.g. `gemini-3.8-flash-high`. */
+  executor?: string
+  /** `MODEL_PLACEHOLDER_M<n>` from the chat model's `model_enum` entry. */
+  placeholder?: string
+  /** Display label, e.g. `Gemini 3.8 Flash (High)`. */
+  label?: string
+}
+
+/**
+ * Names a generation or step from the metadata Antigravity stores with it.
+ * Precedence: a readable name that maps to a known canonical model; a slug or
+ * executor model that looks like a real model name (it carries a version
+ * number — routing aliases such as `gemini-default` do not); a Gemini display
+ * label; the known numeric-id table; any remaining readable name verbatim.
+ * A numeric id nobody knows never displaces a readable name; the caller falls
+ * back to `antigravity-model-<id>` only when nothing readable exists (issue #68).
+ */
+function resolveModel(candidates: ModelCandidates): string | undefined {
+  const { modelId, slug, executor, placeholder, label } = candidates
+  return [slug, executor, placeholder, label].map(canonicalModel).find(Boolean)
+    ?? [slug, executor].map(cleanModel).find((name): name is string => name != null && /\d/.test(name))
+    ?? geminiLabelSlug(cleanModel(label) ?? '')
+    ?? (modelId != null ? knownModelName(modelId) : undefined)
+    ?? [slug, executor, label].map(cleanModel).find(Boolean)
+}
+
+/** The readable model of `named` when it can describe an event with `modelId`: the ids match, or either side has none. */
+function describedBy(named: NamedModel | undefined, modelId: number | undefined): string | undefined {
+  if (!named?.model) return undefined
+  return modelId == null || named.modelId == null || named.modelId === modelId ? named.model : undefined
+}
+
+function modelEnum(chatModel: ProtoField[]): string | undefined {
+  for (const entry of messages(chatModel, 20)) {
+    if (firstString(entry, [1]) === 'model_enum') return firstString(entry, [2])
   }
-  return known[modelId] ?? `antigravity-model-${modelId}`
+  return undefined
 }
 
 function parseModelUsage(fields: ProtoField[]): ModelUsage {
@@ -302,15 +396,21 @@ function usageEvents(fields: ProtoField[], usageField: number, retryField: numbe
   return events.filter((event) => tokenBearing(event.usage))
 }
 
-function parseGeneration(index: number, data: Buffer): GenerationMetadata {
+function parseGeneration(index: number, data: Buffer, executorModel?: string): GenerationMetadata {
   const metadata = readFields(data)
   const chatModel = firstMessage(metadata, 1)
-  const modelId = firstVarint(chatModel, 3)
-  const model = normalizeModel(firstString(chatModel, [19, 21, 22]))
-    ?? (modelId ? modelNameFromId(modelId) : undefined)
+  const modelId = firstVarint(chatModel, 3) || undefined
+  const model = resolveModel({
+    modelId,
+    slug: firstString(chatModel, [19]),
+    executor: firstString(firstMessage(metadata, 3), [28]) ?? executorModel,
+    placeholder: modelEnum(chatModel),
+    label: firstString(chatModel, [21, 22]),
+  })
   const ts = generationTimestamp(chatModel)
   return {
     index,
+    modelId,
     model,
     stepIndices: repeatedVarints(metadata, 2),
     events: usageEvents(chatModel, 4, 17, `generation:${index}`, index, ts),
@@ -320,19 +420,31 @@ function parseGeneration(index: number, data: Buffer): GenerationMetadata {
 function parseStep(index: number, data: Buffer): StepMetadata {
   const metadata = readFields(data)
   const modelInfo = firstMessage(metadata, 24)
-  const modelId = firstVarint(modelInfo, 1)
+  const modelId = firstVarint(modelInfo, 1) || undefined
   const model = normalizeModel(firstString(modelInfo, [12, 8]))
-    ?? (modelId ? modelNameFromId(modelId) : undefined)
   const ts = timestampFromFields(firstMessage(metadata, 8))
     ?? timestampFromFields(firstMessage(metadata, 1))
   return {
     ts,
-    events: usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => ({ ...event, model })),
+    modelId,
+    model,
+    events: usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
+      event.usage.modelId ??= modelId
+      return { ...event, model }
+    }),
   }
 }
 
-function modelForEvent(event: UsageEvent, fallback?: string): string {
-  return event.usage.modelId ? modelNameFromId(event.usage.modelId) : event.model ?? fallback ?? 'antigravity-unknown'
+/**
+ * The model an event is billed to. A readable name that describes the event
+ * wins; a numeric id is then resolved through the names this database itself
+ * pairs with it, then the known-id table, and only then becomes a placeholder.
+ */
+function modelForEvent(event: UsageEvent, learned: Map<number, string>): string {
+  if (event.model) return event.model
+  const modelId = event.usage.modelId
+  if (modelId == null) return 'antigravity-unknown'
+  return learned.get(modelId) ?? knownModelName(modelId) ?? `antigravity-model-${modelId}`
 }
 
 function mergeEvent(target: UsageEvent, duplicate: UsageEvent): void {
@@ -375,6 +487,32 @@ function hasTable(db: Database.Database, table: string): boolean {
   return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(table) != null
 }
 
+/**
+ * Executor model per generation index from the optional `executor_metadata`
+ * table (field 28). Current databases embed the same value in the generation
+ * row itself; this table is consulted only for generations that lack it.
+ */
+function readExecutorModels(db: Database.Database): Map<number, string> {
+  const models = new Map<number, string>()
+  if (!hasTable(db, 'executor_metadata')) return models
+  let rows: Array<{ idx: number; data: unknown }>
+  try {
+    rows = db.prepare('SELECT idx, data FROM executor_metadata ORDER BY idx').all() as Array<{ idx: number; data: unknown }>
+  } catch {
+    return models
+  }
+  for (const row of rows) {
+    if (!Buffer.isBuffer(row.data)) continue
+    try {
+      const model = firstString(readFields(row.data), [28])
+      if (model) models.set(Number(row.idx), model)
+    } catch {
+      // Auxiliary hint only: an unreadable executor row never fails the import.
+    }
+  }
+  return models
+}
+
 function readTrajectoryTimestamp(db: Database.Database, errors: string[]): number | undefined {
   try {
     if (!hasTable(db, 'trajectory_metadata_blob')) return undefined
@@ -407,6 +545,7 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   }
 
   const trajectoryTs = readTrajectoryTimestamp(db, errors)
+  const executorModels = readExecutorModels(db)
   const generations: GenerationMetadata[] = []
   const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx').all() as Array<{ idx: number; data: Buffer }>
   const latestGenerationIndex = Math.max(-1, ...rows.map((row) => Number(row.idx)).filter(Number.isFinite))
@@ -414,7 +553,7 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     const index = Number(row.idx)
     try {
       if (!Buffer.isBuffer(row.data)) throw new Error('generation metadata is not a blob')
-      generations.push(parseGeneration(index, row.data))
+      generations.push(parseGeneration(index, row.data, executorModels.get(index)))
     } catch (error) {
       if (index >= firstIndex) {
         errors.push(`generation metadata ${index}: ${error instanceof Error ? error.message : error}`)
@@ -440,35 +579,45 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
     }
   }
 
+  // Numeric ids this database pairs with readable names: an event whose id is
+  // known only here (a helper model, a retry on another model) is named from
+  // the rows that spell it out rather than from the hard-coded table.
+  const learned = new Map<number, string>()
+  const learn = (named: NamedModel): void => {
+    if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)
+  }
+  for (const generation of generations) learn(generation)
+  for (const step of steps.values()) learn(step)
+
   const events: UsageEvent[] = []
-  let currentModel = generations
-    .filter((generation) => generation.index < firstIndex)
-    .map((generation) => generation.model)
-    .filter((model): model is string => Boolean(model))
+  let current: NamedModel | undefined = generations
+    .filter((generation) => generation.index < firstIndex && generation.model)
     .pop()
-  const generationModel = [...generations].reverse().find((generation) => generation.model)?.model
+  const lastNamed: NamedModel | undefined = [...generations].reverse().find((generation) => generation.model)
 
   for (const generation of selected) {
-    currentModel = generation.model ?? currentModel
+    if (generation.model) current = generation
     const lastStep = generation.stepIndices.length > 0 ? Math.max(...generation.stepIndices) : previousStep
     const linkedTs = generation.stepIndices.map((index) => steps.get(index)?.ts).find((ts) => ts != null)
     const rowEvents = [
       ...[...steps.entries()]
         .filter(([index]) => index > previousStep && index <= lastStep)
         .flatMap(([, step]) => step.events),
-      ...generation.events.map((event) => ({ ...event, model: event.model ?? currentModel, ts: event.ts ?? linkedTs })),
+      ...generation.events.map((event) => ({ ...event, ts: event.ts ?? linkedTs })),
     ]
     if (rowEvents.length === 0 && generation.index === latestGenerationIndex) break
     nextIndex = generation.index + 1
     previousStep = lastStep
     if (rowEvents.length === 0) continue
-    for (const event of rowEvents) event.model ??= currentModel ?? generationModel
+    for (const event of rowEvents) {
+      event.model ??= describedBy(current, event.usage.modelId) ?? describedBy(lastNamed, event.usage.modelId)
+    }
     events.push(...rowEvents)
   }
 
   const sessionId = basename(dbPath).replace(/\.db$/i, '') || 'unknown'
   const records = deduplicateEvents(events).map((event, index): StatsRecord => {
-    const model = modelForEvent(event, generationModel)
+    const model = modelForEvent(event, learned)
     const provider = inferProvider(model)
     const { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, thinkingTokens } = event.usage
     const tokenArgs = { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, thinkingTokens }

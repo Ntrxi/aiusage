@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import {
+  CURATED_PRICE_ALIASES,
   setRuntimePriceTable,
   setPriceOverride,
   resolvePriceFromTable,
@@ -490,6 +491,29 @@ function upsertBuiltinAlias(db: Database.Database, alias: string, modelKey: stri
   return 'updated'
 }
 
+/**
+ * Seeds the curated aliases from `CURATED_PRICE_ALIASES` as builtin aliases.
+ * An alias is added only when its target price exists (the aliases table
+ * references model_prices) and only when no alias of that name exists yet, so
+ * a user binding or a real registry key that LiteLLM later adds always wins.
+ * Runs on every database open and after each pricing sync; returns the number
+ * of aliases added. Existing $0 records are repaired by recalculating pricing.
+ */
+export function ensureCuratedPricingAliases(db: Database.Database): number {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled, created_at, updated_at)
+    SELECT ?, model_key, 'exact', provider, 100, 'aiusage', 'builtin', 1, ?, ?
+    FROM model_prices
+    WHERE model_key = ? AND status = 'active'
+  `)
+  const now = Date.now()
+  let added = 0
+  for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
+    added += insert.run(alias, now, now, modelKey).changes
+  }
+  return added
+}
+
 export async function syncPricingFromLitellm(db: Database.Database): Promise<PricingSyncSummary> {
   const response = await fetch(LITELLM_PRICING_URL, { headers: { Accept: 'application/json' } })
   if (!response.ok) throw new Error(`LiteLLM pricing fetch failed: HTTP ${response.status}`)
@@ -523,6 +547,7 @@ export async function syncPricingFromLitellm(db: Database.Database): Promise<Pri
         else if (aliasResult === 'user_preserved') summary.userPreserved++
       }
     }
+    summary.aliasesAdded += ensureCuratedPricingAliases(db)
   })
   tx()
   summary.dryRun = dryRunLocalModels(db)

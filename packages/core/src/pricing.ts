@@ -56,6 +56,26 @@ export function getUserOverrides(): Record<string, PriceEntry> {
   return { ...userOverrides }
 }
 
+/**
+ * Pricing aliases for model names that tools report but that no pricing source
+ * lists under that exact key. LiteLLM prices Gemini 3.x Pro only under its
+ * `-preview` key, and prefix matching only helps a model name that is *longer*
+ * than a registry key, so `gemini-3.1-pro` and Antigravity's effort-qualified
+ * `-high`/`-low` variants resolved to nothing and cost $0 (issue #69).
+ * Hosts seed these as builtin aliases whenever the target price exists and
+ * never override an alias a user or a pricing sync already defined. The
+ * record's model name is left untouched; only price resolution follows the alias.
+ */
+export const CURATED_PRICE_ALIASES: ReadonlyArray<{ alias: string; modelKey: string }> = [
+  { alias: 'gemini-3.1-pro', modelKey: 'gemini-3.1-pro-preview' },
+  { alias: 'gemini-3.1-pro-high', modelKey: 'gemini-3.1-pro-preview' },
+  { alias: 'gemini-3.1-pro-low', modelKey: 'gemini-3.1-pro-preview' },
+  { alias: 'gemini-3-pro', modelKey: 'gemini-3-pro-preview' },
+  { alias: 'gemini-3-pro-high', modelKey: 'gemini-3-pro-preview' },
+  { alias: 'gemini-3-pro-low', modelKey: 'gemini-3-pro-preview' },
+  { alias: 'gemini-3-flash', modelKey: 'gemini-3-flash-preview' },
+]
+
 const PROVIDER_PREFIXES = [
   'accounts/fireworks/models/',
   'moonshotai/',

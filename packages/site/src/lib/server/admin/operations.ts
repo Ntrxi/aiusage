@@ -1,5 +1,6 @@
 import { sql } from '../db/pool.js'
 import { nanoid } from 'nanoid'
+import { CURATED_PRICE_ALIASES } from '@aiusage/core'
 import { invalidateLeaderboardCache } from '../leaderboard/query.js'
 
 export async function banUser(adminUserId: string, targetUserId: string, reason: string): Promise<void> {
@@ -241,6 +242,21 @@ export async function syncPricingFromLitellm(adminUserId: string): Promise<{ add
         if (!existingAlias) aliasesAdded++
         else if (existingAlias.origin !== 'user' && (existingAlias.model_key !== entry.modelKey || existingAlias.enabled !== true)) aliasesUpdated++
       }
+    }
+
+    // Curated aliases for model names no pricing source lists verbatim (e.g.
+    // gemini-3.1-pro → gemini-3.1-pro-preview, issue #69). Added only when the
+    // target price exists and no alias of that name exists yet.
+    for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
+      const inserted = await tx`
+        INSERT INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled)
+        SELECT ${alias}, model_key, 'exact', provider, 100, 'aiusage', 'builtin', TRUE
+        FROM model_prices
+        WHERE model_key = ${modelKey} AND status = 'active'
+        ON CONFLICT (alias) DO NOTHING
+        RETURNING alias
+      `
+      if (inserted.length > 0) aliasesAdded++
     }
   })
 

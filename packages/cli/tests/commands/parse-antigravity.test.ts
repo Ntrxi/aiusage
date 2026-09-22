@@ -57,12 +57,19 @@ function retry(value: Buffer): Buffer {
 }
 
 function generationMetadata(options: {
+  /** Model slug Antigravity selected (chat model field 19). */
   model?: string
   modelId?: number
   usage?: Buffer
   retries?: Buffer[]
   stepIndices?: number[]
   ts?: number
+  /** `MODEL_PLACEHOLDER_M<n>` stored as the `model_enum` entry (chat model field 20). */
+  placeholder?: string
+  /** Display label such as `Gemini 3.8 Flash (High)` (chat model field 21). */
+  label?: string
+  /** Executor model embedded in the generation row (field 3 → 28). */
+  executorModel?: string
 }): Buffer {
   const chatModel = message(
     options.modelId ? field(3, options.modelId) : undefined,
@@ -70,12 +77,20 @@ function generationMetadata(options: {
     options.ts != null ? field(9, message(field(4, timestamp(options.ts)))) : undefined,
     ...(options.retries ?? []).map((value) => field(17, retry(value))),
     options.model ? field(19, options.model) : undefined,
+    field(20, message(field(1, 'used_claude'), field(2, 'false'))),
+    options.placeholder ? field(20, message(field(1, 'model_enum'), field(2, options.placeholder))) : undefined,
+    options.label ? field(21, options.label) : undefined,
   )
   const stepIndices = options.stepIndices ?? []
   return message(
     field(1, chatModel),
     stepIndices.length > 0 ? field(2, Buffer.concat(stepIndices.map(varint))) : undefined,
+    options.executorModel ? field(3, message(field(28, options.executorModel))) : undefined,
   )
+}
+
+function executorMetadata(model: string): Buffer {
+  return message(field(28, model))
 }
 
 function timestamp(ts: number): Buffer {
@@ -94,31 +109,38 @@ function stepMetadata(options: {
   usage?: Buffer
   retries?: Buffer[]
   modelId?: number
+  modelName?: string
 }): Buffer {
   return message(
     field(1, timestamp(options.ts)),
     options.usage ? field(9, options.usage) : undefined,
     ...(options.retries ?? []).map((value) => field(28, retry(value))),
-    options.modelId ? field(24, message(field(1, options.modelId))) : undefined,
+    options.modelId || options.modelName ? field(24, message(
+      options.modelId ? field(1, options.modelId) : undefined,
+      options.modelName ? field(12, options.modelName) : undefined,
+    )) : undefined,
   )
 }
+
+const SCHEMA = `
+  CREATE TABLE gen_metadata (idx INTEGER, data BLOB, size INTEGER);
+  CREATE TABLE steps (idx INTEGER, metadata BLOB);
+  CREATE TABLE executor_metadata (idx INTEGER, data BLOB);
+  CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);
+`
 
 describe('parse-antigravity', () => {
   let db: Database.Database
 
   beforeEach(() => {
     db = new Database(':memory:')
-    db.exec(`
-      CREATE TABLE gen_metadata (idx INTEGER, data BLOB, size INTEGER);
-      CREATE TABLE steps (idx INTEGER, metadata BLOB);
-      CREATE TABLE trajectory_metadata_blob (id TEXT, data BLOB);
-    `)
+    db.exec(SCHEMA)
   })
 
   afterEach(() => db.close())
 
-  function parse(startIndex = 0) {
-    return runParseAntigravity(db, {
+  function parse(startIndex = 0, target: Database.Database = db) {
+    return runParseAntigravity(target, {
       dbPath: '/home/test/.gemini/antigravity/conversations/session-1.db',
       device: 'laptop',
       deviceInstanceId: 'device-123',
@@ -126,6 +148,14 @@ describe('parse-antigravity', () => {
       fallbackTs: Date.UTC(2026, 8, 7),
       startIndex,
     })
+  }
+
+  function insertGeneration(index: number, data: Buffer): void {
+    db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(index, data, data.length)
+  }
+
+  function insertStep(index: number, data: Buffer): void {
+    db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)').run(index, data)
   }
 
   it('imports exact usage from generation metadata', () => {
@@ -389,5 +419,166 @@ describe('parse-antigravity', () => {
 
     expect(result.records).toEqual([])
     expect(result.nextIndex).toBe(0)
+  })
+
+  describe('model attribution (issue #68)', () => {
+    // 4318 stands for an id Antigravity introduced after this parser was written.
+    const UNKNOWN_ID = 4318
+
+    it('prefers the readable model over an unknown usage-level model id', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3.8-flash',
+        modelId: UNKNOWN_ID,
+        label: 'Gemini 3.8 Flash (High)',
+        usage: usage({ modelId: UNKNOWN_ID, input: 1_000_000, totalOutput: 10 }),
+      }))
+
+      const result = parse()
+
+      expect(result.errors).toEqual([])
+      expect(result.records).toHaveLength(1)
+      expect(result.records[0]).toMatchObject({ model: 'gemini-3.8-flash', provider: 'google', costSource: 'pricing' })
+      expect(result.records[0].cost).toBeGreaterThan(0)
+    })
+
+    it('resolves a numeric id from the executor model when the chat model carries no name', () => {
+      insertGeneration(0, generationMetadata({
+        modelId: UNKNOWN_ID,
+        executorModel: 'gemini-3.8-flash-high',
+        usage: usage({ modelId: UNKNOWN_ID, input: 1_000_000, totalOutput: 10 }),
+      }))
+
+      const [record] = parse().records
+
+      expect(record).toMatchObject({ model: 'gemini-3.8-flash-high', provider: 'google', costSource: 'pricing' })
+      expect(record.cost).toBeGreaterThan(0)
+    })
+
+    it('falls back to the executor_metadata table for the same generation index', () => {
+      db.prepare('INSERT INTO executor_metadata (idx, data) VALUES (?, ?)').run(0, executorMetadata('gemini-3.8-flash-high'))
+      insertGeneration(0, generationMetadata({
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5 }),
+      }))
+
+      expect(parse().records[0]).toMatchObject({ model: 'gemini-3.8-flash-high', provider: 'google' })
+    })
+
+    it('resolves MODEL_PLACEHOLDER labels through the numeric id table', () => {
+      insertGeneration(0, generationMetadata({
+        placeholder: 'MODEL_PLACEHOLDER_M318',
+        usage: usage({ modelId: 1318, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        placeholder: 'MODEL_PLACEHOLDER_M16',
+        usage: usage({ modelId: 1016, input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+
+      const records = parse().records
+
+      expect(records.map((record) => record.model)).toEqual(['gemini-3.8-flash', 'gemini-3.1-pro'])
+      expect(records.map((record) => record.provider)).toEqual(['google', 'google'])
+    })
+
+    it('names a numeric id from the rows of the same database that spell it out', () => {
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3.8-flash',
+        modelId: UNKNOWN_ID,
+        usage: usage({ modelId: UNKNOWN_ID, input: 10, totalOutput: 1, responseId: 'r0' }),
+      }))
+      // A later generation on another model runs a step on the unknown id without naming it.
+      insertStep(3, stepMetadata({ ts: 3_000, usage: usage({ modelId: UNKNOWN_ID, input: 30, totalOutput: 3, responseId: 'r-step' }) }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-2.5-pro',
+        modelId: 246,
+        usage: usage({ modelId: 246, input: 20, totalOutput: 2, responseId: 'r1' }),
+        stepIndices: [3],
+      }))
+
+      const records = parse().records
+
+      expect(records.map((record) => [record.inputTokens, record.model])).toEqual([
+        [10, 'gemini-3.8-flash'],
+        [30, 'gemini-3.8-flash'],
+        [20, 'gemini-2.5-pro'],
+      ])
+    })
+
+    it('keeps a genuinely unknown id as a placeholder instead of borrowing the generation model', () => {
+      // Antigravity runs a helper model (id 1050) inside conversations driven by another model.
+      insertStep(2, stepMetadata({ ts: 2_000, usage: usage({ modelId: 1050, input: 70, totalOutput: 6, responseId: 'helper' }) }))
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-pro-default',
+        modelId: 1016,
+        label: 'Gemini 3.1 Pro (High)',
+        usage: usage({ modelId: 1016, input: 5_000, totalOutput: 400, responseId: 'main' }),
+        stepIndices: [2],
+      }))
+
+      const records = parse().records.sort((a, b) => a.inputTokens - b.inputTokens)
+
+      expect(records).toHaveLength(2)
+      expect(records[0]).toMatchObject({ model: 'antigravity-model-1050', provider: 'unknown', cost: 0, costSource: 'unknown' })
+      expect(records[1]).toMatchObject({ model: 'gemini-3.1-pro', provider: 'google' })
+    })
+
+    it('does not let an unknown step model id override the step model name', () => {
+      insertStep(1, stepMetadata({
+        ts: 1_000,
+        modelId: UNKNOWN_ID,
+        modelName: 'gemini-3.8-flash',
+        usage: usage({ input: 12, totalOutput: 3 }),
+      }))
+      insertGeneration(0, generationMetadata({ stepIndices: [1] }))
+
+      expect(parse().records[0]).toMatchObject({ model: 'gemini-3.8-flash', provider: 'google' })
+    })
+
+    it('slugifies Gemini display labels and routing defaults when no slug is stored', () => {
+      insertGeneration(0, generationMetadata({
+        label: 'Gemini 3.5 Flash (Medium)',
+        usage: usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-default',
+        usage: usage({ modelId: 1020, input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+
+      expect(parse().records.map((record) => record.model)).toEqual(['gemini-3.5-flash-medium', 'gemini-3.5-flash-medium'])
+    })
+
+    it('keeps record ids stable when the model attribution changes', () => {
+      const shared = usage({ modelId: UNKNOWN_ID, input: 20, totalOutput: 5, responseId: 'stable-response' })
+      insertGeneration(0, generationMetadata({ usage: shared }))
+      const corrected = new Database(':memory:')
+      corrected.exec(SCHEMA)
+      corrected.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)')
+        .run(0, generationMetadata({ model: 'gemini-3.8-flash', modelId: UNKNOWN_ID, usage: shared }), 1)
+
+      try {
+        const [before] = parse().records
+        const [after] = parse(0, corrected).records
+
+        expect(before.model).toBe(`antigravity-model-${UNKNOWN_ID}`)
+        expect(after.model).toBe('gemini-3.8-flash')
+        expect(after.id).toBe(before.id)
+      } finally {
+        corrected.close()
+      }
+    })
+  })
+
+  it('preserves effort-qualified Gemini Pro variants as the model identity (issue #69)', () => {
+    for (const [index, model] of ['gemini-3.1-pro', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low'].entries()) {
+      insertGeneration(index, generationMetadata({
+        model,
+        usage: usage({ input: 20, totalOutput: 5, responseId: `response-${index}` }),
+      }))
+    }
+
+    const records = parse().records
+
+    expect(records.map((record) => record.model)).toEqual(['gemini-3.1-pro', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low'])
+    expect(records.every((record) => record.provider === 'google')).toBe(true)
   })
 })
