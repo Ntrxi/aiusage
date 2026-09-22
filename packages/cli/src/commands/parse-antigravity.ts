@@ -52,7 +52,7 @@ interface UsageEvent {
 interface NamedModel {
   model?: string
   modelId?: number
-  /** The name came from a table (the numeric-id table, `executor_metadata`) rather than from a name the row stores. */
+  /** The name came from a table (the numeric-id table, a routing alias, `executor_metadata`) rather than from a name the row stores. */
   inferred?: boolean
 }
 
@@ -208,7 +208,6 @@ const ANTIGRAVITY_MODEL_ALIASES: Record<string, string> = {
   'claude-4.5-sonnet': 'claude-sonnet-4-5',
   'claude-4.5-haiku': 'claude-haiku-4-5',
   'gemini-3-flash': 'gemini-3-flash-preview',
-  'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
 }
 
 /**
@@ -335,6 +334,22 @@ function isVersionedModelName(value: string): boolean {
   return /\d/.test(value) && !isPlaceholder(value) && routingAlias(value) == null
 }
 
+const EFFORT_SUFFIX = /-(?:extra-low|low|medium|high)$/
+
+/**
+ * Whether two model names denote the same model family: one name's segments
+ * prefix the other's once effort qualifiers are dropped, so
+ * `gemini-3.5-flash-high` matches `gemini-3.5-flash-medium` and
+ * `gemini-3.7-flash-safety-le` matches `gemini-3.7-flash`, while
+ * `gemini-3-flash-d` does not match `gemini-3.5-flash-high`.
+ */
+function sameModelFamily(a: string, b: string): boolean {
+  const [shorter, longer] = [a, b]
+    .map((name) => name.toLowerCase().replace(EFFORT_SUFFIX, '').split('-'))
+    .sort((x, y) => x.length - y.length)
+  return shorter.every((segment, index) => segment === longer[index])
+}
+
 /** A versioned model name of a known provider; gates values whose storage layout is inferred rather than observed. */
 function isModelShaped(value: string): boolean {
   return value.length <= 64 && /^[a-z][a-z0-9._-]*$/i.test(value) && inferProvider(value.toLowerCase()) !== 'unknown' && isVersionedModelName(value)
@@ -356,44 +371,51 @@ interface ModelCandidates {
 
 /**
  * Names a row (a generation, or a step) from the metadata Antigravity stores
- * with it. Precedence:
- *  1. the slug when it maps to a known canonical model (`(Thinking)` variants,
- *     name normalisations), else verbatim when it is a versioned model name
- *     Antigravity assigned (`gemini-3.8-flash`, `gemini-3.5-flash-high`);
- *  2. the placeholder as an exact id reference (`MODEL_PLACEHOLDER_M<n>`
- *     through the id table);
- *  3. the display label when it maps to a known canonical model, else
- *     slugified (`Gemini 3.8 Flash (High)` → `gemini-3.8-flash`);
- *  4. the known numeric-id table;
- *  5. the executor model, canonical or verbatim when versioned
+ * with it. The row's identity is the placeholder as an exact id reference
+ * (`MODEL_PLACEHOLDER_M<n>` through the id table), else the display label
+ * (canonical, or slugified: `Gemini 3.8 Flash (High)` → `gemini-3.8-flash`),
+ * else the known numeric-id table. Precedence:
+ *  1. the slug — canonical when it maps to a known model (`(Thinking)`
+ *     variants, name normalisations), else verbatim when it is a versioned
+ *     model name Antigravity assigned (`gemini-3.8-flash`,
+ *     `gemini-3.5-flash-high`) — when it agrees with the row's identity, so
+ *     it refines the identity with an effort or variant qualifier but never
+ *     contradicts it: Antigravity also mints routing-slot names that look
+ *     versioned (`gemini-3-flash-d`), and only the ones in the routing table
+ *     are recognised as such;
+ *  2. the row's identity from the placeholder or the label;
+ *  3. the known numeric-id table;
+ *  4. the executor model, canonical or verbatim when versioned
  *     (`gemini-3.8-flash-high`) — it names the executor, which is not always
  *     the row's own model, so it never outranks the row's slug, label or id;
- *  6. a routing alias (`gemini-default`), whose target moves between releases;
- *  7. the `executor_metadata` table's value when it is model-shaped;
- *  8. any remaining readable name verbatim (never a bare placeholder).
+ *  5. a routing alias (`gemini-default`), whose target moves between releases;
+ *  6. the `executor_metadata` table's value when it is model-shaped;
+ *  7. any remaining readable name verbatim (never a bare placeholder).
  * A numeric id nobody knows never displaces a readable name; the caller falls
  * back to `antigravity-model-<id>` only when nothing readable exists (#68).
+ * The result is flagged `inferred` when the name came from a table (3, 5, 6)
+ * rather than from a name the row stores.
  */
-function resolveModel(candidates: ModelCandidates): string | undefined {
+function resolveModel(candidates: ModelCandidates): Pick<NamedModel, 'model' | 'inferred'> {
   const { modelId, placeholder, label } = candidates
   const slug = cleanModel(candidates.slug)
   const executor = cleanModel(candidates.executor)
   const tableExecutor = cleanModel(candidates.tableExecutor)
   const versioned = (name: string | undefined): string | undefined => name && isVersionedModelName(name) ? name : undefined
-  return canonicalModel(slug) ?? versioned(slug)
-    ?? canonicalModel(placeholder)
-    ?? canonicalModel(label) ?? geminiLabelSlug(label)
-    ?? (modelId != null ? knownModelName(modelId) : undefined)
-    ?? canonicalModel(executor) ?? versioned(executor)
-    ?? [slug, executor].map(routingAlias).find(Boolean)
-    ?? (tableExecutor && isModelShaped(tableExecutor) ? tableExecutor : undefined)
-    ?? [slug, executor, cleanModel(label)].find((name): name is string => name != null && !isPlaceholder(name))
-}
-
-/** The row's model, flagged when it came from a table rather than from a name the row stores. */
-function namedFrom(candidates: ModelCandidates): Pick<NamedModel, 'model' | 'inferred'> {
-  const model = resolveModel(candidates)
-  return { model, inferred: model != null && model !== resolveModel({ ...candidates, modelId: undefined, tableExecutor: undefined }) }
+  const stored = (model: string | undefined): Pick<NamedModel, 'model' | 'inferred'> | undefined => model ? { model, inferred: false } : undefined
+  const inferred = (model: string | undefined): Pick<NamedModel, 'model' | 'inferred'> | undefined => model ? { model, inferred: true } : undefined
+  const own = canonicalModel(slug) ?? versioned(slug)
+  const stated = canonicalModel(placeholder) ?? canonicalModel(label) ?? geminiLabelSlug(label)
+  const known = modelId != null ? knownModelName(modelId) : undefined
+  const identity = stated ?? known
+  return (own && (identity == null || sameModelFamily(own, identity)) ? stored(own) : undefined)
+    ?? stored(stated)
+    ?? inferred(known)
+    ?? stored(canonicalModel(executor) ?? versioned(executor))
+    ?? inferred([slug, executor].map(routingAlias).find(Boolean))
+    ?? inferred(tableExecutor && isModelShaped(tableExecutor) ? tableExecutor : undefined)
+    ?? stored([slug, executor, cleanModel(label)].find((name): name is string => name != null && !isPlaceholder(name)))
+    ?? { model: undefined, inferred: false }
 }
 
 /** The readable model of `named` when it can describe an event with `modelId`: the ids match, or either side has none. */
@@ -478,7 +500,7 @@ function parseGeneration(index: number, data: Buffer, tableExecutor?: string): G
   const generation: GenerationMetadata = {
     index,
     modelId,
-    ...namedFrom({
+    ...resolveModel({
       modelId,
       slug,
       executor: firstString(firstMessage(metadata, 3), [28]),
@@ -507,7 +529,7 @@ function parseStep(index: number, data: Buffer): StepMetadata {
   const step: StepMetadata = {
     ts,
     modelId,
-    ...namedFrom({ modelId, slug: firstString(modelInfo, [12]), label: firstString(modelInfo, [8]) }),
+    ...resolveModel({ modelId, slug: firstString(modelInfo, [12]), label: firstString(modelInfo, [8]) }),
     events: [],
   }
   step.events = usageEvents(metadata, 9, 28, `step:${index}`, index, ts).map((event) => {
@@ -691,8 +713,9 @@ export function runParseAntigravity(db: Database.Database, options: AntigravityI
   // model) is named from those rows rather than from the hard-coded table.
   // Names a row stores beside its id are learned first, in row order; a name a
   // row took from a table only for ids nothing else names. A row named only
-  // from a table then takes the stored name, so one id carries one name
-  // throughout the database.
+  // from a table then takes the name another row stores beside the same id.
+  // (Rows that store different names beside one id, such as a variant slug
+  // next to a plain one, keep their own names.)
   const learned = new Map<number, string>()
   const learn = (named: NamedModel): void => {
     if (named.modelId != null && named.model && !learned.has(named.modelId)) learned.set(named.modelId, named.model)

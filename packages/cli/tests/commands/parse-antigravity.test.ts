@@ -498,14 +498,60 @@ describe('parse-antigravity', () => {
       expect(records).toEqual([[5_000, 'gemini-3.1-pro'], [30, 'gemini-3.1-pro'], [40, 'gemini-3.6-flash-high']])
     })
 
-    it('prefers the row\'s own versioned slug over its placeholder', () => {
+    it('prefers the row\'s own versioned slug over its placeholder when both name the same family', () => {
       insertGeneration(0, generationMetadata({
         model: 'gemini-3.5-flash-high',
         placeholder: 'MODEL_PLACEHOLDER_M20',
         usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
       }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-3.5-flash-low',
+        placeholder: 'MODEL_PLACEHOLDER_M187',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+      insertGeneration(2, generationMetadata({
+        model: 'gemini-3.7-flash-safety-le',
+        label: 'Gemini 3.7 Flash',
+        modelId: 1298,
+        usage: usage({ modelId: 1298, input: 20, totalOutput: 5, responseId: 'r2' }),
+      }))
 
-      expect(parse().records[0]).toMatchObject({ model: 'gemini-3.5-flash-high', provider: 'google', costSource: 'pricing' })
+      const records = parse().records
+
+      expect(records[0]).toMatchObject({ model: 'gemini-3.5-flash-high', provider: 'google', costSource: 'pricing' })
+      // Effort qualifiers are kept as the identity, never collapsed onto another tier.
+      expect(records[1]).toMatchObject({ model: 'gemini-3.5-flash-low', provider: 'google' })
+      expect(records[2]).toMatchObject({ model: 'gemini-3.7-flash-safety-le', provider: 'google' })
+    })
+
+    it('lets the placeholder, label or known id outrank a slug that names another family', () => {
+      // Antigravity mints routing-slot names that look versioned; one missing
+      // from the routing table must not displace what the row says it ran.
+      insertGeneration(0, generationMetadata({
+        model: 'gemini-3-flash-d',
+        placeholder: 'MODEL_PLACEHOLDER_M132',
+        label: 'Gemini 3.5 Flash (High)',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r0' }),
+      }))
+      insertGeneration(1, generationMetadata({
+        model: 'gemini-4-flash-a',
+        label: 'Gemini 3.8 Flash (High)',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r1' }),
+      }))
+      insertGeneration(2, generationMetadata({
+        model: 'gemini-4-flash-a',
+        modelId: 1318,
+        usage: usage({ modelId: 1318, input: 20, totalOutput: 5, responseId: 'r2' }),
+      }))
+      insertGeneration(3, generationMetadata({
+        model: 'gemini-4-flash-a',
+        usage: usage({ input: 20, totalOutput: 5, responseId: 'r3' }),
+      }))
+
+      const records = parse().records.map((record) => record.model)
+
+      // Without any identity to contradict, the slug is still the best name available.
+      expect(records).toEqual(['gemini-3.5-flash-high', 'gemini-3.8-flash', 'gemini-3.8-flash', 'gemini-4-flash-a'])
     })
 
     it('resolves a step\'s model with the same precedence as a generation', () => {
