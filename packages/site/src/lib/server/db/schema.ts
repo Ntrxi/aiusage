@@ -1,4 +1,5 @@
 import { sql } from './pool.js'
+import { ensureCuratedPricingAliases } from '../pricing/curated-aliases.js'
 import { ensureCuratedPrices } from '../pricing/curated-prices.js'
 
 export async function runMigrations(): Promise<void> {
@@ -21,6 +22,12 @@ export async function runMigrations(): Promise<void> {
   }
 
   await ensureCuratedPrices(sql)
+
+  // Not a versioned migration: the curated list changes with the code and its
+  // target prices may only arrive with a later pricing sync, so it is
+  // reapplied on every startup, as the CLI does on each open. Each statement
+  // is idempotent and safe to race with another instance or a pricing sync.
+  await ensureCuratedPricingAliases(sql)
 }
 
 const migrations = [

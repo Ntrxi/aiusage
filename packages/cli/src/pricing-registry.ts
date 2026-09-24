@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3'
 import {
+  CURATED_PRICE_ALIASES,
   CURATED_PRICES,
   setRuntimePriceTable,
   setPriceOverride,
@@ -492,6 +493,54 @@ function upsertBuiltinAlias(db: Database.Database, alias: string, modelKey: stri
 }
 
 /**
+ * Seeds the curated aliases from `CURATED_PRICE_ALIASES` as builtin aliases.
+ * An alias is added only when its target price exists (the aliases table
+ * references model_prices) and when no alias of that name exists yet, so a
+ * user binding always wins. Aliases are resolved before exact keys, so an
+ * alias must never sit on a name that carries a real price: none is seeded
+ * for such a name, and one this code seeded earlier is removed as soon as a
+ * price appears under its name (LiteLLM listing `gemini-3.1-pro` itself).
+ * An alias this code seeded earlier follows the curated list when its target
+ * changes, as soon as the new target price exists. Only rows with
+ * `origin = 'builtin'` and `source = 'aiusage'` are ever touched; the LiteLLM
+ * sync writes its aliases with `source = 'litellm'`.
+ * Runs on every database open and after each pricing sync; returns the number
+ * of aliases added. Existing $0 records are repaired by recalculating pricing.
+ */
+export function ensureCuratedPricingAliases(db: Database.Database): number {
+  const prune = db.prepare(`
+    DELETE FROM model_price_aliases
+    WHERE alias = @alias AND origin = 'builtin' AND source = 'aiusage'
+      AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = @alias AND status = 'active')
+  `)
+  const retarget = db.prepare(`
+    UPDATE model_price_aliases
+    SET model_key = @modelKey,
+        provider = (SELECT provider FROM model_prices WHERE model_key = @modelKey),
+        updated_at = @now
+    WHERE alias = @alias AND origin = 'builtin' AND source = 'aiusage' AND model_key <> @modelKey
+      AND EXISTS (SELECT 1 FROM model_prices WHERE model_key = @modelKey AND status = 'active')
+  `)
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO model_price_aliases (alias, model_key, match_type, provider, priority, source, origin, enabled, created_at, updated_at)
+    SELECT @alias, model_key, 'exact', provider, 100, 'aiusage', 'builtin', 1, @now, @now
+    FROM model_prices
+    WHERE model_key = @modelKey AND status = 'active'
+      AND NOT EXISTS (SELECT 1 FROM model_prices WHERE model_key = @alias AND status = 'active')
+  `)
+  const seed = db.transaction((now: number): number => {
+    let added = 0
+    for (const { alias, modelKey } of CURATED_PRICE_ALIASES) {
+      prune.run({ alias })
+      retarget.run({ alias, modelKey, now })
+      added += insert.run({ alias, modelKey, now }).changes
+    }
+    return added
+  })
+  return seed(Date.now())
+}
+
+/**
  * Seeds `CURATED_PRICES` as builtin prices (source 'aiusage') so a newly
  * launched model is priced before the next LiteLLM sync lists it, instead of
  * falling through to an older sibling by prefix. A price is written only when
@@ -595,6 +644,7 @@ export async function syncPricingFromLitellm(db: Database.Database): Promise<Pri
         else if (aliasResult === 'user_preserved') summary.userPreserved++
       }
     }
+    summary.aliasesAdded += ensureCuratedPricingAliases(db)
   })
   tx()
   summary.dryRun = dryRunLocalModels(db)

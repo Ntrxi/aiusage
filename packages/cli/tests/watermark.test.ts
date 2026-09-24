@@ -181,6 +181,39 @@ describe('WatermarkManager', () => {
     expect(wm.getEntry('codebuddy', '/cb/current.jsonl')?.offset).toBe(500)
   })
 
+  it('clears stale Antigravity entries when upgrading the Antigravity parser', () => {
+    writeFileSync(watermarkPath, JSON.stringify({
+      files: {
+        antigravity: { '/ag/conversations/session.db': { offset: 12, size: 4096, mtime: 6 } },
+        'claude-code': { '/claude/session.jsonl': { offset: 200, size: 200, mtime: 2 } },
+      },
+      grokParserVersion: 1,
+      codebuddyParserVersion: 1,
+    }), 'utf-8')
+
+    const wm = new WatermarkManager(watermarkPath)
+    expect(wm.getEntry('antigravity', '/ag/conversations/session.db')).toBeNull()
+    expect(wm.getEntry('claude-code', '/claude/session.jsonl')?.offset).toBe(200)
+
+    wm.save()
+    const saved = JSON.parse(readFileSync(watermarkPath, 'utf-8'))
+    expect(saved.antigravityParserVersion).toBe(1)
+    expect(saved.grokParserVersion).toBe(1)
+    expect(saved.codebuddyParserVersion).toBe(1)
+  })
+
+  it('preserves Antigravity entries written by the current parser version', () => {
+    writeFileSync(watermarkPath, JSON.stringify({
+      files: {
+        antigravity: { '/ag/conversations/current.db': { offset: 7, size: 8192, mtime: 7 } },
+      },
+      antigravityParserVersion: 1,
+    }), 'utf-8')
+
+    const wm = new WatermarkManager(watermarkPath)
+    expect(wm.getEntry('antigravity', '/ag/conversations/current.db')?.offset).toBe(7)
+  })
+
   it('returns null when no opencode cursor has been set', () => {
     const wm = new WatermarkManager(watermarkPath)
     expect(wm.getOpenCodeCursor()).toBeNull()

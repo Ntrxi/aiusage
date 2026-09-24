@@ -3,6 +3,13 @@ import type { Tool } from '@aiusage/core'
 
 const CURRENT_GROK_PARSER_VERSION = 1
 const CURRENT_CODEBUDDY_PARSER_VERSION = 1
+/**
+ * v1: model resolution prefers readable model metadata over unknown numeric
+ * ids and keeps effort-qualified Gemini Pro names (issues #68, #69). Every
+ * conversation database is re-imported once; records keep their ids, so the
+ * re-import corrects model, provider and cost in place.
+ */
+const CURRENT_ANTIGRAVITY_PARSER_VERSION = 1
 
 export interface WatermarkEntry {
   offset: number
@@ -50,6 +57,7 @@ export interface WatermarkState {
   files: FileWatermarkData
   grokParserVersion?: number
   codebuddyParserVersion?: number
+  antigravityParserVersion?: number
   toolCallBackfillVersion?: number
   opencode?: OpenCodeCursor | null
   hermes?: HermesCursor | null
@@ -66,6 +74,15 @@ export interface WatermarkState {
 
 /** @deprecated Use FileWatermarkData instead */
 export type WatermarkData = FileWatermarkData
+
+function defaultState(): WatermarkState {
+  return {
+    files: defaultFileData(),
+    grokParserVersion: CURRENT_GROK_PARSER_VERSION,
+    codebuddyParserVersion: CURRENT_CODEBUDDY_PARSER_VERSION,
+    antigravityParserVersion: CURRENT_ANTIGRAVITY_PARSER_VERSION,
+  }
+}
 
 function defaultFileData(): FileWatermarkData {
   return {
@@ -109,7 +126,7 @@ export class WatermarkManager {
 
   private load(): WatermarkState {
     if (!existsSync(this.path)) {
-      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION, codebuddyParserVersion: CURRENT_CODEBUDDY_PARSER_VERSION }
+      return defaultState()
     }
     try {
       const content = readFileSync(this.path, 'utf-8')
@@ -123,6 +140,7 @@ export class WatermarkManager {
           files: { ...defaultFileData(), ...(parsed.files ?? {}) },
           grokParserVersion: parsed.grokParserVersion,
           codebuddyParserVersion: parsed.codebuddyParserVersion,
+          antigravityParserVersion: parsed.antigravityParserVersion,
           toolCallBackfillVersion: parsed.toolCallBackfillVersion,
           opencode: parsed.opencode ?? null,
           hermes: parsed.hermes ?? null,
@@ -148,9 +166,16 @@ export class WatermarkManager {
         state.files.codebuddy = {}
         state.codebuddyParserVersion = CURRENT_CODEBUDDY_PARSER_VERSION
       }
+      if ((state.antigravityParserVersion ?? 0) < CURRENT_ANTIGRAVITY_PARSER_VERSION) {
+        // v1: Antigravity usage was attributed to placeholder ids such as
+        // antigravity-model-1318 although the row named the model; re-import
+        // every conversation database so those records are corrected in place.
+        state.files.antigravity = {}
+        state.antigravityParserVersion = CURRENT_ANTIGRAVITY_PARSER_VERSION
+      }
       return state
     } catch {
-      return { files: defaultFileData(), grokParserVersion: CURRENT_GROK_PARSER_VERSION, codebuddyParserVersion: CURRENT_CODEBUDDY_PARSER_VERSION }
+      return defaultState()
     }
   }
 

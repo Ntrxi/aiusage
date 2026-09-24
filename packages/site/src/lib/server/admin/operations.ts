@@ -1,6 +1,7 @@
 import { sql } from '../db/pool.js'
 import { nanoid } from 'nanoid'
 import { invalidateLeaderboardCache } from '../leaderboard/query.js'
+import { ensureCuratedPricingAliases } from '../pricing/curated-aliases.js'
 
 export async function banUser(adminUserId: string, targetUserId: string, reason: string): Promise<void> {
   await sql`UPDATE users SET status = 'banned', banned_at = NOW(), ban_reason = ${reason}, updated_at = NOW() WHERE id = ${targetUserId}`
@@ -242,6 +243,12 @@ export async function syncPricingFromLitellm(adminUserId: string): Promise<{ add
         else if (existingAlias.origin !== 'user' && (existingAlias.model_key !== entry.modelKey || existingAlias.enabled !== true)) aliasesUpdated++
       }
     }
+
+    // Curated aliases for model names no pricing source lists verbatim; they
+    // are also applied on startup (runMigrations).
+    const curated = await ensureCuratedPricingAliases(tx)
+    aliasesAdded += curated.added
+    aliasesUpdated += curated.updated
   })
 
   await logAdminAction(adminUserId, 'sync_pricing', 'model_prices', 'active', `Synced from LiteLLM: ${added} added, ${updated} updated, ${skipped} skipped, ${aliasesAdded} aliases added, ${aliasesUpdated} aliases updated`)

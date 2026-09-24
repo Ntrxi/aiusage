@@ -3,7 +3,7 @@ import Database from 'better-sqlite3'
 import { initializeDatabase } from '../../src/db/index.js'
 import { insertRecord } from '../../src/db/records.js'
 import { recalcPricing } from '../../src/commands/recalc.js'
-import { setUserPrice } from '../../src/pricing-registry.js'
+import { ensureCuratedPricingAliases, setUserPrice } from '../../src/pricing-registry.js'
 import type { StatsRecord } from '@aiusage/core'
 
 describe('Recalc Command', () => {
@@ -34,6 +34,33 @@ describe('Recalc Command', () => {
 
   afterEach(() => {
     db.close()
+  })
+
+  it('prices Gemini 3.1 Pro records through the curated preview alias without renaming them (issue #69)', () => {
+    const models = ['gemini-3.1-pro', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low']
+    for (const [index, model] of models.entries()) {
+      insertRecord(db, {
+        id: `r${index}`, ts: Date.now(), ingestedAt: Date.now(), updatedAt: Date.now(),
+        lineOffset: index, tool: 'antigravity', model, provider: 'google',
+        inputTokens: 1000000, outputTokens: 500000, cacheReadTokens: 0, cacheWriteTokens: 0,
+        thinkingTokens: 0, cost: 0, costSource: 'unknown', sessionId: 's1',
+        sourceFile: '/f1', device: 'd1', deviceInstanceId: 'di1',
+      })
+    }
+    // LiteLLM knows the model only under its -preview key.
+    insertPrice('gemini-3.1-pro-preview', { input: 2, output: 12, cacheRead: 0.2, provider: 'gemini' })
+    expect(ensureCuratedPricingAliases(db)).toBe(3)
+
+    const result = recalcPricing(db)
+    expect(result.updatedCount).toBe(3)
+
+    for (const [index, model] of models.entries()) {
+      const record = db.prepare('SELECT * FROM records WHERE id = ?').get(`r${index}`) as any
+      expect(record.model).toBe(model)
+      expect(record.provider).toBe('google')
+      expect(record.cost_source).toBe('pricing')
+      expect(record.cost).toBeCloseTo(2 + 6, 6)
+    }
   })
 
   it('recalculates cost for pricing-sourced records', () => {
