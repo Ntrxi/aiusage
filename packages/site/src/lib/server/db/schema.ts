@@ -1,4 +1,5 @@
 import { sql } from './pool.js'
+import { ensureCuratedPrices } from '../pricing/curated-prices.js'
 
 export async function runMigrations(): Promise<void> {
   await sql`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -18,6 +19,8 @@ export async function runMigrations(): Promise<void> {
       })
     }
   }
+
+  await ensureCuratedPrices(sql)
 }
 
 const migrations = [

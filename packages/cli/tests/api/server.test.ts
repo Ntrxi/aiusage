@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
 import { createApiServer } from '../../src/api/server.js'
 import Database from 'better-sqlite3'
+import { CURATED_PRICES } from '@aiusage/core'
 import { initializeDatabase } from '../../src/db/index.js'
 import { SyncRuntimeController } from '../../src/sync/runtime.js'
 
@@ -197,7 +198,7 @@ describe('API Server', () => {
     expect(data.data).toEqual([])
   })
 
-  it('returns pricing registry summary for an empty local registry', async () => {
+  it('returns pricing registry summary for a registry that has never been synced', async () => {
     insertTestRecord(db)
 
     const response = await fetch(`${baseUrl}/api/pricing`)
@@ -211,9 +212,10 @@ describe('API Server', () => {
       isBuiltin: false,
       isOverride: false,
     })
+    // Only the curated prices, seeded on database open, are present.
     expect(data.registry).toEqual({
-      totalPrices: 0,
-      builtinPrices: 0,
+      totalPrices: CURATED_PRICES.length,
+      builtinPrices: CURATED_PRICES.length,
       userPrices: 0,
       activeAliases: 0,
       lastSyncedAt: null,
