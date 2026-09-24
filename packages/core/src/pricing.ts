@@ -76,6 +76,46 @@ export const CURATED_PRICE_ALIASES: ReadonlyArray<{ alias: string; modelKey: str
   { alias: 'gemini-3-flash', modelKey: 'gemini-3-flash-preview' },
 ]
 
+export interface CuratedPrice {
+  modelKey: string
+  provider: string
+  price: PriceEntry
+  sourceUrl: string
+}
+
+const ANTHROPIC_PRICING_URL = 'https://platform.claude.com/docs/en/about-claude/pricing'
+const OPENAI_PRICING_URL = 'https://developers.openai.com/api/docs/pricing'
+
+/**
+ * Prices for models that hosts should know without waiting for a LiteLLM sync.
+ * A registry synced before a model launched has no row for it, and prefix
+ * matching then prices it as an older sibling: `claude-opus-5-5` resolved to
+ * `claude-opus-5` and showed $5/$25 instead of $4/$20. Hosts seed these as
+ * builtin prices when no row exists for the key; a later LiteLLM sync or a user
+ * price takes over from there. Rates are USD per 1M tokens at the standard
+ * (short-context, global) tier; `cacheWrite` is the 5-minute write rate.
+ */
+export const CURATED_PRICES: ReadonlyArray<CuratedPrice> = [
+  {
+    modelKey: 'claude-opus-5-5',
+    provider: 'anthropic',
+    price: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5, currency: 'USD' },
+    sourceUrl: ANTHROPIC_PRICING_URL,
+  },
+  {
+    modelKey: 'gpt-6-sol',
+    provider: 'openai',
+    price: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5, currency: 'USD' },
+    sourceUrl: OPENAI_PRICING_URL,
+  },
+  {
+    modelKey: 'gpt-6-luna',
+    provider: 'openai',
+    price: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125, currency: 'USD' },
+    sourceUrl: OPENAI_PRICING_URL,
+  },
+]
+
 const PROVIDER_PREFIXES = [
   'accounts/fireworks/models/',
   'moonshotai/',

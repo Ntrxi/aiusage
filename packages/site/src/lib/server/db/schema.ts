@@ -1,5 +1,6 @@
 import { sql } from './pool.js'
 import { ensureCuratedPricingAliases } from '../pricing/curated-aliases.js'
+import { ensureCuratedPrices } from '../pricing/curated-prices.js'
 
 export async function runMigrations(): Promise<void> {
   await sql`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -19,6 +20,8 @@ export async function runMigrations(): Promise<void> {
       })
     }
   }
+
+  await ensureCuratedPrices(sql)
 
   // Not a versioned migration: the curated list changes with the code and its
   // target prices may only arrive with a later pricing sync, so it is

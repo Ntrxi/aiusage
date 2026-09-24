@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3'
 import {
   CURATED_PRICE_ALIASES,
+  CURATED_PRICES,
   setRuntimePriceTable,
   setPriceOverride,
   resolvePriceFromTable,
@@ -537,6 +538,77 @@ export function ensureCuratedPricingAliases(db: Database.Database): number {
     return added
   })
   return seed(Date.now())
+}
+
+/**
+ * Seeds `CURATED_PRICES` as builtin prices (source 'aiusage') so a newly
+ * launched model is priced before the next LiteLLM sync lists it, instead of
+ * falling through to an older sibling by prefix. A price is written only when
+ * no row exists for its key, or when the existing row is one this code seeded
+ * and the curated rate has changed; LiteLLM-synced and user prices are never
+ * touched. The sync baseline is seeded the same way, so resetting a user
+ * override returns to the curated price. Runs on every database open.
+ */
+export function ensureCuratedPrices(db: Database.Database): void {
+  const upsertPrice = db.prepare(`
+    INSERT INTO model_prices (
+      model_key, provider, input, output, cache_read, cache_write, currency, source, source_model_id,
+      source_url, origin, status, last_synced_at, created_at, updated_at
+    ) VALUES (@modelKey, @provider, @input, @output, @cacheRead, @cacheWrite, @currency, 'aiusage', @modelKey,
+      @sourceUrl, 'builtin', 'active', NULL, @now, @now)
+    ON CONFLICT(model_key) DO UPDATE SET
+      provider = excluded.provider,
+      input = excluded.input,
+      output = excluded.output,
+      cache_read = excluded.cache_read,
+      cache_write = excluded.cache_write,
+      currency = excluded.currency,
+      source_url = excluded.source_url,
+      status = 'active',
+      updated_at = excluded.updated_at
+    WHERE model_prices.origin = 'builtin' AND model_prices.source = 'aiusage'
+      AND (model_prices.input IS NOT excluded.input OR model_prices.output IS NOT excluded.output
+        OR model_prices.cache_read IS NOT excluded.cache_read OR model_prices.cache_write IS NOT excluded.cache_write
+        OR model_prices.currency IS NOT excluded.currency OR model_prices.status <> 'active')
+  `)
+  const upsertBaseline = db.prepare(`
+    INSERT INTO model_price_sync_baselines (
+      model_key, provider, input, output, cache_read, cache_write, currency, source,
+      source_model_id, source_url, last_synced_at, updated_at
+    ) VALUES (@modelKey, @provider, @input, @output, @cacheRead, @cacheWrite, @currency, 'aiusage', @modelKey,
+      @sourceUrl, @now, @now)
+    ON CONFLICT(model_key) DO UPDATE SET
+      provider = excluded.provider,
+      input = excluded.input,
+      output = excluded.output,
+      cache_read = excluded.cache_read,
+      cache_write = excluded.cache_write,
+      currency = excluded.currency,
+      source_url = excluded.source_url,
+      updated_at = excluded.updated_at
+    WHERE model_price_sync_baselines.source = 'aiusage'
+      AND (model_price_sync_baselines.input IS NOT excluded.input OR model_price_sync_baselines.output IS NOT excluded.output
+        OR model_price_sync_baselines.cache_read IS NOT excluded.cache_read OR model_price_sync_baselines.cache_write IS NOT excluded.cache_write
+        OR model_price_sync_baselines.currency IS NOT excluded.currency)
+  `)
+  const seed = db.transaction((now: number) => {
+    for (const { modelKey, provider, price, sourceUrl } of CURATED_PRICES) {
+      const params = {
+        modelKey,
+        provider,
+        input: price.input,
+        output: price.output,
+        cacheRead: price.cacheRead ?? null,
+        cacheWrite: price.cacheWrite ?? null,
+        currency: price.currency ?? 'USD',
+        sourceUrl,
+        now,
+      }
+      upsertPrice.run(params)
+      upsertBaseline.run(params)
+    }
+  })
+  seed(Date.now())
 }
 
 export async function syncPricingFromLitellm(db: Database.Database): Promise<PricingSyncSummary> {
