@@ -68,7 +68,13 @@ function promoteUnreleased(file, marker, summary = '') {
   const releaseBody = summary ? `${summary}\n\n${unreleased}` : unreleased
   const before = changelog.slice(0, markerIndex)
   const after = changelog.slice(boundary + separator.length)
-  const updated = `${before}${marker}${separator}## [${nextVersion}] - ${date}\n\n${releaseBody}${separator}${after}`
+  let updated = `${before}${marker}${separator}## [${nextVersion}] - ${date}\n\n${releaseBody}${separator}${after}`
+  const compareLink = `[${nextVersion}]: https://github.com/juliantanx/aiusage/compare/v${currentVersion}...v${nextVersion}`
+  if (!updated.includes(compareLink)) {
+    const firstCompareLink = updated.search(/^\[\d+\.\d+\.\d+\]:/m)
+    if (firstCompareLink === -1) throw new Error(`${file} has no compare-link section`)
+    updated = `${updated.slice(0, firstCompareLink)}${compareLink}\n${updated.slice(firstCompareLink)}`
+  }
   if (!checkOnly) writeFileSync(file, updated)
 }
 
